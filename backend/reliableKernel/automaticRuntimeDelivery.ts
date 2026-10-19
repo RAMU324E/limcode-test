@@ -24,7 +24,7 @@ import type { ContentAddressedStore } from './contentAddressedStore';
 import { isRuntimeMaintenanceTurn } from './maintenanceTurn';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
-import { childTaskRequestingParentTurn, childRuntimeTaskContinuationLineage, runtimeDeliverySourceTurn } from './childTaskTurn';
+import { childExecutionLatestTurnSteps, childTaskRequestingParentTurn, childRuntimeTaskContinuationLineage, runtimeDeliverySourceTurn } from './childTaskTurn';
 
 
 export type AutomaticRuntimeDeliveryReason =
@@ -526,12 +526,11 @@ export class AutomaticRuntimeDeliveryRouter {
       steps.push(DOMAIN_REPOSITORIES.domain('ChildExecution').assert(String(child.id), { status: child.status, child_conversation_id: input.targetConversationId }));
       if (!['active', 'idle'].includes(String(child.status))) return decision({ ...input, reason: 'child_generation_stale_or_terminal', childExecutionId: String(child.id), authoritySteps: steps });
     }
-    const turns = await listAllDomainRows(this.database, 'Turn', { conversation_id: input.targetConversationId });
-    turns.sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)) || String(right.id).localeCompare(String(left.id)));
-    const active = turns.filter((turn) => turn.status === 'active');
+    const current = (await this.database.currentConversationTurns(input.targetConversationId, true)).snapshot;
+    const active = current.activeTurns;
     if (active.length > 1) throw new Error('Collaboration target has multiple active Turns.');
     const turn = active[0];
-    const anchor = turn ?? turns[0];
+    const anchor = turn ?? current.latestTurn;
     const sourceTurnId = anchor ? String(anchor.id) : input.sourceTurnId;
     if (boardNotice && (!turn || links[0].anchor_turn_id !== turn.id)) return decision({ ...input, sourceTurnId, reason: 'collaboration_notification_expired', authoritySteps: steps });
     // A manual compression or summary rebuild never takes a delivery in. The delivery waits; the
@@ -700,7 +699,7 @@ export class AutomaticRuntimeDeliveryRouter {
     sourceChildAuthority: ChildGenerationAuthority
   ): Promise<{ turnId: string; steps: RepositoryTransactionStep[] } | undefined> {
     if (sourceChildAuthority.childExecutionId && !sourceChildAuthority.continuationTurnId) return undefined;
-    const active = await this.list('Turn', { conversation_id: targetConversationId, status: 'active' }, 2);
+    const active = (await this.database.currentConversationTurns(targetConversationId)).snapshot.activeTurns;
     if (active.length > 1) throw new Error(`Conversation ${targetConversationId} has multiple active Turns.`);
     const turn = active[0];
     if (!turn) return undefined;
@@ -732,21 +731,15 @@ export class AutomaticRuntimeDeliveryRouter {
     }
     const membership = memberships[0];
     const childExecutionId = requireId(membership.child_execution_id, 'ChildExecutionTurnLink.child_execution_id');
-    const [child, lineage, activeLinks] = await Promise.all([
-      this.requireExisting('ChildExecution', childExecutionId),
-      listAllDomainRows(this.database, 'ChildExecutionTurnLink', {
-        child_execution_id: childExecutionId
-      }),
-      this.list('ChildExecutionActiveTurnLink', { child_execution_id: childExecutionId }, 2)
-    ]);
-    if (activeLinks.length > 1) throw new Error(`ChildExecution ${childExecutionId} has multiple active Turn links.`);
-    const latest = [...lineage].sort((left, right) => compareInteger(right.turn_seq, left.turn_seq))[0];
+    const snapshot = (await this.database.childExecutionSnapshot(childExecutionId)).snapshot;
+    const child = snapshot.childExecution;
+    const latest = snapshot.latestTurnLink;
     if (!latest) throw new Error(`ChildExecution ${childExecutionId} has no Turn lineage.`);
-    const active = activeLinks[0] ?? null;
+    const active = snapshot.activeTurnLink;
     const status = requireChildExecutionStatus(child.status);
     const isLatest = latest.turn_id === sourceTurnId;
     const taskLineage = await childRuntimeTaskContinuationLineage(
-      this.database, this.contentStore, childExecutionId, sourceTurnId, lineage
+      this.database, this.contentStore, childExecutionId, sourceTurnId
     );
     const blocked = isChildExecutionInterrupting(status)
       || status === 'interrupted'
@@ -760,9 +753,7 @@ export class AutomaticRuntimeDeliveryRouter {
       && (status === 'active' || status === 'idle')
       && (active === null || active.turn_id === taskLineage.latestTurnId);
     const steps: RepositoryTransactionStep[] = [
-      ...(taskLineage?.authoritySteps ?? [DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assertExactIds(
-        { child_execution_id: childExecutionId }, lineage.map(link => requireId(link.id, 'ChildExecutionTurnLink.id'))
-      )]),
+      ...(taskLineage?.authoritySteps ?? childExecutionLatestTurnSteps(childExecutionId, latest)),
       DOMAIN_REPOSITORIES.domain('ChildExecution').assert(childExecutionId, { status: child.status }),
       DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assert(requireId(membership.id, 'ChildExecutionTurnLink.id'), {
         child_execution_id: childExecutionId,

@@ -971,8 +971,8 @@ async function checkAnswerRestartDelivery() {
     });
     const operationA = await get(ctx.database, 'Operation', generationWaitA.operationId);
     const operationB = await get(ctx.database, 'Operation', generationWaitB.operationId);
-    assert.equal(operationA.owner_kind, 'child_turn_answer_wait');
-    assert.equal(operationA.owner_id, generationA.turnId);
+    assert.equal(operationA.owner_kind, 'child_intent_answer_wait');
+    assert.equal(operationA.owner_id, generationWaitA.turnIntentId);
     assert.equal(operationA.created_at, operationB.created_at);
     assert.notEqual(operationA.owner_id, operationB.owner_id);
     const generationAnswerA = await ctx.services.answers.submit({
@@ -1001,7 +1001,7 @@ async function checkAnswerRestartDelivery() {
       leaseOwnerId: 'answer-generation-owner-b',
       leaseExpiresAt: '2026-08-02T00:00:00.000Z'
     });
-    assert.equal((await get(ctx.database, 'Operation', generationWaitB.operationId)).owner_id, generationB.turnId);
+    assert.equal((await get(ctx.database, 'Operation', generationWaitB.operationId)).owner_id, generationWaitB.turnIntentId);
     const generationAnswerB = await ctx.services.answers.submit({
       answerBridgeId: generationChild.answerBridgeId,
       submissionId: 'answer-generation-submission-b',

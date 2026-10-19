@@ -1,5 +1,6 @@
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import {
+  CHILD_INTENT_ANSWER_WAIT_OWNER_KIND,
   CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
   LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND,
   childContinuationTurnId,
@@ -182,8 +183,14 @@ async function requestingParentForIntent(
     child_execution_id: childExecutionId, turn_intent_id: turnIntentId
   }, 2, steps);
   if (intentLinks.length !== 1) return null;
-  const turnId = childContinuationTurnId(childExecutionId, turnIntentId);
-  let operations = await list(database, 'Operation', { owner_kind: CHILD_TURN_ANSWER_WAIT_OWNER_KIND, owner_id: turnId }, 2, steps);
+  let operations = await list(database, 'Operation', {
+    owner_kind: CHILD_INTENT_ANSWER_WAIT_OWNER_KIND, owner_id: turnIntentId
+  }, 2, steps);
+  if (operations.length === 0) {
+    operations = await list(database, 'Operation', {
+      owner_kind: CHILD_TURN_ANSWER_WAIT_OWNER_KIND, owner_id: childContinuationTurnId(childExecutionId, turnIntentId)
+    }, 2, steps);
+  }
   if (operations.length === 0) {
     // Preserve the existing exact shipped legacy identity check, shared with foreground recovery.
     const bridges = await list(database, 'AnswerBridge', { child_execution_id: childExecutionId }, 2, steps);
@@ -220,16 +227,35 @@ export async function childRuntimeTaskContinuationLineage(
   database: RuntimeDatabase,
   contentStore: ContentAddressedStore,
   childExecutionId: string,
-  sourceTurnId: string,
-  lineage: readonly DomainRow[]
+  sourceTurnId: string
 ): Promise<{ latestTurnId: string; authoritySteps: RepositoryTransactionStep[] } | null> {
-  const ordered = [...lineage].sort((a, b) => BigInt(String(a.turn_seq)) < BigInt(String(b.turn_seq)) ? -1 : 1);
-  const sourceIndex = ordered.findIndex(link => link.turn_id === sourceTurnId);
-  if (sourceIndex < 0 || ordered.some(link => link.child_execution_id !== childExecutionId)) return null;
-  const steps: RepositoryTransactionStep[] = [];
-  retainRows(steps, 'ChildExecutionTurnLink', { child_execution_id: childExecutionId }, ordered);
-  const latestTurnId = requirePhaseFId(ordered[ordered.length - 1].turn_id, 'latest child Turn');
+  const sourceRows = await list(database, 'ChildExecutionTurnLink', { turn_id: sourceTurnId }, 2);
+  const source = sourceRows[0];
+  if (sourceRows.length !== 1 || source.child_execution_id !== childExecutionId) return null;
+  const latest = (await database.snapshot([DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').list({
+    where: { child_execution_id: childExecutionId }, orderBy: { column: 'turn_seq', direction: 'desc' }, limit: 1
+  })])).snapshot[0] as DomainRow[];
+  if (latest.length !== 1) return null;
+  const last = latest[0];
+  const latestTurnId = requirePhaseFId(last.turn_id, 'latest child Turn');
+  const steps = childExecutionLatestTurnSteps(childExecutionId, last);
   if (latestTurnId === sourceTurnId) return { latestTurnId, authoritySteps: steps };
+  const ordered = [source];
+  let after = source;
+  while (BigInt(String(after.turn_seq)) < BigInt(String(last.turn_seq))) {
+    const page = (await database.snapshot([DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').list({
+      where: { child_execution_id: childExecutionId }, orderBy: { column: 'turn_seq', direction: 'asc' },
+      keyset: { column: 'turn_seq', value: BigInt(String(after.turn_seq)), id: requirePhaseFId(after.id, 'ChildExecutionTurnLink.id'), direction: 'after' },
+      limit: 1000
+    })])).snapshot[0] as DomainRow[];
+    if (page.length === 0) return null;
+    for (const member of page) {
+      if (BigInt(String(member.turn_seq)) > BigInt(String(last.turn_seq))) break;
+      ordered.push(member);
+      steps.push(DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assert(requirePhaseFId(member.id, 'ChildExecutionTurnLink.id'), assertedFields(member)));
+    }
+    after = page[page.length - 1];
+  }
   const origins = new Map<string, string | null>();
   const visiting = new Set<string>();
   const origin = async (turnId: string): Promise<string | null> => {
@@ -259,7 +285,7 @@ export async function childRuntimeTaskContinuationLineage(
   const taskOrigin = await origin(sourceTurnId);
   if (taskOrigin === null) return null;
   origins.set(sourceTurnId, taskOrigin);
-  for (const member of ordered.slice(sourceIndex + 1)) {
+  for (const member of ordered.slice(1)) {
     const turnId = requirePhaseFId(member.turn_id, 'child successor Turn');
     const successorOrigin = await origin(turnId);
     origins.set(turnId, successorOrigin);
@@ -270,4 +296,12 @@ export async function childRuntimeTaskContinuationLineage(
     if (turn?.status !== 'terminated' || terminal.length !== 1 || terminal[0].terminal_status !== 'completed') return null;
   }
   return { latestTurnId, authoritySteps: steps };
+}
+
+/** Turn membership is immutable and every generation allocates MAX(turn_seq)+1 in the writer. */
+export function childExecutionLatestTurnSteps(childExecutionId: string, latest: DomainRow): RepositoryTransactionStep[] {
+  return [DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assert(requirePhaseFId(latest.id, 'ChildExecutionTurnLink.id'),
+    { child_execution_id: childExecutionId, turn_id: latest.turn_id, turn_seq: latest.turn_seq }),
+    DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assertNone({ child_execution_id: childExecutionId,
+      turn_seq: BigInt(String(latest.turn_seq)) + 1n })];
 }

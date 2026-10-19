@@ -1,0 +1,8 @@
+{
+  "kind": "limcode-phase-c-turn-control-plane",
+  "checkId": "candidate.turn-sole-execution-identity",
+  "passed": true,
+  "commitSha": "b967bdca78d7934760628fabed3449c5f192dfc8",
+  "measuredAt": "2026-08-21T01:25:15.345Z",
+  "summary": "15组真实SQLite/CAS/fault断言通过：receipt、CAS metadata、Intent、Turn、Message与lease单事务；duplicate重放原result且不增加commit；AuthoritySnapshot只接受服务端compiler输出；compiler失败不提交receipt/intent；interrupt request仅创建PendingTurnInput，并可从receipt稳定重放position；interrupted terminal在同一commit确认termination input、写TurnTermination并释放实际lease；consumed interrupt与duplicate terminal均重放终态；late callback仅写receipt；callback不能admit新Turn，command不能直接写terminal；continuation创建新Intent/Turn，旧Turn保持终态并冻结当前默认executor；terminal事务前注入lease仍由同一事务释放，不产生terminated+lease；非lease admission UNIQUE向外传播，receipt/intent/lease均不提交；无commandTail时并发input仅一个lease；并发interrupt各写独立receipt并合并到同一open PendingTurnInput；delete线性化后竞态edit被事务断言拒绝且不创建revision/receipt；跨facade competing terminal只产生一个终止事实，另一来源receipt-only；Phase C fork仅验证Turn/MessageRevision/Context root source facts，不写target或ContextHead；终态Conversation上的edit使用immutable revision并重放>2^53 decimal sequence；delete保持独立facts；identity.json derivation覆盖全部16种recovery组合；command/callback/internal/recovery统一按(source_kind,source_key)去重"
+}

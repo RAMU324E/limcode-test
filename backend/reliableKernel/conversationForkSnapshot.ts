@@ -263,7 +263,7 @@ export async function prepareConversationForkSnapshot(
     })) continue;
     if (!contextLineage) throw new Error('Native model output fork requires an explicit Context prefix.');
     const messageId = id(fact.message.id, 'Message.id');
-    const revisions = await readNativeMessageContextRevisions(database, messageId);
+    const revisions = await readNativeMessageContextRevisions(database, messageId, { includeItemIndex: true });
     const additional: NativeMessageContextRevision[] = [];
     for (const revision of revisions) {
       if (revision.sources.some((source) => !contextLineage.segmentIds.has(id(source.segment_id, 'ContextSegmentSource.segment_id')))) {

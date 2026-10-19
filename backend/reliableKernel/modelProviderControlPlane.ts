@@ -1,9 +1,13 @@
 import { readOrderedTurnInputMessages } from './turnInputMessages';
+import { LogicalMessageContentReader, logicalMessageContentType } from './logicalMessageContent';
 import { resolveFrozenToolDefinitions } from './frozenToolDefinitions';
 import type { ReliableAgentToolDefinition } from './agentLoop';
-import { frozenRecipeAttachmentHandles, resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
+import { frozenRecipeAttachmentHandles, preparedFrozenModelHandleCatalog,
+  rememberPreparedFrozenModelHandleCatalog, resolveFrozenModelHandleCatalog,
+  retainPreparedModelHandleBase } from './frozenModelHandleCatalog';
 import type { ModelProjectionWorkControls } from './modelProjectionWork';
 import { prepareConversationContextHandleUpdate, rethrowContextHandleStateRace } from './conversationContextHandleState';
+import type { CurrentContextHandleState } from './conversationContextHandleState';
 import { sessionThinkingDisplayLabel } from '../../shared/sessionThinking';
 import { canonicalLlmProviderKind, type LlmThinkingConfigRecord, type LlmProviderKind } from '../../shared/protocol';
 
@@ -49,7 +53,7 @@ import {
   type TurnReminderDeliveryMode,
   type TurnReminderIdentitySplit
 } from './turnReminderProjection';
-import { modelHandleRef, prepareModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
+import { modelHandleRef, prepareModelHandleCatalog, type ModelHandleCatalog, type PreparedModelHandleCatalog } from './modelHandleCatalog';
 import { expandTextCompressionSources } from './compressionSourceReplay';
 import { assertCopiedProjection } from './historicalCompressionHandleCatalog';
 import {
@@ -72,6 +76,8 @@ import {
 } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE } from './nativeToolFacts';
+import type { PreparedContentObject } from './contentAddressedStore';
 import {
   MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT,
   MODEL_STREAM_OUTPUT_DELTA_CHECKPOINT_LIMIT,
@@ -125,6 +131,8 @@ export interface CreateModelRequestCommand {
   settingsSnapshotContentObjectId?: string;
   /** Exact adapter projection estimate frozen by the ordinary request planner. */
   projectedEstimatedTokens?: number;
+  /** Context handle state already read while freezing the same request recipe. */
+  preparedContextHandleState?: CurrentContextHandleState;
   idempotencyKey: string;
 }
 
@@ -326,12 +334,15 @@ export interface PreparedModelRequestRecipe {
   readonly modelRequestId: string;
   readonly recipeObjectId: string;
   readonly recipe: PlainJsonValue;
+  readonly modelHandleCatalog: PreparedModelHandleCatalog;
 }
 
 type ContextSegmentMetadata = Omit<MaterializedContextSegment, 'content'>;
 
 /** One ordinary request's immutable root; the holder is emptied before provider I/O or compression. */
 export interface PreparedOrdinaryRequestContext {
+  /** Current immutable handle state read while freezing the same recipe. */
+  contextHandleState?: CurrentContextHandleState;
   value?: {
     root: DomainRow;
     segments: ContextSegmentMetadata[];
@@ -652,6 +663,7 @@ const CONTENT_TYPE_CHECKPOINT = 'application/vnd.limcode.model-stream-checkpoint
 /** First-release provider path: each socket dispatch is rebuilt from one frozen root and immutable recipe. */
 export class ModelProviderControlPlane {
   private readonly context: ContextSequenceControlPlane;
+  private readonly messageContents: LogicalMessageContentReader;
   private readonly attachmentCatalog: AttachmentCatalogProjection;
   private readonly attachmentHandles: ConversationAttachmentHandleRegistry;
   private readonly tokenEstimator: ReliableContextTokenEstimator;
@@ -666,6 +678,8 @@ export class ModelProviderControlPlane {
   private readonly requestCancellations = new Map<string, Promise<ModelRequestCancelResult>>();
   private readonly activeDispatches = new Set<Promise<ProviderDispatchResult>>();
   private readonly preparedRecipes = new WeakSet<PreparedModelRequestRecipe>();
+  private readonly activePreparedRecipes = new Map<string, { turnId: string; prepared: PreparedModelRequestRecipe;
+    releaseBase?: () => void }>();
   private readonly preparedContexts = new WeakSet<PreparedOrdinaryRequestContext>();
   private readonly nativeSessions = new Map<string, NativeSteeringSessionHandle>();
   private readonly steeringListeners = new Set<(update: NativeSteeringUpdate) => void>();
@@ -698,6 +712,7 @@ export class ModelProviderControlPlane {
       'adapterDrainTimeoutMs'
     );
     this.context = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
+    this.messageContents = new LogicalMessageContentReader(database, contentStore);
     this.attachmentCatalog = new AttachmentCatalogProjection(database);
     this.attachmentHandles = new ConversationAttachmentHandleRegistry(database, { now: this.now, contentStore });
     this.tokenEstimator = new ReliableContextTokenEstimator(database, contentStore);
@@ -776,6 +791,7 @@ export class ModelProviderControlPlane {
       ? null
       : requireId(command.settingsSnapshotContentObjectId, 'settingsSnapshotContentObjectId');
     const recipe = normalizeModelRequestRecipe(command.recipe, 'ModelRequest recipe');
+    const modelHandleCatalog = await resolveFrozenModelHandleCatalog(this.database, this.contentStore, recipe);
     const resolvedTools = await resolveFrozenToolDefinitions(this.database, this.contentStore, recipe);
     const recipeBytes = canonicalPlainJson(recipe, 'ModelRequest recipe');
     const modelRequestId = modelRequestIdFor(turnId, idempotencyKey);
@@ -857,7 +873,8 @@ export class ModelProviderControlPlane {
     }
     const contextHandleSteps = isRecord(recipe) && (recipe.kind === 'reliable-agent-turn' || recipe.kind === 'reliable-context-compression')
       ? await prepareConversationContextHandleUpdate({ database: this.database, contentStore: this.contentStore,
-          conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'), catalog: await resolveFrozenModelHandleCatalog(this.database, this.contentStore, recipe),
+          conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'), catalog: modelHandleCatalog,
+          current: command.preparedContextHandleState,
           ...(isRecord(recipe.modelHandleCatalogReference) ? { baseContentObjectId: recipe.modelHandleCatalogReference.baseContentObjectId } : {}),
           contextRootId, scope: recipe.contextHandleScope, source: compressionRequest ? 'compression' : 'ordinary', now }) : [];
     const steps: RepositoryTransactionStep[] = [
@@ -916,6 +933,7 @@ export class ModelProviderControlPlane {
     ];
     try {
       const commit = await this.database.transaction(steps);
+      this.holdModelRequestRecipe(modelRequestId, turnId, recipeContent.metadata.id, recipe, modelHandleCatalog);
       return {
         modelRequestId,
         projectionId,
@@ -1062,7 +1080,7 @@ export class ModelProviderControlPlane {
       authoritySnapshot: frozenAuthority,
       ...(settingsSnapshot === undefined ? {} : { settingsSnapshot }),
       recipe,
-      resolvedModelHandleCatalog: await resolveFrozenModelHandleCatalog(this.database, this.contentStore, recipe),
+      resolvedModelHandleCatalog: loadedRecipe.modelHandleCatalog,
       resolvedTools: await resolveFrozenToolDefinitions(this.database, this.contentStore, recipe),
       context: providerContext,
       ...(compressionSourceContext ? { compressionSourceContext } : {}),
@@ -1078,12 +1096,50 @@ export class ModelProviderControlPlane {
   public async readModelRequestRecipe(request: DomainRow): Promise<PreparedModelRequestRecipe> {
     const modelRequestId = requireId(request.id, 'ModelRequest.id');
     const recipeObjectId = requireId(request.recipe_object_id, 'ModelRequest.recipe_object_id');
+    const retained = this.activePreparedRecipes.get(modelRequestId)?.prepared;
+    if (retained?.recipeObjectId === recipeObjectId) return retained;
     const metadata = await this.requireDomain('ContentObject', recipeObjectId);
     const recipe = parsePlainJson(await this.contentStore.read(asContentObjectMetadata(metadata)), 'ModelRequest recipe');
+    const catalog = await resolveFrozenModelHandleCatalog(this.database, this.contentStore, recipe);
+    return this.holdModelRequestRecipe(modelRequestId, request.status === 'terminal' ? undefined
+      : requireId(request.turn_id, 'ModelRequest.turn_id'), recipeObjectId, recipe, catalog);
+  }
+
+  /** The producer finishes one frozen recipe before preview; subsequent consumers reuse its view. */
+  public prepareModelRequestRecipe(recipeValue: PlainJsonValue, catalog: ModelHandleCatalog): PlainJsonValue {
+    const recipe = normalizeModelRequestRecipe(recipeValue, 'ModelRequest recipe');
     freezeRecipeValue(recipe);
-    const prepared = Object.freeze({ modelRequestId, recipeObjectId, recipe });
+    rememberPreparedFrozenModelHandleCatalog(recipe as object, catalog);
+    return recipe;
+  }
+
+  public refreezeModelRequestRecipe(recipe: PlainJsonValue, fields: Record<string, PlainJsonValue>): PlainJsonValue {
+    const catalog = preparedFrozenModelHandleCatalog(recipe);
+    if (!catalog || !isRecord(recipe)) throw new Error('Recipe refinement requires its producer-owned prepared catalog.');
+    return this.prepareModelRequestRecipe({ ...recipe, ...fields }, catalog);
+  }
+
+  private holdModelRequestRecipe(modelRequestId: string, turnId: string | undefined, recipeObjectId: string,
+    recipe: PlainJsonValue, catalog: ModelHandleCatalog): PreparedModelRequestRecipe {
+    freezeRecipeValue(recipe);
+    const modelHandleCatalog = rememberPreparedFrozenModelHandleCatalog(recipe as object, catalog);
+    const prepared = Object.freeze({ modelRequestId, recipeObjectId, recipe, modelHandleCatalog });
     this.preparedRecipes.add(prepared);
+    const releaseBase = turnId ? retainPreparedModelHandleBase(this.database, this.contentStore, modelHandleCatalog) : undefined;
+    this.releasePreparedRequestRecipe(modelRequestId);
+    if (turnId) this.activePreparedRecipes.set(modelRequestId, { turnId, prepared, releaseBase });
     return prepared;
+  }
+
+  private releasePreparedRequestRecipe(modelRequestId: string): void {
+    this.activePreparedRecipes.get(modelRequestId)?.releaseBase?.();
+    this.activePreparedRecipes.delete(modelRequestId);
+  }
+
+  public releasePreparedTurnRecipes(turnId: string): void {
+    for (const [requestId, held] of this.activePreparedRecipes) {
+      if (held.turnId === turnId) this.releasePreparedRequestRecipe(requestId);
+    }
   }
 
   /** Explicit dry-run/replay; it reads only the immutable request projection and CAS objects. */
@@ -1282,14 +1338,14 @@ export class ModelProviderControlPlane {
       return await task;
     } finally {
       this.activeDispatches.delete(task);
+      this.releasePreparedRequestRecipe(modelRequestIdInput);
     }
   }
 
   /** Cancels only non-terminal ModelRequests owned by one Turn; sibling Turns keep streaming. */
   public async cancelTurnDispatches(turnIdInput: string, reason = 'turn-interrupt-requested'): Promise<number> {
     const turnId = requireId(turnIdInput, 'turnId');
-    const requests = await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId });
-    const active = requests.filter((row) => row.status !== 'terminal');
+    const active = (await this.database.activeModelRequests(turnId)).snapshot;
     await Promise.all(active.map((row) => this.cancel(
       requireId(row.id, 'ModelRequest.id'),
       requireText(reason, 'cancel reason')
@@ -1311,7 +1367,7 @@ export class ModelProviderControlPlane {
     reason = new ExecutionHandoffError()
   ): Promise<number> {
     const turnId = requireId(turnIdInput, 'turnId');
-    const requests = await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId });
+    const requests = (await this.database.activeModelRequests(turnId)).snapshot;
     let aborted = 0;
     for (const request of requests) {
       const active = this.activeSockets.get(requireId(request.id, 'ModelRequest.id'));
@@ -1339,6 +1395,7 @@ export class ModelProviderControlPlane {
       }
     }
     await Promise.allSettled([...this.activeDispatches]);
+    for (const requestId of this.activePreparedRecipes.keys()) this.releasePreparedRequestRecipe(requestId);
   }
 
   /**
@@ -2089,13 +2146,15 @@ export class ModelProviderControlPlane {
     socketGenerationInput: string | bigint,
     streamSeqInput: string | bigint,
     proof: PlainJsonValue,
-    options: { beforeSubmit?: () => void } = {}
+    options: { beforeSubmit?: () => void; relatedContentObjects?: readonly PreparedContentObject[]; contentType?: string } = {}
   ): Promise<StreamEventResult> {
     return this.recordStreamCheckpoint(modelRequestIdInput, attemptSeqInput, socketGenerationInput, {
       checkpointKind: 'native_tool_call',
       envelopeKind: 'native_tool_call',
       streamSeq: decimalBigInt(streamSeqInput, 'streamSeq'),
-      content: normalizePlainJson(proof, 'Native tool call proof')
+      content: normalizePlainJson(proof, 'Native tool call proof'),
+      contentType: options.contentType ?? NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE,
+      relatedContentObjects: options.relatedContentObjects
     }, options);
   }
 
@@ -2235,6 +2294,8 @@ export class ModelProviderControlPlane {
       usage?: PlainJsonValue;
       timing?: ProviderStreamTiming;
       claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
+      contentType?: string;
+      relatedContentObjects?: readonly PreparedContentObject[];
     },
     options: { beforeSubmit?: () => void } = {}
   ): Promise<StreamEventResult> {
@@ -2244,6 +2305,7 @@ export class ModelProviderControlPlane {
     const socketGeneration = decimalBigInt(socketGenerationInput, 'socketGeneration');
     const completed = event.checkpointKind === 'terminal_summary';
     const checkpointKind = event.checkpointKind;
+    const contentType = event.contentType ?? CONTENT_TYPE_CHECKPOINT;
     const metricStartedAt = this.database.performanceMetrics ? performance.now() : undefined;
     let transactionCount = 0;
     const finish = (result: StreamEventResult): StreamEventResult => {
@@ -2292,7 +2354,7 @@ export class ModelProviderControlPlane {
         socketGeneration,
         streamSeq: event.streamSeq,
         checkpointKind,
-        contentObjectId: this.contentStore.identity(checkpointBytes(), CONTENT_TYPE_CHECKPOINT).id
+        contentObjectId: this.contentStore.identity(checkpointBytes(), contentType).id
       });
       return finish({
         accepted: false,
@@ -2342,7 +2404,7 @@ export class ModelProviderControlPlane {
       });
     }
     options.beforeSubmit?.();
-    const content = await this.contentStore.prepare(this.database, checkpointBytes(), CONTENT_TYPE_CHECKPOINT);
+    const content = await this.contentStore.prepare(this.database, checkpointBytes(), contentType);
     options.beforeSubmit?.();
     const result = await this.database.commitModelStreamEvent({
       modelRequestId,
@@ -2354,6 +2416,7 @@ export class ModelProviderControlPlane {
       terminalFenceId: completed ? stableId('model_stream_fence', modelRequestId) : null,
       contentObject: content.metadata,
       ...(content.insert ? { contentInsert: content.insert } : {}),
+      ...(event.relatedContentObjects?.length ? { relatedContentObjects: event.relatedContentObjects } : {}),
       usage: completed ? (event.usage ?? null) : null,
       terminalStats: completed ? terminalStreamStats(stats, event.timing, event.claudeThinkingBinding) : null,
       now: this.timestamp()
@@ -2525,6 +2588,7 @@ export class ModelProviderControlPlane {
     this.requestCancellations.set(modelRequestId, task);
     void task.finally(() => {
       if (this.requestCancellations.get(modelRequestId) === task) this.requestCancellations.delete(modelRequestId);
+      this.releasePreparedRequestRecipe(modelRequestId);
     }).catch(() => undefined);
     return task;
   }
@@ -2882,8 +2946,8 @@ export class ModelProviderControlPlane {
       }
       currentTurnInputs.push({
         messageId, messageRevisionId, contentObjectId, reinject: currentRef.reinject === true,
-        contentType: requireText(metadata.content_type, 'Current Turn input ContentObject.content_type'),
-        content: decodeUtf8Exact(await this.contentStore.read(asContentObjectMetadata(metadata)),
+        contentType: logicalMessageContentType(requireText(metadata.content_type, 'Current Turn input ContentObject.content_type')),
+        content: decodeUtf8Exact(await this.messageContents.read(asContentObjectMetadata(metadata)),
           `Current Turn input ${messageRevisionId}`)
       });
     }
@@ -3006,9 +3070,9 @@ export class ModelProviderControlPlane {
       const snapshot = await this.database.snapshot(inputObjectIds.map((id) => DOMAIN_REPOSITORIES.domain('ContentObject').get(id)));
       const metadata = snapshot.snapshot.map((row, index) =>
         requireRow(row, `Reinjected current Turn input ContentObject ${inputObjectIds[index]}`));
-      const bytes = await this.contentStore.readMany(metadata.map(asContentObjectMetadata));
+      const bytes = await this.messageContents.readMany(metadata.map(asContentObjectMetadata));
       inputObjectIds.forEach((id, index) => inputs.set(id, {
-        contentType: requireText(metadata[index].content_type, 'Reinjected current Turn input ContentObject.content_type'),
+        contentType: logicalMessageContentType(requireText(metadata[index].content_type, 'Reinjected current Turn input ContentObject.content_type')),
         content: decodeUtf8Exact(bytes[index], `Reinjected current Turn input ${id}`)
       }));
     }
@@ -3483,7 +3547,7 @@ function providerContextSegments(segments: readonly MaterializedContextSegment[]
     ...(segment.modelSource ? { modelSource: segment.modelSource } : {}),
     ...(segment.sourceRecipeObjectId ? { sourceRecipeObjectId: segment.sourceRecipeObjectId } : {}),
     ...(segment.sourceModelRequestId ? { sourceModelRequestId: segment.sourceModelRequestId } : {}),
-    contentType: segment.contentObject.content_type,
+    contentType: logicalMessageContentType(segment.contentObject.content_type),
     content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
   }));
 }
@@ -4132,7 +4196,7 @@ function parsePlainJson(bytes: Buffer, label: string): PlainJsonValue {
 }
 
 function freezeRecipeValue(value: PlainJsonValue): void {
-  if (value === null || typeof value !== 'object') return;
+  if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return;
   Object.values(value).forEach(freezeRecipeValue);
   Object.freeze(value);
 }
@@ -4262,6 +4326,7 @@ function decimalString(value: unknown, label: string): string {
 }
 
 function normalizeModelRequestRecipe(value: PlainJsonValue, label: string): PlainJsonValue {
+  if (preparedFrozenModelHandleCatalog(value)) return value;
   const normalized = normalizePlainJson(value, label);
   if (!isRecord(normalized)) throw new TypeError(`${label} must be an object.`);
   if ('attachmentCatalog' in normalized) {

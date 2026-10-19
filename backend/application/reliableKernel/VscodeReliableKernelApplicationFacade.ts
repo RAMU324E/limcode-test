@@ -81,7 +81,7 @@ import {
   runtimeCommitNeedsInteractionAttention
 } from './interactionAttention';
 import {
-  conversationHistoryPresentationFromBytes,
+  ConversationHistoryContentReader,
   projectChildConversationHistory
 } from './conversationHistoryProjection';
 
@@ -116,6 +116,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private originLinks: ConversationOriginLinkRecord[] = [];
   private readonly historyPreviewByRevisionId = new Map<string, string>();
   private readonly historyTitleByRevisionId = new Map<string, string>();
+  private historyContentReader: ConversationHistoryContentReader | undefined;
   private historyRefresh: Promise<void> | undefined;
   private historyRefreshPending: {
     promise: Promise<void>;
@@ -133,6 +134,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private hydration: Promise<void> | undefined;
   private unsubscribeCommit: (() => void) | undefined;
   private unsubscribeSteering: (() => void) | undefined;
+  private unsubscribeDatabaseClose: (() => void) | undefined;
+  private runtimeFailure: Error | undefined;
   private activeEditorSubscription: vscode.Disposable | undefined;
   private lastActiveProjectFolderUri: string | undefined;
   private disposed = false;
@@ -180,6 +183,9 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         }
       }
     );
+    this.unsubscribeDatabaseClose = product.application.database.onClose(failure => {
+      if (failure) this.onRuntimeFailure(failure);
+    });
     this.unsubscribeCommit = product.application.database.onCommit((commit) => this.onRuntimeCommit(commit));
     this.unsubscribeSteering = product.application.modelProvider.subscribeSteering((update) => {
       this.broadcast({
@@ -867,6 +873,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       if (this.interactionAttentionRefreshTimer !== undefined) clearTimeout(this.interactionAttentionRefreshTimer);
       this.interactionAttentionRefreshTimer = undefined;
       this.interactionAttentionNotifier.clear();
+      this.unsubscribeDatabaseClose?.();
+      this.unsubscribeDatabaseClose = undefined;
       this.unsubscribeCommit?.();
       this.unsubscribeCommit = undefined;
       this.unsubscribeSteering?.();
@@ -874,6 +882,9 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       this.activeEditorSubscription?.dispose();
       this.activeEditorSubscription = undefined;
       this.externalHistoryWatcher.cancel();
+      this.historyContentReader = undefined;
+      this.historyPreviewByRevisionId.clear();
+      this.historyTitleByRevisionId.clear();
       // Host handoff must not wait behind a projection read which the old Host no longer needs.
       // Closing the product below rejects/settles ordinary database work; keep rejection observed.
       void this.hydration?.catch(() => undefined);
@@ -1159,16 +1170,18 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       titleIds.has(target.revisionId) && !this.historyTitleByRevisionId.has(target.revisionId)
       || previewIds.has(target.revisionId) && !this.historyPreviewByRevisionId.has(target.revisionId)
     );
+    const messageContents = this.historyContentReader ??= new ConversationHistoryContentReader(
+      this.product.application.database, this.product.application.contentStore);
     const settled = await mapSettledWithBoundedConcurrency(
       unresolved,
       HISTORY_CONTENT_READ_CONCURRENCY,
-      (target) => this.product.application.contentStore.read(target.content as unknown as ContentObjectMetadata)
+      (target) => messageContents.read(target.content as ContentObjectMetadata)
     );
     settled.forEach((result, index) => {
       if (result.status !== 'fulfilled') return;
       const target = unresolved[index];
       if (!target) return;
-      const presentation = conversationHistoryPresentationFromBytes(result.value, String(target.content.content_type));
+      const presentation = result.value;
       if (presentation.preview !== undefined) this.historyPreviewByRevisionId.set(target.revisionId, presentation.preview);
       if (presentation.titleContent) this.historyTitleByRevisionId.set(target.revisionId, displayConversationTitle({
         id: target.conversationId,
@@ -1316,7 +1329,29 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     }
   }
 
+  private onRuntimeFailure(error: Error): void {
+    if (this.disposed || this.productClosing || this.runtimeFailure) return;
+    this.runtimeFailure = error;
+    console.error('[LimCode] Runtime 已停止，首次故障：', error);
+    this.externalHistoryWatcher.cancel();
+    if (this.historyRefreshTimer) clearTimeout(this.historyRefreshTimer);
+    if (this.interactionAttentionRefreshTimer) clearTimeout(this.interactionAttentionRefreshTimer);
+    const message = `运行连接已停止：${error.message}。请重载窗口，未发送的输入会保留。`;
+    this.broadcast({ id: randomUUID(), type: BridgeMessageType.Error, channel: 'control',
+      payload: { code: 'runtime_unavailable', message } });
+    // Quiesce through the existing handoff. Failed cleanup retains ownership until reload;
+    // it must never grant a peer execution while native work is still in flight.
+    void this.closeProduct().catch(closeError => console.error('[LimCode] Runtime 故障收尾未完成。', closeError));
+    void vscode.window.showErrorMessage(`${EXTENSION_BRAND}：${message}`, '重载窗口').then(async choice => {
+      if (!choice) return;
+      this.broadcast({ id: randomUUID(), type: BridgeMessageType.ComposerDraftSave, channel: 'control' });
+      await new Promise(resolve => setTimeout(resolve, 250));
+      await vscode.commands.executeCommand('workbench.action.reloadWindow');
+    });
+  }
+
   private requireOpen(): void {
+    if (this.runtimeFailure) throw this.runtimeFailure;
     if (this.disposed || this.productClosing || this.productClosed) throw new Error('可靠 ApplicationFacade 已关闭。');
   }
 }

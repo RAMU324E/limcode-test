@@ -1,0 +1,53 @@
+{
+  "kind": "limcode-phase-f-candidate-evidence",
+  "checkId": "candidate.conversation-fork-links",
+  "stableId": "candidate.conversation-fork-links",
+  "passed": true,
+  "commitSha": "528d720f929acd84ece7d6d7bf8f1c68e8557f1e",
+  "measuredAt": "2026-09-11T10:17:50.173Z",
+  "assertionCount": 9,
+  "provenance": {
+    "worktreeClean": false,
+    "commitExplicitlyBound": false,
+    "authoritative": false,
+    "runnerSha256": "4e7bcd9adc82c715b6203e8d9f4f094dca5f50da58f27d8f89eac8ee654e845a",
+    "sourceTreeSha256": "5d344fdf3a880d1c34e784b051002b48de031afe14105394cee38893e9451f28",
+    "sourceFileCount": 487,
+    "sourceFilesTracked": false,
+    "compiledKernelSha256": "008b012c5869cfad313407aa67cb16898abf0b86988a74e88b01a78df624333c",
+    "compiledFileCount": 226,
+    "compileProvenance": "dist/extension/reliable-kernel-compile-provenance.json",
+    "compileWorktreeClean": false,
+    "compiledClosureMatches": false,
+    "invocation": [
+      "/Users/lurenxing/.local/node-v24.15.0-darwin-arm64/bin/node",
+      "/Users/lurenxing/GitHub/limcode-test/scripts/reliable-kernel/run-phase-f-check.mjs",
+      "--check",
+      "candidate.conversation-fork-links"
+    ],
+    "node": "v24.15.0",
+    "sqlite": "3.53.4",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5"
+  },
+  "assertions": [
+    "消息边界fork强制携带精确Context segment；fork中间故障使target Conversation/root/head/三类Link整笔SQLite事务回滚",
+    "Reuse/Branch/Origin/ConversationProjectLink保持独立，fork原子继承ProjectContext并以新Message/Revision身份投影可见历史",
+    "fork后目标续聊从复制序列继续递增，并与源Conversation的Message membership和Context head独立演进",
+    "fork后source/target独立append形成不同后继，原共享前缀保持immutable",
+    "压缩后的B分支保留历史root，仍可从压缩前C递归fork并精确截止；裁断Turn降级为interrupted，Compression anchor只选目标Conversation消息",
+    "完整failed Turn无需final-output fence即可保留真实终态；只有被边界裁断的Turn降级",
+    "含终结ModelRequest/Operation/Attempt的历史转录经historicalCopy通道复制进fork目标，不再撞创建不变量",
+    "Message soft-delete后仍可按immutable历史MessageRevision/root fork，不读取当前删除状态重解释历史",
+    "同一parent并发fork创建独立target且均引用同一共享前缀，没有复制历史正文或节点"
+  ],
+  "faults": [
+    "fork writer transaction fault after relation inserts",
+    "stale expected source head"
+  ],
+  "metrics": {
+    "concurrentForks": 2,
+    "sharedPrefixCopiedNodes": 0
+  }
+}

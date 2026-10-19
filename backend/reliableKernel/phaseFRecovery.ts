@@ -4,6 +4,7 @@ import {
   childContinuationTurnId,
   childInterruptionRecoverySourceKey,
   ChildExecutionControlPlane,
+  CHILD_INTENT_ANSWER_WAIT_OWNER_KIND,
   CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
   LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND
 } from './childExecution';
@@ -36,6 +37,7 @@ export interface PhaseFRecoveryResult {
 interface ContinuationWaitOwner {
   childExecutionId: string;
   answerBridge: DomainRow;
+  turnIntentId?: string;
 }
 
 interface PhaseFScanContext {
@@ -114,7 +116,7 @@ export class PhaseFRecoveryScanner {
   }
 
   private async settleInterruptedTaskWaits(signal: AbortSignal | undefined, context: PhaseFScanContext): Promise<void> {
-    const operations = (await Promise.all(['child_execution', CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
+    const operations = (await Promise.all(['child_execution', CHILD_INTENT_ANSWER_WAIT_OWNER_KIND, CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
       LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND].map(owner_kind => listAllDomainRows(this.database, 'Operation', {
       owner_kind, status: 'waiting_answer'
     })))).flat().filter(operation => operation.tool_call_id !== null);
@@ -408,6 +410,10 @@ export class PhaseFRecoveryScanner {
     ]));
     const continuationOperations = [
       ...await listAllDomainRows(this.database, 'Operation', {
+        owner_kind: CHILD_INTENT_ANSWER_WAIT_OWNER_KIND,
+        status: 'waiting_answer'
+      }),
+      ...await listAllDomainRows(this.database, 'Operation', {
         owner_kind: CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
         status: 'waiting_answer'
       }),
@@ -455,6 +461,7 @@ export class PhaseFRecoveryScanner {
           if (!owner) throw new Error(`Continuation wait ${String(continuation.id)} has no exact owner.`);
           const settled = await this.children.settleContinuationWaits({
             answerBridgeId: String(owner.answerBridge.id),
+            ...(owner.turnIntentId ? { turnIntentId: owner.turnIntentId } : {}),
             toolCallId,
             detail: { timeout: true, recovered: true },
             sourceIdentity: `recovery-foreground-timeout:${toolCallId}:${String(deadline)}`,
@@ -529,10 +536,9 @@ export class PhaseFRecoveryScanner {
         owner_kind: 'child_execution',
         status: 'waiting_answer'
       }),
-      listAllDomainRows(this.database, 'Operation', {
-        owner_kind: CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
-        status: 'waiting_answer'
-      }),
+      Promise.all([CHILD_INTENT_ANSWER_WAIT_OWNER_KIND, CHILD_TURN_ANSWER_WAIT_OWNER_KIND].map(owner_kind =>
+        listAllDomainRows(this.database, 'Operation', { owner_kind, status: 'waiting_answer' })
+      )).then(groups => groups.flat()),
       listAllDomainRows(this.database, 'Operation', {
         owner_kind: LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND,
         status: 'waiting_answer'
@@ -762,19 +768,22 @@ export class PhaseFRecoveryScanner {
     }
   }
 
-  /** Bulk-resolves legacy bridge owners and deterministic future-Turn owners without row caps. */
+  /** Current waits resolve their Intent relation; only published owners need reverse lookup. */
   private async resolveContinuationWaitOwners(
     operations: DomainRow[]
   ): Promise<Map<string, ContinuationWaitOwner>> {
     const result = new Map<string, ContinuationWaitOwner>();
     if (operations.length === 0) return result;
+    const intentOperations = operations.filter((operation) =>
+      operation.owner_kind === CHILD_INTENT_ANSWER_WAIT_OWNER_KIND
+    );
     const generationOperations = operations.filter((operation) =>
       operation.owner_kind === CHILD_TURN_ANSWER_WAIT_OWNER_KIND
     );
     const legacyOperations = operations.filter((operation) =>
       operation.owner_kind === LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND
     );
-    if (generationOperations.length + legacyOperations.length !== operations.length) {
+    if (intentOperations.length + generationOperations.length + legacyOperations.length !== operations.length) {
       throw new Error('Continuation owner resolution received an unsupported Operation owner_kind.');
     }
 
@@ -804,7 +813,17 @@ export class PhaseFRecoveryScanner {
       }
     }
 
-    const generationChildIds = [...new Set(childByGeneration.values())];
+    const childByIntent = new Map<string, string>();
+    const intentOwnerIds = [...new Set(intentOperations.map(operation => String(operation.owner_id)))];
+    const intentOwners = intentOwnerIds.length === 0 ? [] : (await this.database.snapshot(intentOwnerIds.map(turnIntentId =>
+      DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').list({ where: { turn_intent_id: turnIntentId }, limit: 2 })
+    ))).snapshot;
+    for (const [index, turnIntentId] of intentOwnerIds.entries()) {
+      const links = requireRows(intentOwners[index], `ChildExecutionIntentLink ${turnIntentId} lookup`);
+      if (links.length !== 1) throw new Error(`Continuation Intent ${turnIntentId} must have one ChildExecutionIntentLink.`);
+      childByIntent.set(turnIntentId, String(links[0].child_execution_id));
+    }
+    const generationChildIds = [...new Set([...childByGeneration.values(), ...childByIntent.values()])];
     const legacyBridgeIds = [...new Set(legacyOperations.map((operation) =>
       String(operation.owner_id)
     ))];
@@ -833,6 +852,11 @@ export class PhaseFRecoveryScanner {
       bridgeByChild.set(childExecutionId, rows[0]);
     }
 
+    for (const operation of intentOperations) {
+      const childExecutionId = childByIntent.get(String(operation.owner_id))!;
+      result.set(String(operation.id), { childExecutionId, answerBridge: bridgeByChild.get(childExecutionId)!,
+        turnIntentId: String(operation.owner_id) });
+    }
     for (const operation of generationOperations) {
       const childExecutionId = childByGeneration.get(String(operation.owner_id))!;
       result.set(String(operation.id), {

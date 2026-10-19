@@ -67,6 +67,7 @@ import {
 import { ConversationHostIneligibleError } from '../../reliableKernel/ConversationRuntimeOwnerManager';
 import { EXTENSION_BRAND } from '../../../shared/extensionIdentity';
 import type { RuntimeWriteGate } from './runtimeWriteGate';
+import { resolveDroppedResources } from './droppedResources';
 
 /**
  * Webview commands that only read or show something: allowed while this window is frozen for an
@@ -1165,7 +1166,7 @@ export class VscodeReliableKernelCommandRouter {
     try {
       model = await this.product.providerRegistry.probeOpenAICompatibleThinking(payload.config);
     } catch (error) {
-      this.postRequestError(webview, BridgeMessageType.LlmProviderModelsGet, errorMessage(error), correlationId);
+      this.postRequestError(webview, BridgeMessageType.LlmProviderModelsGet, error instanceof Error ? error.message : String(error), correlationId);
       return;
     }
     this.post(webview, {
@@ -1184,9 +1185,10 @@ export class VscodeReliableKernelCommandRouter {
   }
 
   private async postFsStats(webview: vscode.Webview, paths: string[], correlationId?: string): Promise<void> {
-    const results = await Promise.all(paths.map(async (inputPath) => {
+    const results = await Promise.all(resolveDroppedResources(paths).map(async (uri) => {
+      const inputPath = uri.scheme === 'file' ? uri.fsPath : uri.toString();
       try {
-        const stat = await vscode.workspace.fs.stat(vscode.Uri.file(inputPath));
+        const stat = await vscode.workspace.fs.stat(uri);
         return {
           path: inputPath,
           isDirectory: (stat.type & vscode.FileType.Directory) !== 0,
@@ -2544,14 +2546,7 @@ function attachmentExtension(mimeType: string): string {
 }
 
 function errorMessage(error: unknown): string {
-  if (!(error instanceof Error)) return String(error);
-  const cause = (error as { cause?: unknown }).cause;
-  const causeText = cause instanceof Error ? cause.message : typeof cause === 'string' ? cause : '';
-  const code = cause && typeof cause === 'object' && 'code' in cause && typeof (cause as { code?: unknown }).code === 'string'
-    ? (cause as { code: string }).code
-    : '';
-  const detail = [causeText.trim(), code && !causeText.includes(code) ? code : ''].filter(Boolean).join(' ');
-  return detail && !error.message.includes(detail) ? `${error.message}: ${detail}` : error.message;
+  return error instanceof Error ? error.message : String(error);
 }
 
 function isFileNotFoundError(error: unknown): boolean {

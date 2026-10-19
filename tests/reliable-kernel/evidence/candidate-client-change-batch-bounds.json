@@ -1,0 +1,50 @@
+{
+  "kind": "limcode-phase-f-candidate-evidence",
+  "checkId": "candidate.client-change-batch-bounds",
+  "stableId": "candidate.client-change-batch-bounds",
+  "passed": true,
+  "commitSha": "b967bdca78d7934760628fabed3449c5f192dfc8",
+  "measuredAt": "2026-08-21T01:26:33.055Z",
+  "assertionCount": 5,
+  "provenance": {
+    "worktreeClean": true,
+    "commitExplicitlyBound": false,
+    "authoritative": false,
+    "runnerSha256": "4e7bcd9adc82c715b6203e8d9f4f094dca5f50da58f27d8f89eac8ee654e845a",
+    "sourceTreeSha256": "ce6e3695e0a8823ed6b089e4022d2fb4d7ed362ad672c2cb7809fbffe3bacbce",
+    "sourceFileCount": 455,
+    "sourceFilesTracked": true,
+    "compiledKernelSha256": "f1536abe2fe3b04032bb384dcbbd7bd586182d7159cd6b1badaa0f3238cf2a3c",
+    "compiledFileCount": 194,
+    "compileProvenance": "dist/extension/reliable-kernel-compile-provenance.json",
+    "compileWorktreeClean": true,
+    "compiledClosureMatches": true,
+    "invocation": [
+      "/Users/lurenxing/.local/node-v24.15.0-darwin-arm64/bin/node",
+      "/Users/lurenxing/GitHub/limcode-test/scripts/reliable-kernel/run-phase-f-check.mjs",
+      "--check=candidate.client-change-batch-bounds"
+    ],
+    "node": "v24.15.0",
+    "sqlite": "3.53.4",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5"
+  },
+  "assertions": [
+    "普通SQLite commit只产生一个typed upsert/remove atomic batch，records/实际wire bytes受限且不拆分",
+    "不属于当前Client projection的commit不生成空changes、不占用单inflight ACK通道",
+    "single commit 501 records不形成half-visible拆包，直接coalesce为新bounded snapshot",
+    "已连接Conversation无需snapshot即可增量接收MessageTurnLink，以及同commit互相建立可达性的Process+ProcessOriginLink",
+    "客户端整批copy-on-write原子应用；messageSeq保证传输连续，commitSeq允许跨过不可见提交但拒绝回退；unknown type/apply failure/乱序均作废整批并请求snapshot，hostBoot/session变化同时丢弃旧增量状态"
+  ],
+  "faults": [
+    "single oversized commit by record count",
+    "snapshot-only structural link after initial feed connection",
+    "unknown change type after a valid first change",
+    "messageSeq gap, commitSeq regression and hostBootId change"
+  ],
+  "metrics": {
+    "normalBatchRecords": 10,
+    "normalBatchBytes": 2306
+  }
+}

@@ -1,3 +1,5 @@
+import { cancelIntentDeliverySteps } from './deliverySettlementSteps';
+import { LogicalMessageContentReader, logicalMessageContentType } from './logicalMessageContent';
 import type { ExecutionLeaseFence } from './executionLeaseFence';
 import { committedInitialExecutionFence, requireInitialLeaseDuration } from './initialExecutionLease';
 import type { AttachmentIngestService, PreparedMessageAttachmentAdmission } from './attachmentIngest';
@@ -10,7 +12,9 @@ import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { ContextSequenceControlPlane } from './contextSequence';
 import { readInitialRuntimeContextForTurn } from './initialRuntimeContext';
 import { normalizeChildForkTurns, prepareChildContextFork, type ChildForkTurns } from './childContextFork';
-import { readConversationChildTaskProjection } from './conversationChildTaskProjection';
+import { readConversationChildTaskProjection, readConversationChildTaskHistory, readConversationChildTaskList, type ConversationChildTaskPageOptions, type ConversationChildTaskScope } from './conversationChildTaskProjection';
+import type { ChildExecutionSnapshot } from './childExecutionFactsSnapshot';
+export type { ChildExecutionSnapshot } from './childExecutionFactsSnapshot';
 import { readConversationChildHandles } from './conversationChildHandles';
 import { assertForkContextHandleReservations } from './forkContextHandleReservations';
 import { prepareCollaborationCapacity, CollaborationMembershipChangedError } from './collaborationCapacity';
@@ -75,13 +79,16 @@ import {
 import { listAllDomainRows } from './repositoryPagination';
 import { childRuntimeTaskContinuationLineage, isChildTaskIntent, isChildTaskTurn } from './childTaskTurn';
 import {
+  queuedIntentPendingInputId,
+  CHILD_INTENT_ANSWER_WAIT_OWNER_KIND,
   CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
   LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND,
   childContinuationTurnId,
   sendIdentityIds,
-  resolveLegacyContinuationWaitOperations
+  resolveLegacyContinuationWaitOperations,
+  resolveLegacyContinuationWaitTargets
 } from './childSendLineage';
-export { CHILD_TURN_ANSWER_WAIT_OWNER_KIND, LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND, childContinuationTurnId } from './childSendLineage';
+export { CHILD_INTENT_ANSWER_WAIT_OWNER_KIND, CHILD_TURN_ANSWER_WAIT_OWNER_KIND, LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND, childContinuationTurnId } from './childSendLineage';
 import { RuntimeDatabase } from './runtimeDatabase';
 import type { HistoryPreparationPermit } from './historyPreparationAdmission';
 import { retryLocalExecution } from './localExecutionRecovery';
@@ -308,15 +315,6 @@ export interface PendingChildContinuation {
   intentSeq: string;
 }
 
-export interface ChildExecutionSnapshot {
-  childExecution: DomainRow;
-  parentLink: DomainRow;
-  turnLinks: DomainRow[];
-  activeTurnLink: DomainRow | null;
-  activeTurn: DomainRow | null;
-  answerBridge: DomainRow;
-  currentSubmission: DomainRow | null;
-}
 
 export interface PreparedForegroundSettlement {
   toolCallId: string;
@@ -406,6 +404,7 @@ export class ChildExecutionControlPlane {
   private readonly systemClock: boolean;
   private readonly authorityCompiler: TurnAuthorityCompiler;
   private readonly contextSequence: ContextSequenceControlPlane;
+  private readonly messageContents: LogicalMessageContentReader;
   private readonly attachments: AttachmentIngestService | undefined;
   private readonly prepareNextTurnDeliverySteps?: ChildExecutionControlPlaneOptions['prepareNextTurnDeliverySteps'];
   private readonly prepareRuntimeContinuationSteps: ChildExecutionControlPlaneOptions['prepareRuntimeContinuationSteps'];
@@ -423,15 +422,25 @@ export class ChildExecutionControlPlane {
     this.systemClock = options.now === undefined;
     this.authorityCompiler = options.authorityCompiler;
     this.contextSequence = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
+    this.messageContents = new LogicalMessageContentReader(database, contentStore);
     this.attachments = options.attachments;
     this.prepareNextTurnDeliverySteps = options.prepareNextTurnDeliverySteps;
     this.prepareRuntimeContinuationSteps = options.prepareRuntimeContinuationSteps;
   }
 
   /** Model-facing task observations are reconstructed from committed lineage and source facts. */
-  public readConversationTaskProjection(conversationId: string) {
+  public readConversationTaskProjection(conversationId: string, childExecutionIds?: string[]) {
     return readConversationChildTaskProjection(this.database, this.contentStore,
-      requirePhaseFId(conversationId, 'conversationId'));
+      requirePhaseFId(conversationId, 'conversationId'), { kind: 'current', ...(childExecutionIds ? { childExecutionIds } : {}) });
+  }
+
+  public readConversationTaskList(conversationId: string, options: ConversationChildTaskPageOptions = {}) {
+    return readConversationChildTaskList(this.database, this.contentStore, requirePhaseFId(conversationId, 'conversationId'), options);
+  }
+
+  public readConversationTaskHistory(conversationId: string,
+    options: { childExecutionId: string; scope?: ConversationChildTaskScope; limit?: number; cursor?: string }) {
+    return readConversationChildTaskHistory(this.database, this.contentStore, requirePhaseFId(conversationId, 'conversationId'), options);
   }
 
   /** Persistent child references frozen in the Conversation's request history, including a fork's copies. */
@@ -1350,8 +1359,8 @@ export class ChildExecutionControlPlane {
       }),
       DOMAIN_REPOSITORIES.domain('Operation').insertWithNextSequence({
         id: ids.operationId,
-        owner_kind: CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
-        owner_id: childContinuationTurnId(command.childExecutionId, ids.turnIntentId),
+        owner_kind: CHILD_INTENT_ANSWER_WAIT_OWNER_KIND,
+        owner_id: ids.turnIntentId,
         tool_call_id: command.sourceToolCallId,
         status: command.completionPolicy === 'wait_for_answer' ? 'waiting_answer' : 'succeeded',
         created_at: now,
@@ -1359,8 +1368,8 @@ export class ChildExecutionControlPlane {
       }, {
         column: 'operation_seq',
         scope: {
-          owner_kind: CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
-          owner_id: childContinuationTurnId(command.childExecutionId, ids.turnIntentId)
+          owner_kind: CHILD_INTENT_ANSWER_WAIT_OWNER_KIND,
+          owner_id: ids.turnIntentId
         }
       }),
       ...(command.completionPolicy === 'wait_for_answer' ? [
@@ -1479,13 +1488,10 @@ export class ChildExecutionControlPlane {
       state: 'pending'
     }, 1)).length > 0) return null;
     if (snapshot.answerBridge.status === 'closed') return null;
-    const allTurnLinks = await listAllDomainRows(this.database, 'ChildExecutionTurnLink', {
-      child_execution_id: command.childExecutionId
-    });
-    const sourceLink = allTurnLinks.find((link) => link.turn_id === command.sourceTurnId);
-    if (!sourceLink) throw new Error('Runtime delivery source Turn is not a member of the ChildExecution.');
+    const [sourceLink] = await this.listRows('ChildExecutionTurnLink', { turn_id: command.sourceTurnId }, 2);
+    if (!sourceLink || sourceLink.child_execution_id !== command.childExecutionId) throw new Error('Runtime delivery source Turn is not a member of the ChildExecution.');
     const taskLineage = await childRuntimeTaskContinuationLineage(
-      this.database, this.contentStore, command.childExecutionId, command.sourceTurnId, allTurnLinks
+      this.database, this.contentStore, command.childExecutionId, command.sourceTurnId
     );
     if (!taskLineage) return null;
     const sourceTurn = await this.requireExisting('Turn', command.sourceTurnId);
@@ -1546,10 +1552,6 @@ export class ChildExecutionControlPlane {
           child_execution_id: command.childExecutionId,
           state: 'pending'
         }),
-        DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assertExactIds(
-          { child_execution_id: command.childExecutionId },
-          allTurnLinks.map((link) => requirePhaseFId(link.id, 'ChildExecutionTurnLink.id'))
-        ),
         DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assert(
           requirePhaseFId(sourceLink.id, 'ChildExecutionTurnLink.id'),
           {
@@ -1765,7 +1767,7 @@ export class ChildExecutionControlPlane {
       'queued child message ContentObject.id'
     );
     const taskIntent = await isChildTaskIntent(this.database, this.contentStore, command.childExecutionId, command.turnIntentId);
-    const messageContentType = requirePhaseFText(messageContentObject.content_type, 'ContentObject.content_type');
+    const messageContentType = logicalMessageContentType(requirePhaseFText(messageContentObject.content_type, 'ContentObject.content_type'));
     const workspace = await projectFolderForConversation(this.database, childConversationId);
     const inheritedBoundary = await this.frozenWorkEnvironmentPolicyForTurn(
       requirePhaseFId(previousTurn.id, 'previous Turn.id')
@@ -1796,7 +1798,7 @@ export class ChildExecutionControlPlane {
     );
     const messageContentBytes = invisibleRuntimeDelivery
       ? undefined
-      : await this.contentStore.read(messageContentObject as ContentObjectMetadata);
+      : await this.messageContents.read(messageContentObject as ContentObjectMetadata);
     const attachmentAdmission: PreparedMessageAttachmentAdmission | null = invisibleRuntimeDelivery
       ? null
       : this.attachments
@@ -2158,6 +2160,12 @@ export class ChildExecutionControlPlane {
       command.sourceKey
     );
     const now = this.timestamp();
+    const cancelledDeliverySteps: RepositoryTransactionStep[] = [];
+    for (const link of targetPendingIntentLinks) {
+      cancelledDeliverySteps.push(...await cancelIntentDeliverySteps(
+        this.database, String(link.turn_intent_id), 'child-continuation-cancelled', now
+      ));
+    }
     const liveActiveTurns = targetActiveTurns.filter((turn) => turn.status === ACTIVE_TURN);
     const shouldTerminalize = liveActiveTurns.length === 0;
     const newTerminationTurns = targetActiveTurns.filter((turn) =>
@@ -2205,7 +2213,7 @@ export class ChildExecutionControlPlane {
             .map((link) => requirePhaseFId(link.id, 'ChildExecutionActiveTurnLink.id'))
         ),
         DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').assertExactIds(
-          { child_execution_id: lineage.id },
+          { child_execution_id: lineage.id, state: 'pending' },
           tree.intentLinks
             .filter((link) => link.child_execution_id === lineage.id)
             .map((link) => requirePhaseFId(link.id, 'ChildExecutionIntentLink.id'))
@@ -2267,6 +2275,7 @@ export class ChildExecutionControlPlane {
         child_execution_intent_link_id: link.id,
         created_at: now
       })),
+      ...cancelledDeliverySteps,
       ...targetPendingIntentLinks.flatMap((link) => [
         DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').assert(link.id as string, { state: 'pending' }),
         DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').update(link.id as string, {
@@ -2431,151 +2440,12 @@ export class ChildExecutionControlPlane {
 
   /** Identity-scoped read; no answer/delivery state is consumed. */
   public async readExecutionSnapshot(childExecutionIdInput: string): Promise<ChildExecutionSnapshot> {
-    const childExecutionId = requirePhaseFId(childExecutionIdInput, 'childExecutionId');
-    const barrier = await this.database.snapshot([
-      DOMAIN_REPOSITORIES.domain('ChildExecution').get(childExecutionId),
-      DOMAIN_REPOSITORIES.domain('ChildExecutionParentLink').list({
-        where: { child_execution_id: childExecutionId },
-        limit: 2
-      }),
-      DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').list({
-        where: { child_execution_id: childExecutionId },
-        limit: 2
-      }),
-      DOMAIN_REPOSITORIES.domain('AnswerBridge').list({
-        where: { child_execution_id: childExecutionId },
-        limit: 2
-      })
-    ]);
-    const childExecution = requireRow(barrier.snapshot[0], `ChildExecution ${childExecutionId}`);
-    const parentLinks = requireRows(barrier.snapshot[1], 'ChildExecutionParentLink snapshot');
-    const activeLinks = requireRows(barrier.snapshot[2], 'ChildExecutionActiveTurnLink snapshot');
-    const bridges = requireRows(barrier.snapshot[3], 'AnswerBridge snapshot');
-    if (parentLinks.length !== 1) throw new Error('ChildExecution must have exactly one stable ParentLink.');
-    if (activeLinks.length > 1) throw new Error('ChildExecution has multiple ActiveTurnLinks.');
-    if (bridges.length !== 1) throw new Error('ChildExecution must have exactly one AnswerBridge.');
-    const activeTurnLink = activeLinks[0] ?? null;
-    const bridge = bridges[0];
-    const turnLinks = (await listAllDomainRows(this.database, 'ChildExecutionTurnLink', {
-      child_execution_id: childExecutionId
-    })).sort((left, right) => compareBigInt(left.turn_seq, right.turn_seq));
-    const targetReads = [
-      ...(activeTurnLink
-        ? [DOMAIN_REPOSITORIES.domain('Turn').get(
-            requirePhaseFId(activeTurnLink.turn_id, 'ChildExecutionActiveTurnLink.turn_id')
-          )]
-        : []),
-      ...(bridge.current_submission_id === null
-        ? []
-        : [DOMAIN_REPOSITORIES.domain('AnswerSubmission').get(
-            requirePhaseFId(bridge.current_submission_id, 'AnswerBridge.current_submission_id')
-          )])
-    ];
-    const targets = targetReads.length > 0
-      ? (await this.database.snapshot(targetReads)).snapshot
-      : [];
-    let targetIndex = 0;
-    const activeTurn = activeTurnLink
-      ? requireRow(targets[targetIndex++], `Turn ${String(activeTurnLink.turn_id)}`)
-      : null;
-    if (activeTurnLink && !activeTurn) throw new Error('ChildExecution ActiveTurnLink target is missing.');
-    const currentSubmission = bridge.current_submission_id === null
-      ? null
-      : requireRow(targets[targetIndex], `AnswerSubmission ${String(bridge.current_submission_id)}`);
-    return {
-      childExecution,
-      parentLink: parentLinks[0],
-      turnLinks,
-      activeTurnLink,
-      activeTurn,
-      answerBridge: bridge,
-      currentSubmission
-    };
+    return (await this.database.childExecutionSnapshot(requirePhaseFId(childExecutionIdInput, 'childExecutionId'))).snapshot;
   }
 
-  /** Reads a bounded child page and bulk-resolves every uncapped relation/target identity. */
+  /** A bounded child page with only its current identities and referenced Turn generations. */
   public async list(limit = 200): Promise<ChildExecutionSnapshot[]> {
-    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 200) {
-      throw new RangeError('ChildExecution list limit must be from 1 to 200.');
-    }
-    const barrier = await this.database.snapshot([
-      DOMAIN_REPOSITORIES.domain('ChildExecution').list({
-        orderBy: { column: 'created_at', direction: 'desc' },
-        limit
-      })
-    ]);
-    const children = requireRows(barrier.snapshot[0], 'ChildExecution list snapshot');
-    if (children.length === 0) return [];
-    const childIds = new Set(children.map((child) =>
-      requirePhaseFId(child.id, 'ChildExecution.id')
-    ));
-    const [allParents, allMemberships, allActiveLinks, allBridges] = await Promise.all([
-      listAllDomainRows(this.database, 'ChildExecutionParentLink'),
-      listAllDomainRows(this.database, 'ChildExecutionTurnLink'),
-      listAllDomainRows(this.database, 'ChildExecutionActiveTurnLink'),
-      listAllDomainRows(this.database, 'AnswerBridge')
-    ]);
-    const parents = allParents.filter((row) => childIds.has(String(row.child_execution_id)));
-    const memberships = allMemberships.filter((row) => childIds.has(String(row.child_execution_id)));
-    const activeLinks = allActiveLinks.filter((row) => childIds.has(String(row.child_execution_id)));
-    const bridges = allBridges.filter((row) => childIds.has(String(row.child_execution_id)));
-    const activeTurnIds = [...new Set(activeLinks.map((row) =>
-      requirePhaseFId(row.turn_id, 'ChildExecutionActiveTurnLink.turn_id')
-    ))];
-    const currentSubmissionIds = [...new Set(bridges
-      .filter((row) => row.current_submission_id !== null)
-      .map((row) => requirePhaseFId(
-        row.current_submission_id,
-        'AnswerBridge.current_submission_id'
-      )))];
-    const targetSnapshot = activeTurnIds.length + currentSubmissionIds.length === 0
-      ? []
-      : (await this.database.snapshot([
-          ...activeTurnIds.map((id) => DOMAIN_REPOSITORIES.domain('Turn').get(id)),
-          ...currentSubmissionIds.map((id) =>
-            DOMAIN_REPOSITORIES.domain('AnswerSubmission').get(id)
-          )
-        ])).snapshot;
-    const turnsById = new Map(activeTurnIds.map((id, index) => [
-      id,
-      requireRow(targetSnapshot[index], `Turn ${id}`)
-    ]));
-    const submissionsById = new Map(currentSubmissionIds.map((id, index) => [
-      id,
-      requireRow(targetSnapshot[activeTurnIds.length + index], `AnswerSubmission ${id}`)
-    ]));
-    return children.map((child) => {
-      const childId = requirePhaseFId(child.id, 'ChildExecution.id');
-      const parentRows = parents.filter((row) => row.child_execution_id === childId);
-      const activeRows = activeLinks.filter((row) => row.child_execution_id === childId);
-      const bridgeRows = bridges.filter((row) => row.child_execution_id === childId);
-      if (parentRows.length !== 1 || activeRows.length > 1 || bridgeRows.length !== 1) {
-        throw new Error(`ChildExecution ${childId} link cardinality is invalid.`);
-      }
-      const activeTurnLink = activeRows[0] ?? null;
-      const answerBridge = bridgeRows[0];
-      return {
-        childExecution: child,
-        parentLink: parentRows[0],
-        turnLinks: memberships
-          .filter((row) => row.child_execution_id === childId)
-          .sort((left, right) => compareBigInt(left.turn_seq, right.turn_seq)),
-        activeTurnLink,
-        activeTurn: activeTurnLink
-          ? turnsById.get(requirePhaseFId(
-              activeTurnLink.turn_id,
-              'ChildExecutionActiveTurnLink.turn_id'
-            )) ?? null
-          : null,
-        answerBridge,
-        currentSubmission: answerBridge.current_submission_id === null
-          ? null
-          : submissionsById.get(requirePhaseFId(
-              answerBridge.current_submission_id,
-              'AnswerBridge.current_submission_id'
-            )) ?? null
-      };
-    });
+    return (await this.database.childExecutionList(limit)).snapshot;
   }
 
   /** Local timeout has no durable side effect; each observed state is from one SQLite snapshot. */
@@ -2619,6 +2489,7 @@ export class ChildExecutionControlPlane {
     detail: unknown;
     sourceIdentity: string;
     observedAt?: string;
+    turnIntentId?: string;
     sourceTurnId?: string;
     toolCallId?: string;
     status?: ToolOutcomeStatus;
@@ -2636,6 +2507,7 @@ export class ChildExecutionControlPlane {
     const operations = await this.readContinuationWaitOperations({
       bridge,
       status: 'waiting_answer',
+      ...(input.turnIntentId === undefined ? {} : { turnIntentId: requirePhaseFId(input.turnIntentId, 'turnIntentId') }),
       ...(sourceTurnId ? { sourceTurnId } : {}),
       ...(toolCallId ? { toolCallId } : {})
     });
@@ -2666,6 +2538,7 @@ export class ChildExecutionControlPlane {
   /** Read-only generation-resolved continuation waits used by answer/recovery orchestration. */
   public async listContinuationWaitOperations(input: {
     answerBridgeId: string;
+    turnIntentId?: string;
     status?: string;
     sourceTurnId?: string;
     toolCallId?: string;
@@ -2674,6 +2547,7 @@ export class ChildExecutionControlPlane {
     const bridge = await this.requireExisting('AnswerBridge', answerBridgeId);
     return this.readContinuationWaitOperations({
       bridge,
+      ...(input.turnIntentId === undefined ? {} : { turnIntentId: requirePhaseFId(input.turnIntentId, 'turnIntentId') }),
       ...(input.status === undefined ? {} : { status: requirePhaseFText(input.status, 'status') }),
       ...(input.sourceTurnId === undefined
         ? {}
@@ -2685,12 +2559,13 @@ export class ChildExecutionControlPlane {
   }
 
   /**
-   * A continuation wait is owned by the stable Turn id that its TurnIntent will admit. This is the
-   * durable generation fence: a submission from one child Turn cannot observe or settle a wait for
-   * an older/newer generation, even when both transactions share the same millisecond timestamp.
+   * A continuation wait owns its exact TurnIntent, before and after admission or cancellation.
+   * The Intent's admitted Turn is the generation fence for an answer; published future-Turn and
+   * bridge owners keep their original exact read paths.
    */
   private async readContinuationWaitOperations(input: {
     bridge: DomainRow;
+    turnIntentId?: string;
     status?: string;
     sourceTurnId?: string;
     toolCallId?: string;
@@ -2699,61 +2574,18 @@ export class ChildExecutionControlPlane {
       input.bridge.child_execution_id,
       'AnswerBridge.child_execution_id'
     );
-    const intentLinks = await listAllDomainRows(this.database, 'ChildExecutionIntentLink', {
-      child_execution_id: childExecutionId
-    });
-    const targetTurnIds = new Set(intentLinks.map((link) => childContinuationTurnId(
-      childExecutionId,
-      requirePhaseFId(link.turn_intent_id, 'ChildExecutionIntentLink.turn_intent_id')
-    )));
-    if (input.sourceTurnId) {
-      const memberships = await this.listRows('ChildExecutionTurnLink', {
-        turn_id: input.sourceTurnId
-      }, 2);
-      if (memberships.length !== 1 || memberships[0].child_execution_id !== childExecutionId) {
-        throw new Error('Continuation answer source Turn is not a member of its AnswerBridge ChildExecution.');
-      }
-    }
-    const legacy = await listAllDomainRows(this.database, 'Operation', {
-      owner_kind: LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND,
-      owner_id: requirePhaseFId(input.bridge.id, 'AnswerBridge.id'),
+    const facts = (await this.database.childContinuationWaitFacts({ childExecutionId,
+      ...(input.turnIntentId ? { turnIntentId: input.turnIntentId } : {}),
+      ...(input.sourceTurnId ? { sourceTurnId: input.sourceTurnId } : {}),
       ...(input.status ? { status: input.status } : {}),
-      ...(input.toolCallId ? { tool_call_id: input.toolCallId } : {})
-    });
+      ...(input.toolCallId ? { toolCallId: input.toolCallId } : {}) })).snapshot;
+    const current = facts.operations;
     const resolvedLegacy = await resolveLegacyContinuationWaitOperations(this.database, this.contentStore, {
-      childExecutionId,
-      operations: legacy,
-      intentLinks,
+      childExecutionId, operations: facts.legacyOperations, intentLinks: facts.intentLinks,
+      ...(input.turnIntentId ? { turnIntentId: input.turnIntentId } : {}),
       ...(input.sourceTurnId ? { sourceTurnId: input.sourceTurnId } : {})
     });
 
-    let current: DomainRow[];
-    if (input.sourceTurnId) {
-      current = targetTurnIds.has(input.sourceTurnId)
-        ? await listAllDomainRows(this.database, 'Operation', {
-            owner_kind: CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
-            owner_id: input.sourceTurnId,
-            ...(input.status ? { status: input.status } : {}),
-            ...(input.toolCallId ? { tool_call_id: input.toolCallId } : {})
-          })
-        : [];
-    } else if (input.toolCallId) {
-      const rows = await listAllDomainRows(this.database, 'Operation', {
-        tool_call_id: input.toolCallId,
-        ...(input.status ? { status: input.status } : {})
-      });
-      current = rows.filter((operation) =>
-        operation.owner_kind === CHILD_TURN_ANSWER_WAIT_OWNER_KIND
-        && targetTurnIds.has(requirePhaseFId(operation.owner_id, 'Operation.owner_id'))
-      );
-    } else {
-      current = (await listAllDomainRows(this.database, 'Operation', {
-        owner_kind: CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
-        ...(input.status ? { status: input.status } : {})
-      })).filter((operation) => targetTurnIds.has(
-        requirePhaseFId(operation.owner_id, 'Operation.owner_id')
-      ));
-    }
     return [...current, ...resolvedLegacy].sort((left, right) =>
       compareBigInt(left.operation_seq, right.operation_seq)
       || String(left.id).localeCompare(String(right.id))
@@ -2863,18 +2695,30 @@ export class ChildExecutionControlPlane {
       const first = await this.listRows('ChildExecutionTurnLink', { child_execution_id: operation.owner_id, turn_seq: 1n }, 2);
       if (first.length !== 1) return false;
       membership = first[0];
+    } else if (operation.owner_kind === CHILD_INTENT_ANSWER_WAIT_OWNER_KIND) {
+      const intent = await this.requireExisting('TurnIntent', requirePhaseFId(operation.owner_id, 'Operation.owner_id'));
+      if (intent.state !== 'admitted' || intent.turn_id === null) return false;
+      const relations = await this.listRows('ChildExecutionIntentLink', { turn_intent_id: intent.id }, 2);
+      const members = await this.listRows('ChildExecutionTurnLink', { turn_id: intent.turn_id }, 2);
+      if (relations.length !== 1 || members.length !== 1
+        || relations[0].child_execution_id !== members[0].child_execution_id) return false;
+      membership = members[0];
     } else if (operation.owner_kind === CHILD_TURN_ANSWER_WAIT_OWNER_KIND) {
       const members = await this.listRows('ChildExecutionTurnLink', { turn_id: operation.owner_id }, 2);
       if (members.length !== 1) return false; // A later queued task has not acquired a Turn yet.
       membership = members[0];
     } else if (operation.owner_kind === LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND) {
       const bridge = await this.requireExisting('AnswerBridge', requirePhaseFId(operation.owner_id, 'Operation.owner_id'));
-      const members = await listAllDomainRows(this.database, 'ChildExecutionTurnLink', { child_execution_id: bridge.child_execution_id });
-      for (const member of members) {
-        const exact = await this.readContinuationWaitOperations({ bridge, toolCallId, sourceTurnId: String(member.turn_id) });
-        if (exact.some(row => row.id === operation.id)) { membership = member; break; }
-      }
-      if (!membership) return false;
+      const childExecutionId = requirePhaseFId(bridge.child_execution_id, 'AnswerBridge.child_execution_id');
+      const facts = (await this.database.childContinuationWaitFacts({ childExecutionId, toolCallId, status: 'waiting_answer' })).snapshot;
+      const targets = await resolveLegacyContinuationWaitTargets(this.database, this.contentStore, {
+        childExecutionId, operations: facts.legacyOperations, intentLinks: facts.intentLinks
+      });
+      const target = targets.find(value => value.operation.id === operation.id);
+      if (!target?.turnId) return false;
+      const members = await this.listRows('ChildExecutionTurnLink', { turn_id: target.turnId }, 2);
+      if (members.length !== 1 || members[0].child_execution_id !== childExecutionId) return false;
+      membership = members[0];
     } else return false;
 
     const childExecutionId = requirePhaseFId(membership.child_execution_id, 'ChildExecutionTurnLink.child_execution_id');
@@ -2965,7 +2809,7 @@ export class ChildExecutionControlPlane {
       ...(input.cancelledSubtree ? { cancelledSubtree: true } : {}),
       reason: requirePhaseFText(input.reason, 'reason')
     };
-    if (waiting.owner_kind === CHILD_TURN_ANSWER_WAIT_OWNER_KIND) {
+    if (waiting.owner_kind === CHILD_INTENT_ANSWER_WAIT_OWNER_KIND || waiting.owner_kind === CHILD_TURN_ANSWER_WAIT_OWNER_KIND) {
       return (await this.settleContinuationOperation({
         operation: waiting,
         execution: executions[0],
@@ -3763,8 +3607,9 @@ export class ChildExecutionControlPlane {
       || link.child_execution_id !== command.childExecutionId
       || link.turn_intent_id !== ids.turnIntentId
       || revision.content_object_id !== expectedContentObjectId
-      || operation.owner_kind !== CHILD_TURN_ANSWER_WAIT_OWNER_KIND
-      || operation.owner_id !== childContinuationTurnId(command.childExecutionId, ids.turnIntentId)
+      || !((operation.owner_kind === CHILD_INTENT_ANSWER_WAIT_OWNER_KIND && operation.owner_id === ids.turnIntentId)
+        || (operation.owner_kind === CHILD_TURN_ANSWER_WAIT_OWNER_KIND
+          && operation.owner_id === childContinuationTurnId(command.childExecutionId, ids.turnIntentId)))
       || operation.tool_call_id !== command.sourceToolCallId
       || (command.completionPolicy === 'wait_for_answer') !== (pause !== null)
       || (pause !== null && pause.operation_id !== ids.operationId)
@@ -3891,71 +3736,9 @@ export class ChildExecutionControlPlane {
     };
   }
 
-  private async readStableTreeSnapshot(rootId: string): Promise<{
-    root: DomainRow;
-    lineages: DomainRow[];
-    parentLinks: DomainRow[];
-    activeLinks: DomainRow[];
-    activeTurns: DomainRow[];
-    intentLinks: DomainRow[];
-    pendingIntentLinks: DomainRow[];
-    answerBridges: DomainRow[];
-    pendingInputs: DomainRow[];
-    pendingInputIds: Set<string>;
-  }> {
-    // The relation sets can exceed one repository page. Each fixed-domain scan is complete, and the
-    // writer transaction below asserts the exact Parent/Active/Intent sets before changing anything.
-    const links = await listAllDomainRows(this.database, 'ChildExecutionParentLink');
-    const children = await listAllDomainRows(this.database, 'ChildExecution');
-    const active = await listAllDomainRows(this.database, 'ChildExecutionActiveTurnLink');
-    const intents = await listAllDomainRows(this.database, 'ChildExecutionIntentLink');
-    const bridges = await listAllDomainRows(this.database, 'AnswerBridge');
-    const turns = await listAllDomainRows(this.database, 'Turn');
-    const pendingInputs = await listAllDomainRows(this.database, 'PendingTurnInput');
-    const byId = new Map(children.map((child) => [child.id as string, child]));
-    const root = byId.get(rootId);
-    if (!root) throw new Error(`ChildExecution ${rootId} does not exist.`);
-    const descendants = new Set([rootId]);
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const link of links) {
-        const parentId = link.parent_child_execution_id;
-        if (typeof parentId !== 'string' || !descendants.has(parentId)) continue;
-        const childId = requirePhaseFId(link.child_execution_id, 'ChildExecutionParentLink.child_execution_id');
-        if (!descendants.has(childId)) {
-          descendants.add(childId);
-          changed = true;
-        }
-      }
-    }
-    const lineages = [...descendants].map((id) => {
-      const child = byId.get(id);
-      if (!child) throw new Error(`ChildExecution tree references missing lineage ${id}.`);
-      return child;
-    });
-    const parentLinks = links.filter((link) => descendants.has(link.child_execution_id as string));
-    const activeLinks = active.filter((link) => descendants.has(link.child_execution_id as string));
-    const intentLinks = intents.filter((link) => descendants.has(link.child_execution_id as string));
-    const activeTurnIds = new Set(activeLinks.map((link) => link.turn_id as string));
-    const activeTurns = turns.filter((turn) => activeTurnIds.has(turn.id as string));
-    if (activeTurns.length !== activeTurnIds.size) throw new Error('ChildExecution tree contains a missing active Turn target.');
-    const answerBridges = bridges.filter((bridge) => descendants.has(bridge.child_execution_id as string));
-    if (answerBridges.length !== lineages.length || lineages.some((lineage) =>
-      answerBridges.filter((bridge) => bridge.child_execution_id === lineage.id).length !== 1
-    )) throw new Error('ChildExecution tree must retain exactly one AnswerBridge per lineage.');
-    return {
-      root,
-      lineages,
-      parentLinks,
-      activeLinks,
-      activeTurns,
-      intentLinks,
-      pendingIntentLinks: intentLinks.filter((link) => link.state === 'pending'),
-      answerBridges,
-      pendingInputs,
-      pendingInputIds: new Set(pendingInputs.map((input) => input.id as string))
-    };
+  private async readStableTreeSnapshot(rootId: string) {
+    const facts = (await this.database.childExecutionSubtreeSnapshot(rootId)).snapshot;
+    return { ...facts, pendingInputIds: new Set(facts.pendingInputs.map(input => String(input.id))) };
   }
 
   private async findInterruptionReplay(
@@ -4338,10 +4121,6 @@ function sendResult(
     deduplicated,
     ...(commitSeq ? { commitSeq } : {})
   };
-}
-
-function queuedIntentPendingInputId(childExecutionId: string, turnIntentId: string): string {
-  return stablePhaseFId('pending_turn_input', 'child-send-intent', childExecutionId, turnIntentId);
 }
 
 function admissionIds(command: ReturnType<typeof normalizeAdmissionCommand>) {

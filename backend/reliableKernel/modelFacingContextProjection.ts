@@ -1604,6 +1604,9 @@ function storedContextItemContents(
               : {}),
             ...(typeof storedOutputItem.previousResponseId === 'string' && storedOutputItem.previousResponseId
               ? { previousResponseId: storedOutputItem.previousResponseId }
+              : {}),
+            ...(typeof storedOutputItem.steeringSuccessorResponseId === 'string' && storedOutputItem.steeringSuccessorResponseId
+              ? { steeringSuccessorResponseId: storedOutputItem.steeringSuccessorResponseId }
               : {})
           }
         : undefined;

@@ -1,0 +1,63 @@
+{
+  "kind": "limcode-phase-e-candidate-evidence",
+  "checkId": "candidate.context-compression-node-bound",
+  "passed": true,
+  "commitSha": "b967bdca78d7934760628fabed3449c5f192dfc8",
+  "measuredAt": "2026-08-21T01:25:50.441Z",
+  "provenance": {
+    "worktreeClean": true,
+    "commitExplicitlyBound": false,
+    "authoritative": false,
+    "runnerSha256": "8a7471222d822acc2ec7b180d373f2761606cd23c60f44dfd591bcbbb7037e6e",
+    "sourceTreeSha256": "ce6e3695e0a8823ed6b089e4022d2fb4d7ed362ad672c2cb7809fbffe3bacbce",
+    "sourceFileCount": 455,
+    "sourceFilesTracked": true,
+    "compiledKernelSha256": "f1536abe2fe3b04032bb384dcbbd7bd586182d7159cd6b1badaa0f3238cf2a3c",
+    "compiledFileCount": 194,
+    "compileProvenance": "dist/extension/reliable-kernel-compile-provenance.json",
+    "compileWorktreeClean": true,
+    "compiledClosureMatches": true,
+    "invocation": [
+      "/Users/lurenxing/.local/node-v24.15.0-darwin-arm64/bin/node",
+      "/Users/lurenxing/GitHub/limcode-test/scripts/reliable-kernel/run-phase-e-check.mjs",
+      "--check=candidate.context-compression-node-bound"
+    ],
+    "node": "v24.15.0",
+    "sqlite": "3.53.4",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5"
+  },
+  "assertions": [
+    "tool call与唯一ToolModelResult形成一个tool_pair segment并登记两条同call_seq source，压缩只能按整个segment选取",
+    "700k base64图片即使令旧root字节缓存超过100k，也按多模态语义保持低于阈值，不会触发自动压缩",
+    "压缩判定按provider语义估算重新物化Context，root旧字节缓存不再驱动阈值；显式压缩提交不再被Context-only阈值二次否决",
+    "压缩区间k=1/4/64/512时真实ContextSequenceNode增量恒为1（≤4、O(1)），CompressionBlockSource则精确写入k行",
+    "compression root严格物化summary+finite tail，到tail_segment_count即停止且不重新带回被替换原文",
+    "compression后普通append只延长有限tail并继续复用summary，不重接被压缩prefix",
+    "嵌套compression lineage中的Message edit/delete会递归展开冻结来源；保留不含目标的内层summary时复用其NULL-parent node并构造finite tail；只禁用涉及目标的outer block，历史root不变"
+  ],
+  "faults": [],
+  "metrics": {
+    "nodeDelta": 1,
+    "sourceRows": 4,
+    "nodeScaling": [
+      {
+        "sourceCount": 4,
+        "nodeDelta": 1
+      },
+      {
+        "sourceCount": 1,
+        "nodeDelta": 1
+      },
+      {
+        "sourceCount": 64,
+        "nodeDelta": 1
+      },
+      {
+        "sourceCount": 512,
+        "nodeDelta": 1
+      }
+    ]
+  }
+}

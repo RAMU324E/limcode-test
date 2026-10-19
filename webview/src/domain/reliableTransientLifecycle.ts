@@ -1,3 +1,4 @@
+import { reliableMessageContentWindowState, type ReliableMessageContentWindow } from './reliableMessageContentWindow';
 import type { ReliableKernelBoundedClientState } from '@shared/reliableKernelClientFeed';
 import type {
   ReliableKernelDetailState,
@@ -11,7 +12,8 @@ const MAX_TRANSIENT_MODEL_REQUESTS = 512;
 export function reconcileReliableTransientRequests(
   requests: Record<string, ReliableKernelTransientState>,
   records: ReliableKernelBoundedClientState['records'],
-  details: Record<string, ReliableKernelDetailState>
+  details: Record<string, ReliableKernelDetailState>,
+  contentWindows: Record<string, ReliableMessageContentWindow> = {}
 ): void {
   const messages = records.Message ?? {};
   const linksByRequestId = new Map(Object.values(records.ModelRequestMessageLink ?? {})
@@ -70,9 +72,11 @@ export function reconcileReliableTransientRequests(
     const messageId = stringValue(link?.message_id);
     const message = messageId ? messages[messageId] : undefined;
     const revisionId = stringValue(message?.revision_id);
-    const detailReady = Boolean(
-      revisionId && details[`message-content:${revisionId}`]?.status === 'ready'
-    );
+    const contentWindow = messageId ? contentWindows[messageId] : undefined;
+    const indexRevisionId = stringValue(message?.item_index_revision_id);
+    const indexedReady = indexRevisionId && (contentWindow?.followTail === false
+      || reliableMessageContentWindowState(contentWindow, indexRevisionId, details).ready);
+    const detailReady = Boolean(indexedReady || (revisionId && details[`message-content:${revisionId}`]?.status === 'ready'));
     const terminalState = stringValue(request.terminal_state);
     const completed = terminalState === 'completed'
       || (!terminalState && entry.status === 'completed');
@@ -114,34 +118,31 @@ function completedToolFactsReady(
   if (entry.toolCalls.length === 0) return true;
   if (!messageId) return false;
 
-  const toolCallsById = new Map(Object.values(records.ToolCall ?? {}).flatMap((call) => {
-    const id = stringValue(call.id);
-    return id ? [[id, call] as const] : [];
-  }));
   const candidates = Object.values(records.ToolCallSourceLink ?? {}).filter((link) =>
-    stringValue(link.model_request_id) === entry.modelRequestId
-    && stringValue(link.message_id) === messageId
-  );
-  const usedLinks = new Set<number>();
-
+    stringValue(link.model_request_id) === entry.modelRequestId && stringValue(link.message_id) === messageId);
+  const byCallId = new Map<string, number[]>(), byOrdinal = new Map<number, number[]>();
+  candidates.forEach((link, index) => {
+    const id = stringValue(link.provider_call_id), ordinal = nonNegativeInteger(link.provider_ordinal);
+    if (id) { const group = byCallId.get(id) ?? []; group.push(index); byCallId.set(id, group); }
+    if (ordinal !== undefined) { const group = byOrdinal.get(ordinal) ?? []; group.push(index); byOrdinal.set(ordinal, group); }
+  });
+  for (const group of byCallId.values()) group.reverse();
+  for (const group of byOrdinal.values()) group.reverse();
+  const used = new Set<number>();
+  const take = (group: number[] | undefined): number | undefined => {
+    while (group?.length) { const index = group.pop()!; if (!used.has(index)) return index; }
+    return undefined;
+  };
   for (let ordinal = 0; ordinal < entry.toolCalls.length; ordinal += 1) {
     const preview = entry.toolCalls[ordinal]!;
-    let linkIndex = candidates.findIndex((link, index) =>
-      !usedLinks.has(index) && stringValue(link.provider_call_id) === preview.callId
-    );
-    if (linkIndex < 0) {
-      linkIndex = candidates.findIndex((link, index) =>
-        !usedLinks.has(index) && nonNegativeInteger(link.provider_ordinal) === ordinal
-      );
-    }
-    if (linkIndex < 0) return false;
-
-    const link = candidates[linkIndex]!;
+    const index = take(byCallId.get(preview.callId ?? '')) ?? take(byOrdinal.get(ordinal));
+    if (index === undefined) return false;
+    const link = candidates[index]!;
     const toolCallId = stringValue(link.tool_call_id);
-    const toolCall = toolCallId ? toolCallsById.get(toolCallId) : undefined;
-    if (!toolCall || stringValue(toolCall.turn_id) !== entry.turnId) return false;
-    if (preview.name && stringValue(toolCall.tool_name) !== preview.name) return false;
-    usedLinks.add(linkIndex);
+    const toolCall = toolCallId ? records.ToolCall?.[toolCallId] : undefined;
+    if (!toolCall || stringValue(toolCall.turn_id) !== entry.turnId
+      || (preview.name && stringValue(toolCall.tool_name) !== preview.name)) return false;
+    used.add(index);
   }
   return true;
 }

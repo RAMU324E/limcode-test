@@ -17,6 +17,7 @@ import {
   steeringStatusSessionKey,
   visibleSteeringReceipts
 } from '@webview/composables/steeringReceipts';
+import { createSteeringReceiptIndex } from '@webview/domain/steeringReceiptProof';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 
 const { currentSteeringReceipts, currentSteeringFailure, dismissSteeringFailure } = useChat();
@@ -127,8 +128,9 @@ onBeforeUnmount(() => {
   pendingStatusCommands.clear();
 });
 
+const receiptIndex = computed(() => createSteeringReceiptIndex(currentSteeringReceipts.value));
 function presentation(receipt: NativeSteeringReceipt) {
-  return steeringReceiptPresentation(receipt, currentSteeringReceipts.value);
+  return steeringReceiptPresentation(receipt, receiptIndex.value);
 }
 
 function receiptDetail(receipt: NativeSteeringReceipt): string {

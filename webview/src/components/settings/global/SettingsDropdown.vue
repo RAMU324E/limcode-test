@@ -29,6 +29,7 @@ const props = withDefaults(
     height?: number | string;
     closeSignal?: number | string;
     placement?: 'bottom' | 'top';
+    panelSizing?: 'trigger' | 'content';
   }>(),
   {
     placeholder: '请选择',
@@ -40,7 +41,8 @@ const props = withDefaults(
     searchPlaceholder: '筛选...',
     maxHeight: 260,
     height: '',
-    placement: 'bottom'
+    placement: 'bottom',
+    panelSizing: 'trigger'
   }
 );
 
@@ -48,12 +50,53 @@ const emit = defineEmits<{
   (event: 'update:modelValue', value: string): void;
   (event: 'change', option: SettingsDropdownOption): void;
   (event: 'open'): void;
+  (event: 'open-change', open: boolean): void;
 }>();
 
 const root = ref<HTMLElement | null>(null);
 const scroller = ref<HTMLElement | null>(null);
 const searchInput = ref<HTMLInputElement | null>(null);
 const open = ref(false);
+const panel = ref<HTMLElement | null>(null);
+const resolvedPlacement = ref(props.placement);
+const positionedStyle = ref<Record<string, string>>({});
+let positionFrame: number | undefined;
+let sizeObserver: ResizeObserver | undefined;
+
+function schedulePosition(): void {
+  if (positionFrame !== undefined || !open.value || props.panelSizing !== 'content') return;
+  positionFrame = requestAnimationFrame(() => { positionFrame = undefined; positionPanel(); });
+}
+function positionPanel(): void {
+  if (!open.value || !root.value || !panel.value || props.panelSizing !== 'content') return;
+  const anchor = root.value.getBoundingClientRect();
+  // Use layout dimensions: the enter animation scales the visual bounding box.
+  const box = { width: panel.value.offsetWidth, height: panel.value.offsetHeight };
+  const width = document.documentElement.clientWidth || window.innerWidth;
+  const height = document.documentElement.clientHeight || window.innerHeight;
+  const above = Math.max(0, anchor.top - 12), below = Math.max(0, height - anchor.bottom - 12);
+  const preferred = props.placement === 'top' ? above : below;
+  const alternate = props.placement === 'top' ? below : above;
+  resolvedPlacement.value = preferred >= box.height || preferred >= alternate
+    ? props.placement : props.placement === 'top' ? 'bottom' : 'top';
+  const available = resolvedPlacement.value === 'top' ? above : below;
+  positionedStyle.value = {
+    left: `${Math.max(8, Math.min(anchor.left, width - box.width - 8)) - anchor.left}px`,
+    '--settings-dropdown-panel-max-height': `min(${cssLength(props.maxHeight)}, ${available}px)`
+  };
+}
+function stopPositioning(): void {
+  if (positionFrame !== undefined) cancelAnimationFrame(positionFrame);
+  positionFrame = undefined;
+  sizeObserver?.disconnect();
+  sizeObserver = undefined;
+  window.removeEventListener('resize', schedulePosition);
+  window.removeEventListener('scroll', schedulePosition, true);
+}
+function closeFromKeyboard(): void {
+  open.value = false;
+  root.value?.querySelector<HTMLButtonElement>('.settings-dropdown-button')?.focus();
+}
 const filterText = ref('');
 
 const selectedOption = computed(() => props.options.find((option) => option.value === props.modelValue));
@@ -71,7 +114,8 @@ const filteredOptions = computed(() => {
 });
 const panelStyle = computed<Record<string, string>>(() => ({
   '--settings-dropdown-panel-max-height': cssLength(props.maxHeight),
-  ...(props.height === '' || props.height === undefined ? {} : { '--settings-dropdown-panel-height': cssLength(props.height) })
+  ...(props.height === '' || props.height === undefined ? {} : { '--settings-dropdown-panel-height': cssLength(props.height) }),
+  ...positionedStyle.value
 }));
 
 onMounted(() => {
@@ -80,12 +124,27 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   document.removeEventListener('click', onDocumentClick);
+  stopPositioning();
 });
 
-watch(open, (nextOpen) => {
+watch(open, async (nextOpen) => {
+  emit('open-change', nextOpen);
+  stopPositioning();
+  positionedStyle.value = {};
+  resolvedPlacement.value = props.placement;
   if (!nextOpen) return;
-  if (!props.searchable) return;
-  void nextTick(() => searchInput.value?.focus());
+  await nextTick();
+  if (!open.value) return;
+  if (props.searchable) searchInput.value?.focus();
+  if (props.panelSizing !== 'content') return;
+  positionPanel();
+  window.addEventListener('resize', schedulePosition);
+  window.addEventListener('scroll', schedulePosition, true);
+  if (typeof ResizeObserver !== 'undefined') {
+    sizeObserver = new ResizeObserver(schedulePosition);
+    if (panel.value) sizeObserver.observe(panel.value);
+    if (root.value) sizeObserver.observe(root.value);
+  }
 });
 
 watch(
@@ -131,10 +190,6 @@ function onDocumentClick(event: MouseEvent): void {
   if (!root.value?.contains(target)) open.value = false;
 }
 
-function compactLabel(label: string): string {
-  return label.length > 64 ? `${label.slice(0, 61)}...` : label;
-}
-
 function cssLength(value: number | string): string {
   if (typeof value === 'number') return `${value}px`;
   return value || '260px';
@@ -142,7 +197,7 @@ function cssLength(value: number | string): string {
 </script>
 
 <template>
-  <div ref="root" class="settings-dropdown">
+  <div ref="root" class="settings-dropdown" @keydown.esc.stop.prevent="closeFromKeyboard">
     <button
       type="button"
       class="settings-dropdown-button"
@@ -162,13 +217,17 @@ function cssLength(value: number | string): string {
     <Transition name="lc-dropdown">
       <section
         v-if="open"
+        ref="panel"
         class="project-dropdown settings-dropdown-panel lc-dropdown-panel"
-        :class="`placement-${placement}`"
+        :class="[`placement-${resolvedPlacement}`, { 'sizing-content': panelSizing === 'content' }]"
         :style="panelStyle"
         role="listbox"
         @click.stop
       >
+        <slot v-if="$slots.panelContent" name="panelContent" />
+        <template v-else>
         <div ref="scroller" class="settings-dropdown-scroll">
+          <slot name="header" />
           <div v-if="title" class="project-dropdown-title">{{ title }}</div>
           <label v-if="searchable" class="settings-dropdown-filter" aria-label="筛选选项">
             <IconSearch stroke="2" aria-hidden="true" />
@@ -193,7 +252,7 @@ function cssLength(value: number | string): string {
             >
               <component v-if="option.icon" :is="option.icon" class="settings-dropdown-option-icon" stroke="2" aria-hidden="true" />
               <span class="project-option-copy">
-                <span class="project-option-name">{{ compactLabel(option.label) }}</span>
+                <span class="project-option-name">{{ option.label }}</span>
                 <span v-if="option.description" class="project-option-path">{{ option.description }}</span>
               </span>
             </button>
@@ -204,6 +263,7 @@ function cssLength(value: number | string): string {
           </div>
         </div>
         <AdvancedScrollbar :scroller="scroller" variant="minimal" />
+        </template>
       </section>
     </Transition>
     <slot name="panelOverlay" :open="open" />
@@ -289,6 +349,12 @@ button.settings-dropdown-button:active {
   border-radius: var(--radius-sm);
   background: var(--vscode-editor-background);
   box-shadow: 0 8px 22px rgba(0, 0, 0, 0.22);
+}
+
+.settings-dropdown-panel.sizing-content {
+  width: max-content;
+  min-width: min(280px, calc(100vw - 16px));
+  max-width: min(420px, calc(100vw - 16px));
 }
 
 .settings-dropdown-panel.placement-top {

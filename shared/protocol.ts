@@ -1721,6 +1721,8 @@ export interface ModelOutputItemReference {
   providerResponseId?: string;
   /** 该 response 的 previous_response_id（链上首个 response 缺省）。 */
   previousResponseId?: string;
+  /** 当前转向段的已接受后继 response；普通工具续流沿用，后续转向才更新。 */
+  steeringSuccessorResponseId?: string;
 }
 
 export interface ModelOutputPartMetadata {
@@ -3388,7 +3390,9 @@ export type BridgeErrorCode =
   /** The Conversation named by a scoped request was deleted or never existed. */
   | 'stale_conversation'
   /** The fork command can never succeed and must not be replayed. */
-  | 'fork_rejected';
+  | 'fork_rejected'
+  /** This Host's Runtime failed; no new execution is admitted until reload. */
+  | 'runtime_unavailable';
 
 export interface BridgeErrorPayload {
   requestType?: string;

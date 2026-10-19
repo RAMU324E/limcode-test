@@ -77,6 +77,7 @@ import {
   NativeResponseTimingTracker,
   nonEmptyRecord,
   nowMonotonicMs,
+  observeNativeResponseCreated,
   shouldCloseThoughtBlock,
   stringifyJson,
   stripUndefined,
@@ -782,10 +783,7 @@ async function runLlmAttempt(
         // 真实物理 response 独立记账；重连/回放不得再加一次。同一 response 的
         // usage chunk 是更新而不是增量，逻辑 Done 的聚合只用于总计费。
         if (nativeUsage.beginResponse(nativeEvent.responseId)) responseTiming.responseCreated(nativeEvent.responseId);
-        nativeChain.current = {
-          responseId: nativeEvent.responseId,
-          ...(nativeEvent.previousResponseId ? { previousResponseId: nativeEvent.previousResponseId } : {})
-        };
+        observeNativeResponseCreated(nativeChain, nativeEvent);
       }
       if (hasModelOutputChunk(chunk)) responseTiming.outputObserved(chunkAt, chunkMark);
       // A terminal response can be the first complete proof of its output items. Persist those
@@ -1972,22 +1970,13 @@ export async function listLlmProviderModels(config: LlmProviderConfigRecord, opt
   if (settings.provider === 'claude') {
     return discoverAnthropicModels(settings, proxyFetch ?? fetch, headers);
   }
-  const requestHeaders = settings.provider === 'gemini' && settings.apiKey
-    ? mergeHeaders({ 'x-goog-api-key': settings.apiKey }, headers)
-    : headers;
-  const fetchCatalog = (baseUrl: string) => unified.listAvailableModels({
+  const result = await unified.listAvailableModels({
     provider: settings.provider,
     apiKey: settings.apiKey,
-    baseUrl,
+    baseUrl: settings.baseUrl,
     ...(proxyFetch ? { fetch: proxyFetch } : {}),
-    ...(requestHeaders ? { headers: requestHeaders } : {}),
+    ...(headers ? { headers } : {}),
     outputFormat: 'unified'
-  });
-  const result = await fetchCatalog(settings.baseUrl).catch(async (error) => {
-    if (settings.provider === 'gemini' && /\/v1\/?$/i.test(settings.baseUrl)) {
-      return fetchCatalog(settings.baseUrl.replace(/\/v1\/?$/i, '/v1beta'));
-    }
-    throw error;
   });
 
   return result.models.map(modelCatalogEntryToRecord);
@@ -5818,13 +5807,37 @@ function unifiedPromptCacheFromSettings(
 function requestBodyWithOpenAIPromptCacheKey(settings: LlmProviderConfigRecord, conversationId?: string): LlmRequestBodyRecord | undefined {
   const requestBody = settings.requestBody;
   if (settings.provider !== 'openai-responses') return requestBody;
-  if (typeof requestBody?.prompt_cache_key === 'string' && requestBody.prompt_cache_key.trim()) return requestBody;
+  const configuredKey = normalizeOpenAIPromptCacheKey(requestBody?.prompt_cache_key);
+  if (configuredKey) {
+    return { ...(requestBody ?? {}), prompt_cache_key: configuredKey };
+  }
+  const sanitizedBody = removeInvalidOpenAIPromptCacheKey(requestBody);
   const promptCache = normalizePromptCache(settings.promptCache, settings.provider);
-  if (!promptCache.enabled || !conversationId?.trim()) return requestBody;
+  if (!promptCache.enabled || !conversationId?.trim()) return sanitizedBody;
   return {
-    ...(requestBody ?? {}),
-    prompt_cache_key: conversationId
+    ...(sanitizedBody ?? {}),
+    prompt_cache_key: boundedOpenAIPromptCacheKey(conversationId)
   };
+}
+
+function normalizeOpenAIPromptCacheKey(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const key = value.trim();
+  return key.length > 0 && key.length <= 64 ? key : undefined;
+}
+
+function boundedOpenAIPromptCacheKey(conversationId: string): string {
+  const key = conversationId.trim();
+  return key.length <= 64 ? key : key.slice(-64);
+}
+
+function removeInvalidOpenAIPromptCacheKey(
+  requestBody: LlmRequestBodyRecord | undefined
+): LlmRequestBodyRecord | undefined {
+  if (!requestBody || !Object.prototype.hasOwnProperty.call(requestBody, 'prompt_cache_key')) return requestBody;
+  const sanitized = { ...requestBody };
+  delete sanitized.prompt_cache_key;
+  return sanitized;
 }
 
 function openAIResponsesWebSocketConfigEntry(settings: LlmProviderConfigRecord, conversationId?: string): { transport?: 'websocket'; webSocketSessionKey?: string } {

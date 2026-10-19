@@ -2271,7 +2271,7 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       const requestConfig = toPlainProviderConfig(config);
-      this.closeFetchedModelsDialog();
+      clearModelFetch(this);
       const requestId = createMessageId();
       const pending: PendingModelFetch = {
         requestId, configId: requestConfig.id, provider: requestConfig.provider, baseUrl: requestConfig.baseUrl.trim()
@@ -2862,16 +2862,17 @@ export const useGlobalSettingsStore: typeof useGlobalSettingsStoreDefinition = O
         });
       }, { flush: 'sync' }));
       scope.run(() => watch(() => {
-        if (!store.fetchedModelsDialog.open) return '';
-        const config = store.llmProviderConfigs.configs.find((item) => item.id === store.fetchedModelsDialog.configId);
+        const configId = store.fetchedModelsDialog.configId;
+        const config = store.llmProviderConfigs.configs.find(item => item.id === configId);
         // Match toPlainProviderConfig: an autosave that only trims transport fields does not
         // replace the endpoint/credentials that the in-flight request actually used.
-        return JSON.stringify([
+        return [configId, JSON.stringify([
           config?.id, config?.provider, config?.baseUrl?.trim(), config?.apiKey?.trim(),
           sanitizeHeaders(config?.headers)
-        ]);
-      }, (current, previous) => {
-        if (previous && current) store.closeFetchedModelsDialog();
+        ])] as const;
+      }, ([configId, endpoint], [previousConfigId, previousEndpoint]) => {
+        // Opening or replacing the dialog binds a new target; only changes to that target cancel it.
+        if (configId === previousConfigId && endpoint !== previousEndpoint) store.closeFetchedModelsDialog();
       }, { flush: 'sync' }));
       const reset = store.$reset.bind(store);
       store.$reset = () => { pendingNativeProbes.delete(store); store.closeFetchedModelsDialog(); reset(); };

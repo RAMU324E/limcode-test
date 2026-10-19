@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { normalizeCollaborationHistoryCursor } from './collaborationHistoryCursor';
+import { normalizeCollaborationHistoryCursor, normalizeCollaborationHistoryDirection } from './collaborationHistoryCursor';
 import { FileDiffPreviewBusyError, FileDiffPreviewTooLargeError } from '../capabilities/fileDiffAsync';
 import { captureDebug, type DebugCaptureRecorder } from './debugCapture/observer';
 import type * as vscode from 'vscode';
@@ -574,12 +574,7 @@ export class ReliableKernelWebviewFeedBridge {
     client.historyRequests.add(request.requestId);
     try {
       if (!this.history) throw new Error('当前 Runtime 未配置历史消息读取器。');
-      const page = await this.history.backwardVisibleMessages({
-        conversationId: request.conversationId,
-        beforeMessageSeq: request.beforeMessageSeq,
-        beforeId: request.beforeId,
-        limit: request.limit
-      });
+      const page = await this.history.visibleMessages(request);
       if (client.closed || client.navigationGeneration !== navigationGeneration) return;
       this.post(client, {
         type: RELIABLE_KERNEL_HISTORY_PAGE_RESULT_MESSAGE,
@@ -632,6 +627,7 @@ export class ReliableKernelWebviewFeedBridge {
       const page = await this.history.backwardCollaboration({
         conversationId: request.conversationId,
         ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
+        ...(request.direction === undefined ? {} : { direction: request.direction }),
         limit: request.limit
       });
       if (client.closed || !client.ready || !client.visible || client.connection !== connectionPromise
@@ -1622,6 +1618,8 @@ function normalizeDetailRequest(message: Record<string, unknown>): ReliableKerne
   const kind = message.kind;
   if (![
     'message-content',
+    'message-content-item',
+    'message-content-items',
     'turn-intent-preview',
     'tool-arguments-content',
     'tool-result-content',
@@ -1651,6 +1649,14 @@ function normalizeDetailRequest(message: Record<string, unknown>): ReliableKerne
     message.expectedTotalBytes !== undefined
     && (!Number.isSafeInteger(message.expectedTotalBytes) || (message.expectedTotalBytes as number) < 0)
   ) throw new TypeError('detail.expectedTotalBytes must be a non-negative integer.');
+  if (message.itemAfterSequence !== undefined
+    && (!Number.isSafeInteger(message.itemAfterSequence) || (message.itemAfterSequence as number) < 0)) {
+    throw new TypeError('detail.itemAfterSequence must be a non-negative integer.');
+  }
+  if (message.itemLimit !== undefined
+    && (!Number.isSafeInteger(message.itemLimit) || (message.itemLimit as number) < 1 || (message.itemLimit as number) > 96)) {
+    throw new TypeError('detail.itemLimit must be from 1 to 96.');
+  }
   return {
     type: RELIABLE_KERNEL_DETAIL_REQUEST_MESSAGE,
     requestId: requireText(message.requestId, 'detail.requestId'),
@@ -1659,6 +1665,8 @@ function normalizeDetailRequest(message: Record<string, unknown>): ReliableKerne
     recordId: requireText(message.recordId, 'detail.recordId'),
     offset: message.offset as number,
     maxBytes: message.maxBytes as number,
+    ...(message.itemAfterSequence === undefined ? {} : { itemAfterSequence: message.itemAfterSequence as number }),
+    ...(message.itemLimit === undefined ? {} : { itemLimit: message.itemLimit as number }),
     ...(message.expectedTotalBytes === undefined
       ? {}
       : { expectedTotalBytes: message.expectedTotalBytes as number })
@@ -1669,6 +1677,7 @@ function normalizeCollaborationHistoryRequest(
   message: Record<string, unknown>
 ): ReliableKernelCollaborationHistoryRequestMessage {
   const cursor = normalizeCollaborationHistoryCursor(message.cursor);
+  const direction = normalizeCollaborationHistoryDirection(message.direction, cursor);
   if (!Number.isSafeInteger(message.limit) || (message.limit as number) < 1 || (message.limit as number) > 200) {
     throw new TypeError('collaborationHistory.limit must be from 1 to 200.');
   }
@@ -1678,6 +1687,7 @@ function normalizeCollaborationHistoryRequest(
     sessionId: requireText(message.sessionId, 'collaborationHistory.sessionId'),
     conversationId: requireText(message.conversationId, 'collaborationHistory.conversationId'),
     ...(cursor === undefined ? {} : { cursor }),
+    direction,
     limit: message.limit as number
   };
 }
@@ -1685,13 +1695,16 @@ function normalizeCollaborationHistoryRequest(
 function normalizeHistoryPageRequest(
   message: Record<string, unknown>
 ): ReliableKernelHistoryPageRequestMessage {
-  const beforeMessageSeq = requireDecimal(
-    message.beforeMessageSeq,
-    'historyPage.beforeMessageSeq'
-  );
-  if (beforeMessageSeq === '0') {
-    throw new TypeError('historyPage.beforeMessageSeq must be positive.');
+  const backwards = message.beforeMessageSeq !== undefined;
+  if (backwards === (message.afterMessageSeq !== undefined)
+    || (backwards ? message.afterId !== undefined : message.beforeId !== undefined)) {
+    throw new TypeError('historyPage requires exactly one before or after keyset cursor.');
   }
+  const cursor = backwards
+    ? { beforeMessageSeq: requireDecimal(message.beforeMessageSeq, 'historyPage.beforeMessageSeq'),
+        beforeId: requireText(message.beforeId, 'historyPage.beforeId') }
+    : { afterMessageSeq: requireDecimal(message.afterMessageSeq, 'historyPage.afterMessageSeq'),
+        afterId: requireText(message.afterId, 'historyPage.afterId') };
   if (
     !Number.isSafeInteger(message.limit)
     || (message.limit as number) <= 0
@@ -1706,8 +1719,7 @@ function normalizeHistoryPageRequest(
       ? {}
       : { sessionId: requireText(message.sessionId, 'historyPage.sessionId') }),
     conversationId: requireText(message.conversationId, 'historyPage.conversationId'),
-    beforeMessageSeq,
-    beforeId: requireText(message.beforeId, 'historyPage.beforeId'),
+    ...cursor,
     limit: message.limit as number
   };
 }

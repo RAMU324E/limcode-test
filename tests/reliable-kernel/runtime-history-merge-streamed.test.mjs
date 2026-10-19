@@ -237,6 +237,31 @@ describe('历史合并的流式提交与有界读取', { concurrency: false }, (
     assert.deepEqual(await ledgerEntries(f, 'commits'), []);
   });
 
+  test('按对话剔除的两种时间线占位行不进入规划，整段跳过仍响应取消', async t => {
+    const source = minimalSource();
+    t.after(() => source.close());
+    source.prepare('INSERT INTO conversation VALUES (?, ?, ?, ?, ?)').run('healthy', 'healthy', 'active', NOW, NOW);
+    for (const table of ['runtime_delivery_timeline_link', 'collaboration_send_timeline_link']) {
+      const insert = source.prepare(`INSERT INTO ${table}(id, conversation_id, exchange_seq) VALUES (?, 'excluded', ?)`);
+      for (let i = 0; i < 251; i++) insert.run(`${table}_${i}`, i + 1);
+    }
+    const exclusions = { includes: domain => domain.endsWith('TimelineLink') };
+    const requested = [];
+    const target = { snapshot: async reads => {
+      requested.push(...reads);
+      return { snapshot: reads.map(() => null) };
+    }, mergeModelAggregates: async () => [] };
+    const result = await scanMergeRows(source, target, { exclusions, chunkRows: 8 });
+    assert.equal(result.rows, 1);
+    assert.equal(result.refusedAggregate, undefined);
+    assert.deepEqual(requested.map(row => row.domain), ['Conversation']);
+    source.exec('DELETE FROM conversation');
+    const abort = new AbortController();
+    const timer = setImmediate(() => abort.abort());
+    t.after(() => clearImmediate(timer));
+    await assert.rejects(scanMergeRows(source, target, { exclusions, signal: abort.signal }), { name: 'AbortError' });
+  });
+
   test('全跳过501条原始行仍让出并取消，保留协作记录按sequence读', async t => {
     const source = minimalSource();
     t.after(() => source.close());

@@ -151,16 +151,17 @@ export class VscodeConfigurationMutations {
   }
 
   private async modelProfileObservation(capture: ModelProfileRootCapture, scope: ScopeRef, effective?: () => Promise<ChatModelOverrideRecord | undefined>, receipt?: ModelProfileScopeMutationReceipt): Promise<ModelProfileScopeSnapshotPayload> {
-    const pair = await this.modelProfilePair(capture.paths, scope);
-    let effectiveModel: ChatModelOverrideRecord | undefined;
-    let effectiveModelError: string | undefined;
-    try {
-      effectiveModel = await effective?.();
-    } catch (error) {
-      // The stored pair/revision remains readable when its inherited provider or model was
-      // removed. Model-dependent mutations still validate effective() before writing.
-      effectiveModelError = error instanceof Error ? error.message : String(error);
-    }
+    // The saved pair and inherited model read the same immutable settings root. Start them together
+    // while the existing mutation lock remains held, instead of serializing two full store reads.
+    const pairPromise = this.modelProfilePair(capture.paths, scope);
+    const effectivePromise = effective
+      ? effective().then(model => ({ model }), error => ({ error }))
+      : Promise.resolve({ model: undefined as ChatModelOverrideRecord | undefined });
+    const [pair, effectiveResult] = await Promise.all([pairPromise, effectivePromise]);
+    const effectiveModel = 'model' in effectiveResult ? effectiveResult.model : undefined;
+    const effectiveModelError = 'error' in effectiveResult
+      ? (effectiveResult.error instanceof Error ? effectiveResult.error.message : String(effectiveResult.error))
+      : undefined;
     this.assertModelProfileRoot(capture);
     // One provider-independent shape for reads and every successful mutation, including clear.
     return { ...scope, ...pair, ...(effectiveModel ? { effectiveModel } : {}),

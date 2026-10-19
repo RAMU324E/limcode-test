@@ -38,7 +38,12 @@ export function toClientWirePlain(value: unknown, ancestors = new WeakSet<object
 
 /** Applies the same per-record summary bound before page sizing and final bridge transport. */
 export function boundClientRecordSummary(recordInput: Record<string, unknown>, domain?: string): Record<string, PlainData> {
-  let record = toClientWirePlain(recordInput) as Record<string, PlainData>;
+  return boundPlainClientRecordSummary(toClientWirePlain(recordInput) as Record<string, PlainData>, domain);
+}
+
+/** A projection producer already converted its whole envelope; bound each row without cloning again. */
+export function boundPlainClientRecordSummary(recordInput: Record<string, PlainData>, domain?: string): Record<string, PlainData> {
+  let record = recordInput;
   if (domain === 'ModelRequest') {
     const summary = projectModelRequestSummary(record);
     if (clientWireBytes(summary) > CLIENT_MODEL_REQUEST_SUMMARY_MAX_BYTES) {
@@ -62,14 +67,14 @@ export function clientWireBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), 'utf8');
 }
 
-/** Sets an exact self-inclusive byte count; the field's digit width stabilizes in at most a few passes. */
+/** Serialize once; only the decimal width of responseBytes contributes to its own size. */
 export function settleClientWireResponseBytes<T extends { responseBytes: number }>(value: T): number {
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const bytes = clientWireBytes(value);
-    if (value.responseBytes === bytes) return bytes;
-    value.responseBytes = bytes;
-  }
-  throw new Error('Client wire responseBytes did not stabilize.');
+  value.responseBytes = 0;
+  const fixedBytes = clientWireBytes(value) - 1;
+  let bytes = fixedBytes + 1;
+  while (fixedBytes + String(bytes).length !== bytes) bytes = fixedBytes + String(bytes).length;
+  value.responseBytes = bytes;
+  return bytes;
 }
 
 function truncateStrings(value: PlainData, maxLength: number, field = ''): PlainData {

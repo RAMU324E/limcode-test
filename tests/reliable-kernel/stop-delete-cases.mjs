@@ -46,6 +46,50 @@ async function fenced(f, turnId, work) {
     ownerId: lease.owner_id, hostBootId: lease.host_boot_id, generation: BigInt(lease.generation) }, work);
 }
 
+export async function stopClosesOutputCrashWindow(f, window) {
+  const conversationId = await f.conversation(`stop-${window}`);
+  const { turnId } = await f.input(conversationId);
+  const originalModel = f.model, originalMcp = f.mcpHandler;
+  const target = window === 'output-before-calls' ? f.app.agentLoop : f.app.agentLoop.context;
+  const method = window === 'output-before-calls' ? 'prepareProviderToolBatch' : 'appendToolPairsInOrderBatch';
+  const original = target[method];
+  const dispatchesBefore = f.mcpCalls.length;
+  f.model = async () => ({ role: 'model', parts: [
+    { id: 'stop-window-call', functionCall: { name: 'fixture_hang', args: {} } }
+  ] });
+  f.mcpHandler = async () => ({ content: [{ type: 'text', text: 'committed result' }] });
+  target[method] = async () => { throw new kernel.ExecutionHandoffError(`stop window ${window}`); };
+  try {
+    await assert.rejects(fenced(f, turnId, () => f.app.agentLoop.drive(turnId)), /stop window/);
+    target[method] = original;
+    const [request] = await rows(f, 'ModelRequest', { turn_id: turnId });
+    assert.equal(request.terminal_state, 'completed');
+    assert.equal((await rows(f, 'ModelRequestMessageLink', { model_request_id: request.id })).length, 1);
+    const existing = await rows(f, 'ToolCall', { turn_id: turnId });
+    assert.equal(existing.length, window === 'output-before-calls' ? 0 : 1);
+    if (existing.length) {
+      assert.equal((await rows(f, 'ToolModelResult', { tool_call_id: existing[0].id })).length, 1);
+      assert.equal((await rows(f, 'ContextSegmentSource', { source_kind: 'tool_call', source_id: existing[0].id })).length, 0);
+    }
+    const candidates = (await f.app.database.modelRequestStopCandidates(turnId)).snapshot;
+    assert.deepEqual(candidates.toolOutputRequests.map(row => row.id), [request.id]);
+    await f.app.turns.requestExternalInterrupt(conversationId, { source: { kind: 'command', key: f.id('stop-output-window') },
+      turnId, reason: '用户停止' });
+    const stopped = await fenced(f, turnId, () => f.app.agentLoop.drive(turnId));
+    assert.equal(stopped.terminalStatus, 'interrupted');
+    const [call] = await rows(f, 'ToolCall', { turn_id: turnId });
+    const [result] = await rows(f, 'ToolModelResult', { tool_call_id: call.id });
+    assert.ok(result);
+    for (const [source_kind, source_id] of [['tool_call', call.id], ['tool_model_result', result.id]]) {
+      assert.equal((await rows(f, 'ContextSegmentSource', { source_kind, source_id })).length, 1);
+    }
+    assert.equal(f.mcpCalls.length - dispatchesBefore, window === 'output-before-calls' ? 0 : 1);
+    assert.deepEqual((await f.app.database.modelRequestStopCandidates(turnId)).snapshot.toolOutputRequests, []);
+  } finally {
+    target[method] = original; f.model = originalModel; f.mcpHandler = originalMcp;
+  }
+}
+
 function command(f, conversationId, requestId, options = {}) {
   return stopAndDeleteConversation({ application: f.app, conversations: f.runner, childAgents: f.coordinator,
     pollMs: 0, timeoutMs: 2000, ...options }, { conversationId, requestId });

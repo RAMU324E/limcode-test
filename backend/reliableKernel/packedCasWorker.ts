@@ -1,20 +1,32 @@
 import { parentPort, workerData } from 'node:worker_threads';
-import { PackedCasStore } from './packedCasStore';
+import { inspectPackedCasIdentity, migratePackedCasEpochIdentity, PackedCasStore } from './packedCasStore';
 import {
   PACKED_CAS_MAX_QUEUED_BYTES, PACKED_CAS_MAX_QUEUED_REQUESTS, packedCasRequestCharge,
+  type PackedCasMaintenanceWorkerData, type PackedCasMaintenanceWorkerResponse,
   type PackedCasWorkerData, type PackedCasWorkerError, type PackedCasWorkerRequest, type PackedCasWorkerResponse
 } from './packedCasWorkerProtocol';
 
 const port = parentPort;
 if (!port) throw new Error('Packed CAS must run in a worker.');
-const input = workerData as PackedCasWorkerData;
+const input = workerData as PackedCasWorkerData | PackedCasMaintenanceWorkerData;
 let store: PackedCasStore | undefined;
 let queuedBytes = 0;
 let queuedRequests = 0;
 let closed = false;
 let queue = Promise.resolve();
 
-try {
+if ('kind' in input) {
+  let response: PackedCasMaintenanceWorkerResponse;
+  try {
+    if (input.kind === 'inspectIdentity') response = { ok: true, identity: inspectPackedCasIdentity(input.binding) };
+    else {
+      migratePackedCasEpochIdentity(input.previous, input.next, input.allowPrevious);
+      response = { ok: true };
+    }
+  } catch (error) { response = { ok: false, error: serializeError(error) }; }
+  port.postMessage(response);
+  port.close();
+} else try {
   store = new PackedCasStore(input.binding, input.options);
   port.on('message', (request: PackedCasWorkerRequest) => {
     const charge = packedCasRequestCharge(request);

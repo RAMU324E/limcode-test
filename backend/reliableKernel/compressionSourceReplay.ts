@@ -1,6 +1,7 @@
 import type { FullProviderContextItem } from './modelProviderControlPlane';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import type { RuntimeDatabase } from './runtimeDatabase';
+import { LogicalMessageContentReader, logicalMessageContentType, MESSAGE_CONTENT_TYPE } from './logicalMessageContent';
 import { selectConversationCompressionBlock } from './compressionBlockOwnership';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 
@@ -55,6 +56,7 @@ export async function prepareTextCompressionSources(
     ? item.segmentKind === 'compression'
     : isNativeState(item);
   if (!input.some(shouldExpand)) return { items: [...input], sourceEndOffsets: input.map((_, index) => index + 1) };
+  const messageContents = new LogicalMessageContentReader(database, store);
   const sourceEndOffsets: number[] = [];
   const output: FullProviderContextItem[] = [];
   const cache = new Map<string, { item: FullProviderContextItem; contentObjectId: string; bytes: number }>();
@@ -87,15 +89,17 @@ export async function prepareTextCompressionSources(
         const segment = await get(database, 'ContextSegment', frame.segmentId);
         contentObjectId = id(segment.content_object_id);
         const metadata = await get(database, 'ContentObject', contentObjectId);
-        if (Number(metadata.byte_length) > MAX_REPLAY_BYTES - bytes) throw limited('bytes', '历史内容超过重建字节上限。');
-        const content = (await store.read(metadata as unknown as ContentObjectMetadata)).toString('utf8');
+        const contentMetadata = metadata as unknown as ContentObjectMetadata;
+        if (await messageContents.byteLength(contentMetadata) > MAX_REPLAY_BYTES - bytes) throw limited('bytes', '历史内容超过重建字节上限。');
+        const content = (await messageContents.read(contentMetadata)).toString('utf8');
+        const contentType = logicalMessageContentType(contentMetadata.content_type);
         let role: string | null = null;
-        if (metadata.content_type === 'application/vnd.limcode.message+json') {
+        if (contentType === MESSAGE_CONTENT_TYPE) {
           const message: unknown = JSON.parse(content);
           if (record(message) && (message.role === 'user' || message.role === 'model')) role = message.role;
         }
         item = { segmentId: frame.segmentId, segmentKind: id(segment.segment_kind), messageRole: role,
-          contentType: id(metadata.content_type), content };
+          contentType, content };
         const contentBytes = Buffer.byteLength(content, 'utf8');
         // This cache is only a read optimization, never a second replay admission limit.
         // Oversized entries still replay normally and are released unless retained in output.

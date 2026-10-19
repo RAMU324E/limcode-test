@@ -21,6 +21,9 @@ const require = createRequire(import.meta.url);
 const compiledRoot = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 
 const kernel = require(path.join(compiledRoot, 'backend/reliableKernel/index.js'));
+const { applyReliableKernelDataMessage, createEmptyReliableKernelClientState } =
+  require(path.join(compiledRoot, 'shared/reliableKernelClientFeed.js'));
+const { LogicalMessageContentReader } = require(path.join(compiledRoot, 'backend/reliableKernel/logicalMessageContent.js'));
 
 const { emptyConversationContextHandleStateStep } = require(path.join(compiledRoot, 'backend/reliableKernel/conversationContextHandleState.js'));
 
@@ -70,7 +73,7 @@ async function assistantCurrentParts(app, modelRequestId) {
   const [current] = await rows(app, 'MessageCurrentRevisionLink', { message_id: output.message_id });
   const [revision] = await rows(app, 'MessageRevision', { id: current.revision_id });
   const [metadata] = await rows(app, 'ContentObject', { id: revision.content_object_id });
-  return JSON.parse((await app.contentStore.read(metadata)).toString('utf8')).parts;
+  return JSON.parse((await new LogicalMessageContentReader(app.database, app.contentStore).read(metadata)).toString('utf8')).parts;
 }
 
 async function contextMessageParts(app, conversationId) {
@@ -138,8 +141,14 @@ async function isolatedNativeRuntime(run, { transport = 'websocket', realAuthori
   const probePath = path.join(directory, 'probe.txt');
   await fs.writeFile(probePath, 'content from the real native probe file');
   let releaseTool = deferred();
+  let heldToolExecutions;
+  const releaseAllTools = () => {
+    releaseTool.resolve();
+    for (const gate of heldToolExecutions?.values() ?? []) gate.resolve();
+  };
   const frames = [];
   const drives = [];
+  let caseDrives = [];
   let turnFailure;
   let executions = 0;
   let httpCalls = 0;
@@ -185,8 +194,9 @@ async function isolatedNativeRuntime(run, { transport = 'websocket', realAuthori
     },
     execution: 'runtime',
     async execute(_arguments, _dependencies, context) {
-      executions += 1;
-      await releaseTool.promise;
+      const execution = ++executions;
+      if (heldToolExecutions) await heldToolExecutions.get(execution)?.promise;
+      else await releaseTool.promise;
       context.signal.throwIfAborted();
       return { ok: true, output: await fs.readFile(probePath, 'utf8') };
     }
@@ -283,13 +293,16 @@ async function isolatedNativeRuntime(run, { transport = 'websocket', realAuthori
         id: lease.id, conversationId: lease.conversation_id, turnId: lease.turn_id,
         ownerId: lease.owner_id, hostBootId: lease.host_boot_id, generation: BigInt(lease.generation)
       };
-      const completion = kernel.runWithExecutionLeaseFence(fence, () => app.agentLoop.drive(started.turnId));
-      void completion.then(async result => {
-        if (result.terminalStatus === 'completed') return;
-        const terminations = await rows(app, 'TurnTermination', { turn_id: started.turnId });
-        turnFailure = new Error(`Native Turn ${started.turnId} ended ${result.terminalStatus}: ${terminations.map(row => row.reason).join('; ')}`);
-      }).catch(error => { turnFailure = error; });
+      const completion = kernel.runWithExecutionLeaseFence(fence, () => app.agentLoop.drive(started.turnId)).then(async result => {
+        if (result.terminalStatus !== 'completed') {
+          const terminations = await rows(app, 'TurnTermination', { turn_id: started.turnId });
+          turnFailure = new Error(`Native Turn ${started.turnId} ended ${result.terminalStatus}: ${terminations.map(row => row.reason).join('; ')}`);
+        }
+        return result;
+      }, error => { turnFailure = error; throw error; });
+      void completion.catch(() => undefined);
       drives.push(completion);
+      caseDrives.push({ turnId: started.turnId, completion });
       return { ...started, completion };
     }
     function send(socket, event) {
@@ -328,7 +341,10 @@ async function isolatedNativeRuntime(run, { transport = 'websocket', realAuthori
     await run({
       app, get conversationId() { return conversationId; }, startTurn, frames, send, created, text, completed, stored, configuration,
       async resetCase(options = {}) {
-        releaseTool.resolve(); releaseTool = deferred(); frames.length = 0; executions = 0; httpCalls = 0; turnFailure = undefined;
+        releaseAllTools(); releaseTool = deferred(); frames.length = 0; executions = 0; httpCalls = 0; turnFailure = undefined;
+        caseDrives = [];
+        heldToolExecutions = options.heldToolExecutions
+          ? new Map(options.heldToolExecutions.map(execution => [execution, deferred()])) : undefined;
         transport = options.transport ?? "websocket"; configuration.openaiResponsesTransport = transport;
         configuration.promptCache = options.promptCache ?? { enabled: false, mode: 'key', ttl: '30m' };
         configuration.model = MODEL; configuration.models = [{ id: MODEL, name: MODEL }]; configuration.generationConfig = undefined;
@@ -340,6 +356,24 @@ async function isolatedNativeRuntime(run, { transport = 'websocket', realAuthori
           emptyConversationContextHandleStateStep(conversationId,now),
           kernel.DOMAIN_REPOSITORIES.domain("AgentConversationLink").insert({id:`${conversationId}-agent`,conversation_id:conversationId,agent_id:"agent-main",role:"default",created_at:now,updated_at:now})
         ]);
+      },
+      async finishCase(failed) {
+        releaseAllTools();
+        if (failed) {
+          for (const { turnId } of caseDrives) {
+            const [turn] = await rows(app, 'Turn', { id: turnId });
+            if (turn?.status === 'active') await app.turns.interrupt({
+              source: { kind: 'command', key: `native-fixture-stop:${turnId}` }, turnId, reason: 'native fixture case failed'
+            });
+          }
+          await app.modelProvider.abortAllActiveDispatches();
+        }
+        await Promise.allSettled(caseDrives.map(({ completion }) => completion));
+      },
+      releaseToolExecution(execution) {
+        const gate = heldToolExecutions?.get(execution);
+        assert.ok(gate, `native execution ${execution} must have a fixture gate`);
+        gate.resolve();
       },
       async setThinking(value) {
         assert.ok(stored);
@@ -354,7 +388,7 @@ async function isolatedNativeRuntime(run, { transport = 'websocket', realAuthori
       get releaseTool() { return releaseTool; }, configureModel, executions: () => executions, httpCalls: () => httpCalls
     });
   } finally {
-    releaseTool.resolve();
+    releaseAllTools();
     resetOpenAIResponsesWebSocketSessions();
     for (const socket of sockets.clients) socket.terminate();
     for (const frame of frames) frame.response?.destroy();
@@ -381,8 +415,9 @@ async function withNativeRuntime(run, options = {}) {
     if (!sharedNative) await nativeLifetime;
   }
   await sharedNative.resetCase(options);
-  try { return await run(sharedNative); }
-  finally { sharedNative.releaseTool.resolve(); resetOpenAIResponsesWebSocketSessions(); }
+  let failed = true;
+  try { const value = await run(sharedNative); failed = false; return value; }
+  finally { await sharedNative.finishCase(failed); resetOpenAIResponsesWebSocketSessions(); }
 }
 
 after(async () => { finishNative?.resolve(); await nativeLifetime; });
@@ -708,6 +743,95 @@ test('accepted steer and required result on one predecessor apply the steer, con
     assert.equal(harness.httpCalls(), 0);
   });
 });
+test('a steering segment survives multiple ordinary tool responses through provider output and native item metadata', { timeout: 30_000 }, async () => {
+  await withNativeRuntime(async harness => {
+    const { app, conversationId, frames, created, text, completed, send, until } = harness;
+    const turn = await harness.startTurn('native-steering-segment', 'Keep the steering segment across tool continuations.');
+    const first = await until(() => frames.find(frame => frame.body.type === 'response.create'), 'initial segment request');
+    created(first.socket, 'segment-response-1');
+    const prefix = text(first.socket, 'segment-response-1', 0, 'Before steering.');
+    const request = await until(async () => (await rows(app, 'ModelRequest', { turn_id: turn.turnId }))
+      .find(row => row.stream_stats_json?.nativeCapabilities?.steering === true), 'segment steering capability');
+    const [lease] = await rows(app, 'ExecutionLease', { turn_id: turn.turnId });
+    const queued = await app.modelProvider.steer({ commandId: 'native-segment-steer', conversationId, turnId: turn.turnId,
+      leaseEpoch: BigInt(lease.generation), content: { role: 'user', parts: [{ text: 'Continue in this steering segment.' }] } });
+    const steering = await until(() => frames.find(frame => frame.body.type === 'response.steer'), 'segment steering send');
+    send(steering.socket, { type: 'response.steer.accepted',
+      steer: { id: 'server-segment-steer', previous_response_id: 'segment-response-1' } });
+    const receipt = async () => (await app.modelProvider.steeringReceipts(conversationId))
+      .find(value => value.submissionId === queued.submissionId);
+    await until(async () => (await receipt())?.state === 'accepted', 'segment steer accepted');
+    completed(first.socket, 'segment-response-1', [prefix]);
+    created(first.socket, 'segment-response-2', 'segment-response-1');
+    await until(async () => ['continuing', 'completed'].includes((await receipt())?.state), 'segment steer applied');
+    let socket = first.socket;
+    let pendingSibling;
+    for (const response of [2, 3]) {
+      const responseId = `segment-response-${response}`;
+      const answer = text(socket, responseId, 0, `Output from ${responseId}.`);
+      const call = { type: 'function_call', id: `segment-item-${response}`, call_id: `segment-call-${response}`,
+        name: 'native_probe', arguments: '{}', async: true, status: 'completed' };
+      send(socket, { type: 'response.output_item.done', response_id: responseId, output_index: 1, item: call });
+      const output = [answer, call];
+      if (response === 2) {
+        pendingSibling = { type: 'function_call', id: 'segment-pending-item', call_id: 'segment-pending-call',
+          name: 'native_probe', arguments: '{}', async: true, status: 'completed' };
+        send(socket, { type: 'response.output_item.done', response_id: responseId, output_index: 2, item: pendingSibling });
+        output.push(pendingSibling);
+      }
+      await until(() => harness.executions() === response, `all async tools admitted in ${responseId}`);
+      completed(socket, responseId, output);
+      if (response === 3) {
+        await until(async () => (await app.modelProvider.readNativeLatestResponseUsage(request.id))?.responseId === responseId,
+          'the next pending call is admitted at response 3 before its predecessor settles');
+        harness.releaseToolExecution(2);
+      }
+      const deliveredCallId = response === 2 ? call.call_id : pendingSibling.call_id;
+      const delivery = await until(() => frames.find(frame => frame.body.type === 'response.create'
+        && frame.body.input?.some(item => item.type === 'function_call_output' && item.call_id === deliveredCallId)), `segment tool result ${response}`);
+      assert.equal(delivery.body.previous_response_id, responseId);
+      socket = delivery.socket;
+      created(socket, `segment-response-${response + 1}`, responseId);
+    }
+    completed(socket, 'segment-response-4', [text(socket, 'segment-response-4', 0, 'Final multi-hop answer.')]);
+    await until(async () => (await app.modelProvider.readNativeLatestResponseUsage(request.id))?.responseId === 'segment-response-4',
+      'the four-response logical chain reaches its committed boundary');
+    harness.releaseToolExecution(3);
+    const carrier = await until(() => frames.find(frame => frame.body.type === 'response.create'
+      && frame.body.input?.some(item => item.type === 'function_call_output' && item.call_id === 'segment-call-3')),
+    'the settled sibling continues in a fresh full request');
+    assert.equal(carrier.body.previous_response_id, undefined);
+    created(carrier.socket, 'segment-carrier-response');
+    completed(carrier.socket, 'segment-carrier-response', [text(carrier.socket, 'segment-carrier-response', 0, 'All three tool results are available.')]);
+    assert.equal((await turn.completion).terminalStatus, 'completed');
+    assert.equal(harness.executions(), 3);
+    const parts = await assistantCurrentParts(app, request.id);
+    for (const response of [2, 3, 4]) {
+      const responseParts = parts.filter(part => part.outputItem?.providerResponseId === `segment-response-${response}`);
+      assert.ok(responseParts.length > 0);
+      assert.ok(responseParts.every(part => part.outputItem.steeringSuccessorResponseId === 'segment-response-2'));
+    }
+    const [messageLink] = await rows(app, 'ModelRequestMessageLink', { model_request_id: request.id });
+    const feed = new kernel.BoundedClientFeed(app.database);
+    try {
+      const feedFrames = [];
+      await feed.connect({ activeConversationId: conversationId, send(frame) { feedFrames.push(frame); } });
+      const state = applyReliableKernelDataMessage(createEmptyReliableKernelClientState(), feedFrames[0]).state;
+      const message = state.records.Message[messageLink.message_id];
+      assert.ok(message.item_index_revision_id, 'the real Feed retains a separate native item index');
+      const detail = await new kernel.ClientDetailReader(app.database, app.contentStore).read({
+        kind: 'message-content-items', recordId: message.item_index_revision_id,
+        offset: 0, maxBytes: 65536, itemLimit: 1, conversationId
+      });
+      assert.equal(detail.hasMore, false);
+      const page = JSON.parse(Buffer.from(detail.chunk, 'base64').toString('utf8'));
+      assert.equal(page.items.length, 1);
+      assert.equal(page.items[0].outputItem.providerResponseId, 'segment-response-4');
+      assert.equal(page.items[0].outputItem.steeringSuccessorResponseId, 'segment-response-2');
+    } finally { feed.close(); }
+  }, { heldToolExecutions: [2, 3] });
+});
+
 test(`native WS freezes exact ${streamed ? 'streamed' : 'done-only'} reasoning item proofs before final aggregation`,
   { timeout: 30_000 }, async () => {
     await withNativeRuntime(async h => {
@@ -773,10 +897,12 @@ test(`native WS freezes exact ${streamed ? 'streamed' : 'done-only'} reasoning i
         'the final aggregate and repeated done cannot append duplicate item occurrences');
       const [link] = await rows(h.app, 'ModelRequestMessageLink', { model_request_id: request.id });
       const immutable = [];
+      const itemRevisionIds = new Set(before.map(source => source.source_id));
       for (const revision of await rows(h.app, 'MessageRevision', { message_id: link.message_id })) {
+        if (!itemRevisionIds.has(revision.id)) continue;
         const [metadata] = await rows(h.app, 'ContentObject', { id: revision.content_object_id });
         const parts = JSON.parse((await h.app.contentStore.read(metadata)).toString('utf8')).parts;
-        if (parts.length === 1 && before.some(source => source.source_id === revision.id)) immutable.push(...parts);
+        if (parts.length === 1) immutable.push(...parts);
       }
       assert.deepEqual(semantic(immutable.sort((left, right) => left.outputItem.ordinal - right.outputItem.ordinal)), expected,
         'each canonical part has its own exact immutable revision proof');

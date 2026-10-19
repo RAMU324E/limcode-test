@@ -338,6 +338,13 @@ export class ReliableKernelApplication {
       }
     );
     this.convergenceHeld = dependencies.holdRuntimeConvergence === true;
+    database.onClose(failure => {
+      if (!failure) return;
+      this.stopRuntimeConvergence();
+      this.webviewFeed.close();
+      this.runtime.clientFeed.close();
+      void this.processDeliveries.dispose().catch(error => console.error('[LimCode] Runtime delivery shutdown failed.', error));
+    });
     this.unsubscribeConvergence = database.onCommit((commit) => {
       if (!commit.changes.some((change) => [
         'EffectIntent',
@@ -468,11 +475,7 @@ export class ReliableKernelApplication {
     this.database.stopHistoryPreparation(new ExecutionHandoffError('Reliable Runtime is closing for Host handoff.'));
     const task = (async () => {
       if (!this.closeDependenciesCompleted) {
-        this.convergenceClosed = true;
-        this.unsubscribeConvergence?.();
-        this.unsubscribeConvergence = undefined;
-        if (this.convergenceTimer) clearTimeout(this.convergenceTimer);
-        this.convergenceTimer = undefined;
+        this.stopRuntimeConvergence();
         await this.convergenceTask?.catch(() => undefined);
         this.webviewFeed.close();
         this.runtime.clientFeed.close();
@@ -500,6 +503,14 @@ export class ReliableKernelApplication {
    * terminal Operation or model artifact must not depend on the original dispatcher Promise
    * reaching its next line of code.
    */
+  private stopRuntimeConvergence(): void {
+    this.convergenceClosed = true;
+    this.unsubscribeConvergence?.();
+    this.unsubscribeConvergence = undefined;
+    if (this.convergenceTimer) clearTimeout(this.convergenceTimer);
+    this.convergenceTimer = undefined;
+  }
+
   private scheduleRuntimeConvergence(): void {
     if (this.convergenceClosed) return;
     this.convergenceRequested = true;

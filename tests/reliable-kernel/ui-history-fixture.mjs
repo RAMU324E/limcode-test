@@ -28,6 +28,7 @@ export async function createHistoryFixture(t) {
   const directory = await promises.mkdtemp(path.join(os.tmpdir(), 'limcode-ui-history-'));
   const root = await kernel.resetCandidateRuntimeRoot(directory);
   const database = await kernel.RuntimeDatabase.open(root.authority);
+  const contentStore = kernel.ContentAddressedStore.forDatabase(root.authority, database);
   t.after(async () => { await database.close(); await promises.rm(directory, { recursive: true, force: true }); });
   let clock = 0;
   const at = () => new Date(Date.parse(NOW) + ++clock * 1000).toISOString();
@@ -46,10 +47,10 @@ export async function createHistoryFixture(t) {
   }
   await database.transaction(steps);
   const reveals = [], facade = Object.create(Facade.prototype);
-  Object.assign(facade, { product: { application: { database }, configuration: { agents: async () => [] } }, historyEntries: [], originLinks: [],
+  Object.assign(facade, { product: { application: { database, contentStore }, configuration: { agents: async () => [] } }, historyEntries: [], originLinks: [],
     historyPreviewByRevisionId: new Map(), historyTitleByRevisionId: new Map(), historyRevealEmitter: { fire: value => reveals.push(value) },
     historyEmitter: { fire() {} }, writeGate: new RuntimeWriteGate(), disposed: false, startHydration: async () => {} });
-  return { database, facade, reveals,
+  return { database, contentStore, facade, reveals,
     page(scopeKind = 'project', cursor) { return facade.getConversationHistoryPage({ scopeKind, projectFolderUri: scopeKind === 'project' ? P : undefined, cursor, limit: 5 }); },
     create(id, project = 'q') { return database.transaction(conversation(id, project, at())); },
     touch(id) { return database.transaction([kernel.DOMAIN_REPOSITORIES.domain('Conversation').update(id, { updated_at: at() })]); },

@@ -6,7 +6,112 @@ import {
   isTextPart,
   type MessageContent
 } from '../../../shared/protocol';
-import type { DomainRow } from '../../reliableKernel/repositories';
+import type { ContentAddressedStore, ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
+import {
+  LogicalMessageContentReader,
+  NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE,
+  type NativeMessageBlock
+} from '../../reliableKernel/logicalMessageContent';
+import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
+import type { RuntimeDatabase } from '../../reliableKernel/runtimeDatabase';
+
+const HISTORY_PREVIEW_SUMMARY_LIMIT = 256;
+const HISTORY_PREVIEW_SUMMARY_CHARACTERS = 4096;
+
+interface HistoryPreviewSummary {
+  visibleText: string;
+  thoughtText: string;
+  toolNames: string[];
+  responseNames: string[];
+  toolText: string;
+  responseText: string;
+  hasAttachments: boolean;
+  hasParts: boolean;
+}
+
+interface HistoryPartPreview {
+  visibleText: string;
+  thoughtText: string;
+  toolName?: string;
+  responseName?: string;
+  hasAttachments: boolean;
+}
+
+/** Sidebar-only summaries of immutable items and their existing block prefixes. */
+export class ConversationHistoryContentReader {
+  private readonly messageContents: LogicalMessageContentReader;
+  private readonly blockPreviews = new Map<string, HistoryPreviewSummary>();
+  private readonly itemPreviews = new Map<string, HistoryPartPreview[]>();
+
+  public constructor(private readonly database: Pick<RuntimeDatabase, 'snapshot'>,
+    contentStore: Pick<ContentAddressedStore, 'read' | 'readMany' | 'readChunk'>) {
+    this.messageContents = new LogicalMessageContentReader(database, contentStore);
+  }
+
+  public async read(metadata: ContentObjectMetadata): Promise<{ preview?: string; titleContent?: MessageContent }> {
+    if (metadata.content_type !== NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE) {
+      return conversationHistoryPresentationFromBytes(await this.messageContents.read(metadata), metadata.content_type);
+    }
+    const root = await this.messageContents.readComposition(metadata);
+    let next: string | null = root.tailBlockContentObjectId;
+    let summary = emptyHistoryPreview();
+    const pending: Array<{ id: string; block: NativeMessageBlock }> = [];
+    while (next) {
+      const cached = this.cached(this.blockPreviews, next);
+      if (cached) { summary = cached; break; }
+      const block = await this.messageContents.readBlock(next);
+      pending.push({ id: next, block });
+      next = block.previousBlockContentObjectId;
+    }
+    for (const { id, block } of pending.reverse()) {
+      if (summary.visibleText.length <= 180) {
+        summary = { ...summary, toolNames: [...summary.toolNames], responseNames: [...summary.responseNames] };
+        const missing = [...new Set(block.items.flatMap(item => this.itemPreviews.has(item.contentObjectId)
+          ? [] : [item.contentObjectId]))];
+        const contentRows = missing.length ? (await this.database.snapshot(missing.map(contentId =>
+          DOMAIN_REPOSITORIES.domain('ContentObject').get(contentId)))).snapshot : [];
+        const contents = new Map(missing.flatMap((contentId, index) => {
+          const row = contentRows[index];
+          return row && !Array.isArray(row) ? [[contentId, row as ContentObjectMetadata] as const] : [];
+        }));
+        for (const item of block.items) {
+          // An append cannot change the first 177 visible characters once truncation is known.
+          if (summary.visibleText.length > 180) break;
+          let parts = this.cached(this.itemPreviews, item.contentObjectId);
+          if (!parts) {
+            const content = contents.get(item.contentObjectId);
+            if (!content) throw new Error(`History preview ContentObject ${item.contentObjectId} is unavailable.`);
+            const message = decodeConversationHistoryContent((await this.messageContents.read(content)).toString('utf8'));
+            if (!message) throw new Error(`History preview ContentObject ${item.contentObjectId} is not MessageContent.`);
+            parts = message.parts.map(historyPartPreview);
+            this.remember(this.itemPreviews, item.contentObjectId, parts, parts.reduce((size, part) => size
+              + part.visibleText.length + part.thoughtText.length + (part.toolName?.length ?? 0)
+              + (part.responseName?.length ?? 0) + 1, 0));
+          }
+          for (const part of parts) appendHistoryPart(summary, part);
+        }
+      }
+      this.remember(this.blockPreviews, id, summary, summary.visibleText.length + summary.thoughtText.length
+        + summary.toolText.length + summary.responseText.length
+        + [...summary.toolNames, ...summary.responseNames].reduce((size, name) => size + name.length, 0));
+    }
+    return { preview: renderHistoryPreview(summary) };
+  }
+
+  private cached<T>(cache: Map<string, T>, id: string): T | undefined {
+    const value = cache.get(id);
+    if (value !== undefined) { cache.delete(id); cache.set(id, value); }
+    return value;
+  }
+
+  private remember<T>(cache: Map<string, T>, id: string, value: T, characters: number): void {
+    // Text is capped at the preview boundary. Unusually whitespace-heavy tool names may be
+    // longer before normalization; do not retain them merely to reproduce exact name deduplication.
+    if (characters > HISTORY_PREVIEW_SUMMARY_CHARACTERS) return;
+    cache.delete(id); cache.set(id, value);
+    if (cache.size > HISTORY_PREVIEW_SUMMARY_LIMIT) cache.delete(cache.keys().next().value!);
+  }
+}
 
 export const CHILD_HISTORY_STATUS = {
   running: '运行中',
@@ -159,36 +264,62 @@ export function projectChildConversationHistory(
 
 /** Produce a bounded, user-facing preview from an immutable MessageContent object. */
 export function conversationHistoryPreview(content: MessageContent): string {
-  const visibleText = content.parts
-    .filter(isTextPart)
-    .filter((part) => part.thought !== true)
-    .map((part) => part.text)
-    .join('\n');
-  const normalizedVisibleText = normalizePreview(visibleText);
-  if (normalizedVisibleText) return normalizedVisibleText;
+  const summary = emptyHistoryPreview();
+  for (const part of content.parts) {
+    appendHistoryPart(summary, historyPartPreview(part));
+    if (summary.visibleText.length > 180) break;
+  }
+  return renderHistoryPreview(summary);
+}
 
-  const toolNames = content.parts
-    .filter(isFunctionCallPart)
-    .map((part) => part.functionCall.name.trim())
-    .filter(Boolean);
-  if (toolNames.length > 0) return normalizePreview(`调用工具：${unique(toolNames).join('、')}`);
+function emptyHistoryPreview(): HistoryPreviewSummary {
+  return { visibleText: '', thoughtText: '', toolNames: [], responseNames: [], toolText: '', responseText: '',
+    hasAttachments: false, hasParts: false };
+}
 
-  const responseNames = content.parts
-    .filter(isFunctionResponsePart)
-    .map((part) => part.functionResponse.name.trim())
-    .filter(Boolean);
-  if (responseNames.length > 0) return normalizePreview(`工具结果：${unique(responseNames).join('、')}`);
+function historyPartPreview(part: MessageContent['parts'][number]): HistoryPartPreview {
+  return {
+    visibleText: isTextPart(part) && part.thought !== true ? previewTextPrefix(part.text) : '',
+    thoughtText: isTextPart(part) && part.thought === true ? previewTextPrefix(part.text) : '',
+    ...(isFunctionCallPart(part) ? { toolName: part.functionCall.name.trim() } : {}),
+    ...(isFunctionResponsePart(part) ? { responseName: part.functionResponse.name.trim() } : {}),
+    hasAttachments: isInlineDataPart(part) || isFileDataPart(part)
+  };
+}
 
-  const thoughtText = content.parts
-    .filter(isTextPart)
-    .filter((part) => part.thought === true)
-    .map((part) => part.text)
-    .join('\n');
-  const normalizedThought = normalizePreview(thoughtText);
-  if (normalizedThought) return normalizePreview(`思考：${normalizedThought}`);
+function appendHistoryPart(summary: HistoryPreviewSummary, part: HistoryPartPreview): void {
+  const appendText = (left: string, right: string): string => left.length > 180 || !right ? left
+    : (left ? `${left} ${right}` : right).slice(0, 181);
+  summary.visibleText = appendText(summary.visibleText, part.visibleText);
+  summary.thoughtText = appendText(summary.thoughtText, part.thoughtText);
+  const appendName = (names: string[], text: string, name: string | undefined, label: string): string => {
+    if (!name || text.length > 180 || names.includes(name)) return text;
+    names.push(name);
+    const value = previewTextPrefix(`${label}${names.join('、')}`);
+    if (value.length > 180) names.length = 0;
+    return value;
+  };
+  summary.toolText = appendName(summary.toolNames, summary.toolText, part.toolName, '调用工具：');
+  summary.responseText = appendName(summary.responseNames, summary.responseText, part.responseName, '工具结果：');
+  summary.hasAttachments ||= part.hasAttachments;
+  summary.hasParts = true;
+}
 
-  if (content.parts.some((part) => isInlineDataPart(part) || isFileDataPart(part))) return '附件消息';
-  return content.parts.length > 0 ? '结构化消息' : '消息未包含可显示内容';
+function renderHistoryPreview(summary: HistoryPreviewSummary): string {
+  if (summary.visibleText) return renderPreviewPrefix(summary.visibleText);
+  if (summary.toolText) return renderPreviewPrefix(summary.toolText);
+  if (summary.responseText) return renderPreviewPrefix(summary.responseText);
+  if (summary.thoughtText) return normalizePreview(`思考：${renderPreviewPrefix(summary.thoughtText)}`);
+  if (summary.hasAttachments) return '附件消息';
+  return summary.hasParts ? '结构化消息' : '消息未包含可显示内容';
+}
+
+function previewTextPrefix(value: string): string {
+  return value.trim().replace(/\s+/g, ' ').slice(0, 181);
+}
+
+function renderPreviewPrefix(value: string): string {
+  return value.length > 180 ? `${value.slice(0, 177)}…` : value;
 }
 
 export function decodeConversationHistoryContent(value: string): MessageContent | undefined {
@@ -283,8 +414,4 @@ function text(value: unknown): string | undefined {
 function normalizePreview(value: string): string {
   const normalized = value.trim().replace(/\s+/g, ' ');
   return normalized.length > 180 ? `${normalized.slice(0, 177)}…` : normalized;
-}
-
-function unique(values: readonly string[]): string[] {
-  return [...new Set(values)];
 }

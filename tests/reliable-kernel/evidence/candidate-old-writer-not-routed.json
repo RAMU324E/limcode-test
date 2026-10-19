@@ -1,0 +1,47 @@
+{
+  "kind": "limcode-phase-f-candidate-evidence",
+  "checkId": "candidate.old-writer-not-routed",
+  "stableId": "candidate.old-writer-not-routed",
+  "passed": true,
+  "commitSha": "528d720f929acd84ece7d6d7bf8f1c68e8557f1e",
+  "measuredAt": "2026-09-11T10:17:51.605Z",
+  "assertionCount": 3,
+  "provenance": {
+    "worktreeClean": false,
+    "commitExplicitlyBound": false,
+    "authoritative": false,
+    "runnerSha256": "4e7bcd9adc82c715b6203e8d9f4f094dca5f50da58f27d8f89eac8ee654e845a",
+    "sourceTreeSha256": "5d344fdf3a880d1c34e784b051002b48de031afe14105394cee38893e9451f28",
+    "sourceFileCount": 487,
+    "sourceFilesTracked": false,
+    "compiledKernelSha256": "008b012c5869cfad313407aa67cb16898abf0b86988a74e88b01a78df624333c",
+    "compiledFileCount": 226,
+    "compileProvenance": "dist/extension/reliable-kernel-compile-provenance.json",
+    "compileWorktreeClean": false,
+    "compiledClosureMatches": false,
+    "invocation": [
+      "/Users/lurenxing/.local/node-v24.15.0-darwin-arm64/bin/node",
+      "/Users/lurenxing/GitHub/limcode-test/scripts/reliable-kernel/run-phase-f-check.mjs",
+      "--check",
+      "candidate.old-writer-not-routed"
+    ],
+    "node": "v24.15.0",
+    "sqlite": "3.53.4",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5"
+  },
+  "assertions": [
+    "真实VS Code extension main emitted require closure不可达旧file writer、BackendApplication、AgentRun/run-history/full ClientState入口",
+    "未知可靠Runtime route显式失败且无旧路由/双写/importer；Runtime exact set无AgentRun/TaskList/ClientChangeLog/ProviderContinuation",
+    "F executable transition selectors不进入production graph；shared/protocol中的已擦除类型不按整文件误判；Bridge session只驻内存、快照messages恢复Message bucket，run_agent等待子Agent/转后台语义明确，初始Child无TurnIntent直接进入AgentLoop且后台失败走failed AnswerSubmission/RuntimeDeliveryWake"
+  ],
+  "faults": [
+    "candidate import-graph traversal against all Phase F legacy selectors"
+  ],
+  "metrics": {
+    "productionEntry": "dist/extension/vscode/extension.js",
+    "emittedClosureFiles": 212,
+    "phaseFTransitionEntries": 19
+  }
+}

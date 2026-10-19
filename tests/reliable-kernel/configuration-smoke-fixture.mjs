@@ -28,6 +28,12 @@ export class Uri {
     return uri;
   }
   toString() { return `${this.scheme}://${this.path}`; }
+  with(changes) {
+    const next = new Uri(this.fsPath);
+    Object.assign(next, this, changes);
+    if (this.scheme === 'file' && typeof changes.path === 'string') next.fsPath = path.resolve(changes.path);
+    return next;
+  }
 }
 
 export function installVscode() {

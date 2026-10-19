@@ -38,4 +38,4 @@ docs/architecture/*
 /scripts/reliable-kernel/tool-scheduler-model-independent-after.json
 /scripts/reliable-kernel/tool-scheduler-phase*-*.json
 .playwright-cli/
-/output/playwright/
+/output/

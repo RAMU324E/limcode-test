@@ -1,7 +1,8 @@
 /** Derived decisions expire when these rules change; content fingerprints and commit facts do not. */
-export const RUNTIME_MERGE_VALIDATION_REVISION = '2026-09-30-process-exit-consistency-model-ownership';
+export const RUNTIME_MERGE_VALIDATION_REVISION = '2026-10-16-timeline-exclusions-child-settlement';
 
 const REVISIONED_REFUSALS = new Set([
+  'runtime-data-set-merge-source-row-invalid',
   'runtime-data-set-merge-invariant',
   'runtime-data-set-merge-unfinished-work',
   'runtime-data-set-merge-foreign-unfinished-work'

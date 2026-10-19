@@ -1,0 +1,20 @@
+{
+  "kind": "limcode-phase-d-candidate-evidence",
+  "stableId": "candidate.attachment-cas-ingest",
+  "passed": true,
+  "commitSha": "b967bdca78d7934760628fabed3449c5f192dfc8",
+  "measuredAt": "2026-08-21T01:25:57.589Z",
+  "assertionCount": 4,
+  "assertions": [
+    "附件限制从现有settings authority读取，正文进CAS，AttachmentLink精确指向MessageRevision",
+    "超限附件在CAS发布和Runtime引用前拒绝",
+    "重复ingest稳定重放同一Attachment/Link且大INTEGER保持bigint/十进制字符串",
+    "CAS发布失败时SQLite不保存Attachment或AttachmentLink引用"
+  ],
+  "faults": [
+    "size-limit-before-CAS",
+    "CAS-publish-failure-before-SQLite",
+    "duplicate ingest",
+    "large INTEGER wire"
+  ]
+}

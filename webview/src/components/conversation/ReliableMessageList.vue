@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
 import type { MessageRecord, RunTerminationRecord } from '@shared/protocol';
 import { projectCompressionNotices, type CompressionNotice as CompressionWarningRecord } from '@shared/compressionNotices';
 import { useChat } from '@webview/composables/useChat';
 import { messageForkBlocked } from '@webview/composables/forkRequestLifecycle';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
+import { USER_SCROLL_INTENT_EVENT, userScrollIntentDetail } from '@webview/composables/scrollIntent';
+import { useSessionStore } from '@webview/stores/useSessionStore';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
 import { useReliableTimelinePresentationStore } from '@webview/stores/useReliableTimelinePresentationStore';
@@ -22,7 +24,7 @@ import {
   createReliableRetryClock,
   reliableRetryStreamingActivityLabel
 } from '@webview/domain/reliableTransientActivity';
-import { modelRequestRetryForTurn, projectReliableTurnTermination } from '@webview/domain/reliableConversationProjection';
+import { createReliableModelRequestRetryIndex, createTurnProjectionIndex, modelRequestRetryForTurn, projectReliableTurnTermination } from '@webview/domain/reliableConversationProjection';
 import { modelRequestStreamStats } from '@webview/reliability/modelRequestStreamStats';
 import { turnInputEchoContent, turnInputEchoMessage } from '@webview/domain/reliableTurnInputSubmission';
 import { collaborationCardPlacementLabel, projectCollaborationTimeline } from '@webview/domain/reliableCollaborationTimeline';
@@ -38,9 +40,7 @@ import {
   PENDING_TIMELINE_MOUNT_LIMIT,
   TIMELINE_SEGMENT_STEP,
   absoluteTimelineFloor,
-  clampTimelineSegmentStart,
   composeTimelineRows,
-  latestTimelineSegmentStart,
   prioritizedTimelineDetailDemand
 } from './segmentedTimeline';
 import { captureScrollAnchor, restoreScrollAfterHistoryLoad, releaseStickyFromUserScroll, type ScrollAnchor } from './scrollAnchor';
@@ -58,7 +58,8 @@ const emit = defineEmits<{
   (event: 'edit-message', message: MessageRecord, deleteCount: number): void;
   (event: 'resend-as-new', message: MessageRecord): void;
 }>();
-const { feed, conversationId, projection, ensureDetails } = useReliableConversation();
+const session = useSessionStore();
+const { feed, conversationId, projection, ensureDetails, completeMessageContent } = useReliableConversation();
 const {
   retryMessageFrom,
   deleteMessagesFrom,
@@ -99,9 +100,16 @@ function displayedMessage(message: MessageRecord): MessageRecord {
   const echo = submissionEchoByMessageId.value[message.id];
   return echo ? { ...message, content: turnInputEchoContent(echo) } : message;
 }
-const mountedTransientRequestIds = computed(() => new Set(messages.value.flatMap((message) =>
-  message.id.startsWith('transient:')
-    ? [message.id.slice('transient:'.length)]
+const messageOrderIds = computed(() => projection.value.index.messageIds);
+const messageMetadata = computed(() => projection.value.index.messageMetadata);
+const messagePositions = computed(() => projection.value.index.messagePositionById);
+const compressionPositions = computed(() => projection.value.index.compressionPositions);
+const absoluteFloors = computed(() => projection.value.absoluteFloorByMessageId);
+const splitSourceMessageIds = computed(() => projection.value.splitSourceMessageIdByMessageId);
+const terminations = computed(() => projection.value.terminationByMessageId);
+const mountedTransientRequestIds = computed(() => new Set(messageOrderIds.value.flatMap((id) =>
+  id.startsWith('transient:')
+    ? [id.slice('transient:'.length)]
     : []
 )));
 const compressionBlocks = computed(() => Object.values(feed.records.CompressionBlock ?? {})
@@ -115,101 +123,123 @@ const compressionBlocks = computed(() => Object.values(feed.records.CompressionB
 const segmentStart = ref(0);
 const followLatestSegment = ref(true);
 const pendingHistoryAnchorId = ref<string | null>(null);
+const pendingHistoryDirection = ref<'before' | 'after'>('before');
+const pendingCollaborationPageForReading = ref(false);
 const pendingScrollAnchor = ref<ScrollAnchor | null>(null);
+const readingRoot = ref<HTMLElement | null>(null);
+let readingScrollAnchor: ScrollAnchor | null = null;
+let readingScroller: HTMLElement | null = null;
+let readingScrollTop: number | undefined;
+let readingResizeObserver: ResizeObserver | undefined;
 /** Timeline rows present when the user asked for older collaboration records. */
 const pendingCollaborationRowIds = shallowRef<Set<string> | null>(null);
-const earliestLoadedFloor = computed(() => {
-  const first = messages.value[0];
-  if (!first) return 0;
-  return projection.value.absoluteFloorByMessageId[first.id] ?? first.seq;
-});
-const hasLoadedFloorGap = computed(() => {
-  let previous = 0;
-  for (const message of messages.value) {
-    const floor = projection.value.absoluteFloorByMessageId[message.id];
-    if (!floor) continue;
-    if (previous > 0 && floor > previous + 1) return true;
-    previous = Math.max(previous, floor);
-  }
-  return false;
-});
+const collaborationSearching = ref(false);
+const collaborationSearchDirection = ref<'before' | 'after'>('before');
+const collaborationSearchNotice = ref('');
+const collaborationSearchStart = ref(0);
+const collaborationScanned = computed(() => Math.max(0, feed.collaborationHistoryScannedRows - collaborationSearchStart.value));
+let collaborationSearchTimer: ReturnType<typeof setTimeout> | undefined;
+function stopCollaborationSearch(notice = '已停止查找'): void {
+  if (collaborationSearchTimer !== undefined) clearTimeout(collaborationSearchTimer);
+  collaborationSearchTimer = undefined;
+  collaborationSearching.value = false;
+  pendingCollaborationRowIds.value = null;
+  collaborationSearchNotice.value = notice;
+}
+onBeforeUnmount(() => stopCollaborationSearch(''));
+watch(() => feed.sessionId, () => stopCollaborationSearch(''));
+watch(() => feed.collaborationHistoryError, error => { if (error) stopCollaborationSearch('查找失败，可从当前位置重试'); });
+watch(() => session.runtimeError, error => { if (error) stopCollaborationSearch('运行连接已停止'); });
 const canRequestEarlierHistory = computed(() =>
-  feed.historyConversationId === conversationId.value
-  && feed.historyHasMore
-  && (earliestLoadedFloor.value > 1 || hasLoadedFloorGap.value)
+  feed.historyConversationId === conversationId.value && feed.historyHasMore
 );
-const hasEarlierSegment = computed(() => segmentStart.value > 0 || canRequestEarlierHistory.value);
-const hasLaterSegment = computed(() => segmentStart.value + TIMELINE_MOUNT_LIMIT < timelineRows.value.length);
-const earlierSegmentLabel = computed(() => feed.historyLoading
+const canRequestLaterHistory = computed(() =>
+  feed.historyConversationId === conversationId.value && feed.historyHasMoreAfter
+);
+const canRequestEarlierCollaboration = computed(() =>
+  feed.collaborationHistoryConversationId === conversationId.value && feed.collaborationHistoryHasMoreBefore);
+const canRequestLaterCollaboration = computed(() =>
+  feed.collaborationHistoryConversationId === conversationId.value && feed.collaborationHistoryHasMoreAfter);
+const readingHistoryLoading = computed(() => feed.historyLoading
+  || (pendingCollaborationPageForReading.value && feed.collaborationHistoryLoading));
+const hasEarlierSegment = computed(() => segmentStart.value > readingRun.value.start
+  || canRequestEarlierHistory.value || canRequestEarlierCollaboration.value);
+const hasLaterSegment = computed(() => segmentEnd.value < readingRun.value.end
+  || readingRun.value.end < timelineRows.value.length || canRequestLaterHistory.value);
+const earlierSegmentLabel = computed(() => readingHistoryLoading.value && pendingHistoryDirection.value === 'before'
   ? '正在加载更早内容'
-  : feed.historyError && segmentStart.value === 0
+  : feed.historyError && segmentStart.value === readingRun.value.start
     ? '重试加载更早内容'
-    : segmentStart.value > 0
-      ? `显示更早内容（前方 ${segmentStart.value} 个步骤）`
-      : '显示更早内容'
+    : '显示更早内容'
 );
 const compressionTimeline = computed(() => projectReliableCompressionTimeline(
   compressionBlocks.value,
-  messages.value.map((message) => ({ id: message.id, createdAt: message.createdAt }))
+  { messageIds: messageOrderIds.value, messagePositionById: messagePositions.value, compressionPositions: compressionPositions.value }
 ));
 const compressionBlocksByAnchor = computed(() => compressionTimeline.value.byAnchor);
+const messageRoles = computed(() => new Map(messageMetadata.value.map(message => [message.id, message.role])));
 const terminationRowsByAnchor = computed(() => {
   const result: Record<string, RunTerminationRecord[]> = {};
-  for (const [messageId, termination] of Object.entries(projection.value.terminationByMessageId)) {
-    const anchor = messages.value.find((message) => message.id === messageId);
-    if (anchor?.role !== 'user' || isTerminationSuppressed(termination)) continue;
+  for (const [messageId, termination] of Object.entries(terminations.value)) {
+    if (messageRoles.value.get(messageId) !== 'user' || isTerminationSuppressed(termination)) continue;
     (result[messageId] ??= []).push(termination);
   }
   return result;
 });
 
-// Historical collaboration pages can add older independent facts; the live committed feed wins
-// on overlap. Do not convert those envelopes into Messages or infer their place from created_at.
-const collaborationRecords = computed(() => {
-  const history: typeof feed.historyRecords = feed.historyConversationId === conversationId.value ? feed.historyRecords : {};
-  const collaboration: typeof feed.collaborationHistoryRecords = feed.collaborationHistoryConversationId === conversationId.value
-    ? feed.collaborationHistoryRecords : {};
-  const records: typeof feed.records = { ...history, ...collaboration, ...feed.records };
-  for (const type of [
-    'Conversation', 'Message', 'Turn', 'CollaborationMessage', 'CollaborationMessageSourceLink',
-    'CollaborationMessageTargetLink', 'RuntimeDelivery', 'RuntimeDeliveryTimelineLink', 'RuntimeDeliveryAnswerPresentation',
-    'CollaborationSendTimelineLink', 'RuntimeInboxItem', 'AnswerSubmission', 'AnswerBridge',
-    'ChildExecution', 'ChildExecutionParentLink', 'CollaborationPeerConversation'
-  ]) {
-    records[type] = { ...(history[type] ?? {}), ...(collaboration[type] ?? {}), ...(feed.records[type] ?? {}) };
-  }
-  return records;
-});
+const collaborationRecords = computed(() => feed.committedRecords);
+const messageOrder = computed(() => messageOrderIds.value.map(id => ({ id })));
+const messageTurnIds = computed(() => projection.value.turnIdByMessageId);
 const collaborationTimeline = computed(() => projectCollaborationTimeline({
   conversationId: conversationId.value,
   records: collaborationRecords.value,
-  messages: messages.value,
-  turnIdByMessageId: projection.value.turnIdByMessageId,
+  messages: messageOrder.value,
+  turnIdByMessageId: messageTurnIds.value,
   removedConversationIds: feed.removedConversationIds,
   peerStateGeneration: feed.peerStateGeneration,
   acceptedAnswerPeerGenerations: feed.acceptedAnswerPeerGenerations,
   acceptedAnswerDetails: feed.details
 }));
-const timelineRows = computed(() => composeTimelineRows(messages.value, collaborationTimeline.value));
-const visibleTimelineRows = computed(() => timelineRows.value.slice(
-  segmentStart.value, segmentStart.value + TIMELINE_MOUNT_LIMIT
-));
+const timelineRows = computed(() => composeTimelineRows(messageOrder.value, collaborationTimeline.value));
+// A released history page is a real gap. Never put its distant neighbour directly beside the
+// current page; the same keyset endpoint fills that range when the reader moves through it.
+const residentRuns = computed(() => {
+  const runs: Array<{ start: number; end: number }> = [];
+  let start = 0, priorFloor = 0;
+  timelineRows.value.forEach((row, index) => {
+    if (row.kind !== 'message') return;
+    const floor = absoluteFloors.value[row.message.id] ?? 0;
+    if (floor > 0 && priorFloor > 0 && floor > priorFloor + 1) {
+      runs.push({ start, end: index }); start = index;
+    }
+    priorFloor = Math.max(priorFloor, floor);
+  });
+  runs.push({ start, end: timelineRows.value.length });
+  return runs;
+});
+const readingRun = computed(() => residentRuns.value.find(run => segmentStart.value >= run.start && segmentStart.value < run.end)
+  ?? residentRuns.value[residentRuns.value.length - 1]!);
+const segmentEnd = computed(() => Math.min(readingRun.value.end, segmentStart.value + TIMELINE_MOUNT_LIMIT));
+function clampReadingStart(requested: number): number {
+  const run = residentRuns.value.find(candidate => requested >= candidate.start && requested < candidate.end)
+    ?? residentRuns.value[residentRuns.value.length - 1]!;
+  return Math.max(run.start, Math.min(requested, Math.max(run.start, run.end - TIMELINE_MOUNT_LIMIT)));
+}
+function latestReadingStart(): number {
+  const run = residentRuns.value[residentRuns.value.length - 1]!;
+  return Math.max(run.start, run.end - TIMELINE_MOUNT_LIMIT);
+}
+const visibleRowMembership = computed(() => timelineRows.value.slice(segmentStart.value, segmentEnd.value));
+const visibleTimelineRows = computed(() => visibleRowMembership.value.map(row => row.kind === 'message' ? { ...row, message: projection.value.index.messageById.get(row.message.id)! } : row));
 const visibleMessageRows = computed(() => visibleTimelineRows.value.flatMap((row) =>
   row.kind === 'message' ? [row.message] : []
 ));
 const hasCollaborationCards = computed(() => timelineRows.value.some((row) => row.kind === 'collaboration'));
 
-// Merge historical facts per domain; a current committed row always wins over its cached copy.
-const retryRecords = computed(() => {
-  const history = feed.historyConversationId === conversationId.value ? feed.historyRecords : {};
-  const records = { ...history, ...feed.records };
-  for (const domain of ['Turn', 'ModelRequest', 'ModelContextProjection', 'ConversationContextStatus', 'TurnTermination']) {
-    records[domain] = { ...(history[domain] ?? {}), ...(feed.records[domain] ?? {}) };
-  }
-  return records;
-});
+const retryRecords = computed(() => feed.committedRecords);
+const retryIndex = computed(() => createReliableModelRequestRetryIndex(retryRecords.value, conversationId.value));
 function terminationRetry(turnId: string): ReturnType<typeof modelRequestRetryForTurn> {
-  return modelRequestRetryForTurn(retryRecords.value, conversationId.value, turnId);
+  return modelRequestRetryForTurn(retryRecords.value, conversationId.value, turnId, retryIndex.value);
 }
 function retryTerminatedRequest(termination: RunTerminationRecord, requestId: string): void {
   if (conversationActionPending.value) return;
@@ -218,9 +248,9 @@ function retryTerminatedRequest(termination: RunTerminationRecord, requestId: st
   retryMessageFrom(conversationId.value, retry.target, currentAuthoritySelection());
 }
 const compressionNotices = computed(() => projectCompressionNotices({
-  conversationId: conversationId.value, records: feed.records, messages: messages.value,
-  turnIdByMessageId: projection.value.turnIdByMessageId,
-  placedTerminationIds: Object.values(projection.value.terminationByMessageId).map((item) => item.id)
+  conversationId: conversationId.value, records: feed.records, messages: messageMetadata.value,
+  turnIdByMessageId: messageTurnIds.value,
+  placedTerminationIds: Object.values(terminations.value).map((item) => item.id)
 }));
 const compressionWarningsByAnchor = computed(() => Object.fromEntries(
   Object.entries(compressionNotices.value.byAnchor).map(([anchor, notices]) => [anchor,
@@ -230,24 +260,28 @@ const unanchoredCompressionWarnings = computed(() => compressionNotices.value.un
   !timelinePresentation.isSuppressed(conversationId.value, 'compression-warning', notice.id)));
 const unanchoredTurnFailures = computed(() => compressionNotices.value.unanchoredFailures.filter((notice) =>
   !timelinePresentation.isSuppressed(conversationId.value, 'turn-termination', notice.id)));
-const unanchoredTerminationRows = computed(() => unanchoredTurnFailures.value.flatMap((failure) => {
-  const raw = retryRecords.value.TurnTermination?.[failure.id];
-  const termination = raw ? projectReliableTurnTermination(raw, retryRecords.value) : undefined;
-  return termination ? [{ termination: { ...termination, detail: failure.detail }, title: failure.title }] : [];
-}));
+const unanchoredTerminationRows = computed(() => {
+  if (!unanchoredTurnFailures.value.length) return [];
+  const index = createTurnProjectionIndex(retryRecords.value);
+  return unanchoredTurnFailures.value.flatMap((failure) => {
+    const raw = retryRecords.value.TurnTermination?.[failure.id];
+    const termination = raw ? projectReliableTurnTermination(raw, retryRecords.value, index) : undefined;
+    return termination ? [{ termination: { ...termination, detail: failure.detail }, title: failure.title }] : [];
+  });
+});
 
 watch(
   () => props.followLatest,
   (followLatest) => {
     followLatestSegment.value = followLatest;
-    if (followLatest) segmentStart.value = latestTimelineSegmentStart(timelineRows.value.length);
+    if (followLatest) followLatestReading();
   },
   { immediate: true }
 );
 
 let previousRowIds: string[] = [];
 watch(
-  () => timelineRows.value.map((row) => row.id).join('|'),
+  timelineRows,
   () => {
     const ids = timelineRows.value.map((row) => row.id);
     const previousFirst = previousRowIds[segmentStart.value];
@@ -257,13 +291,13 @@ watch(
       : null;
     previousRowIds = ids;
     if (followLatestSegment.value) {
-      segmentStart.value = latestTimelineSegmentStart(ids.length);
+      segmentStart.value = latestReadingStart();
       return;
     }
     // Rows inserted above the mounted window (an older collaboration page, a card of an earlier
     // Turn) must not shift the rows the user is reading.
     const kept = previousFirst ? ids.indexOf(previousFirst) : -1;
-    segmentStart.value = clampTimelineSegmentStart(ids.length, kept >= 0 ? kept : segmentStart.value);
+    segmentStart.value = clampReadingStart(kept >= 0 ? kept : segmentStart.value);
     if (anchor) {
       pendingScrollAnchor.value = anchor;
       void restorePendingScrollAnchor();
@@ -273,31 +307,35 @@ watch(
 );
 
 watch(conversationId, () => {
+  stopCollaborationSearch('');
   pendingHistoryAnchorId.value = null;
+  pendingCollaborationPageForReading.value = false;
   pendingCollaborationRowIds.value = null;
   pendingScrollAnchor.value = null;
+  readingScrollAnchor = null;
+  readingScrollTop = undefined;
   followLatestSegment.value = props.followLatest;
   segmentStart.value = props.followLatest
-    ? latestTimelineSegmentStart(timelineRows.value.length)
-    : clampTimelineSegmentStart(timelineRows.value.length, segmentStart.value);
+    ? latestReadingStart()
+    : clampReadingStart(segmentStart.value);
 });
 
 watch(
-  () => feed.historyLoadedPages,
-  (messagePages, previousMessagePages) => {
-    if (messagePages <= previousMessagePages) return;
+  () => [feed.historyLoadedPages, feed.collaborationHistoryLoadedPages, readingHistoryLoading.value] as const,
+  () => {
+    if (readingHistoryLoading.value || collaborationSearching.value) return;
     const anchorId = pendingHistoryAnchorId.value;
     pendingHistoryAnchorId.value = null;
-    if (!anchorId) return;
-    const anchorIndex = timelineRows.value.findIndex((row) => row.id === anchorId);
-    if (anchorIndex < 0) return;
-    followLatestSegment.value = false;
-    segmentStart.value = clampTimelineSegmentStart(
-      timelineRows.value.length,
-      Math.max(0, anchorIndex - TIMELINE_SEGMENT_STEP)
-    );
-
-    void restorePendingScrollAnchor();
+    pendingCollaborationPageForReading.value = false;
+    if (anchorId) {
+      const anchorIndex = timelineRows.value.findIndex((row) => row.id === anchorId);
+      if (anchorIndex >= 0) {
+        followLatestSegment.value = false;
+        segmentStart.value = clampReadingStart(Math.max(0, anchorIndex - (pendingHistoryDirection.value === 'before'
+          ? TIMELINE_SEGMENT_STEP : TIMELINE_MOUNT_LIMIT - TIMELINE_SEGMENT_STEP - 1)));
+      }
+    }
+    if (pendingScrollAnchor.value) void restorePendingScrollAnchor();
   }
 );
 
@@ -307,12 +345,25 @@ watch(
   () => feed.collaborationHistoryLoadedPages,
   (pages, previousPages) => {
     const known = pendingCollaborationRowIds.value;
-    if (pages <= previousPages || !known) return;
-    pendingCollaborationRowIds.value = null;
+    if (pages <= previousPages || !known || !collaborationSearching.value) return;
     const firstNew = timelineRows.value.findIndex((row) => row.kind === 'collaboration' && !known.has(row.id));
-    if (firstNew < 0) return;
-    followLatestSegment.value = false;
-    segmentStart.value = clampTimelineSegmentStart(timelineRows.value.length, firstNew);
+    if (firstNew >= 0) {
+      stopCollaborationSearch(collaborationSearchDirection.value === 'before' ? '已找到更早的协作记录' : '已找到较新的协作记录');
+      followLatestSegment.value = false;
+      segmentStart.value = clampReadingStart(firstNew);
+      return;
+    }
+    if (!(collaborationSearchDirection.value === 'before' ? feed.collaborationHistoryHasMoreBefore : feed.collaborationHistoryHasMoreAfter)) {
+      stopCollaborationSearch(collaborationSearchDirection.value === 'before' ? '没有更早的协作记录' : '没有较新的协作记录');
+      return;
+    }
+    // One request at a time; yield between empty/duplicate pages so progress and Stop can paint.
+    collaborationSearchTimer = setTimeout(() => {
+      collaborationSearchTimer = undefined;
+      if (collaborationSearching.value && !feed.requestCollaborationHistoryPage(conversationId.value, collaborationSearchDirection.value)) {
+        stopCollaborationSearch('查找已暂停');
+      }
+    }, 0);
   }
 );
 
@@ -447,6 +498,7 @@ const activityModelLabel = computed(() => {
   return override || provider?.model?.trim() || 'LLM';
 });
 const activityLabel = computed(() => {
+  if (session.runtimeError) return '';
   const action = conversationAction.value;
   if (action?.action === 'retry' && action.phase !== 'running' && action.phase !== 'unconfirmed') {
     if (action.phase === 'requesting_stop') return '正在提交停止旧回复的请求';
@@ -532,7 +584,9 @@ watch(
       .map(([toolCallId]) => toolCallId)
   ].join('|'),
   () => {
+    feed.retainMessageContentWindows(visibleMessageRows.value.map(message => historySourceMessageId(message.id)));
     const pinnedDetailKeys = visibleMessageRows.value.flatMap((message) => {
+      if (projection.value.contentWindowByMessageId[message.id]) return [];
       const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
       return revisionId ? [reliableKernelDetailKey('message-content', revisionId)] : [];
     });
@@ -553,20 +607,20 @@ watch(
   { immediate: true }
 );
 
-onBeforeUnmount(() => feed.setPinnedDetailKeys([]));
+onBeforeUnmount(() => { feed.setPinnedDetailKeys([]); feed.retainMessageContentWindows([]); });
 
 function deleteCount(message: MessageRecord): number {
-  const index = messages.value.findIndex((candidate) => candidate.id === message.id);
-  return index < 0 ? 1 : messages.value.length - index;
+  const count = Number((feed.projections.activeConversationWindow as { visibleMessageCount?: string } | undefined)?.visibleMessageCount);
+  const floor = absoluteFloors.value[message.id];
+  if (Number.isSafeInteger(count) && floor !== undefined) return Math.max(1, count - floor + 1);
+  const index = projection.value.index.messagePositionById.get(message.id);
+  return index === undefined ? 1 : messages.value.length - index;
 }
 
 function runHadCompletedTools(message: MessageRecord): boolean {
   const turnId = projection.value.turnIdByMessageId[message.id];
   if (!turnId) return false;
-  return projection.value.toolCalls.some((call) =>
-    (call.status === 'success' || call.status === 'warning' || call.status === 'error')
-    && (call.messageId === message.id || projection.value.turnIdByMessageId[call.messageId] === turnId)
-  );
+  return projection.value.index.completedToolTurnIds.has(turnId);
 }
 
 async function restorePendingScrollAnchor(): Promise<void> {
@@ -576,52 +630,153 @@ async function restorePendingScrollAnchor(): Promise<void> {
   await nextTick();
   if (pendingScrollAnchor.value !== anchor || props.scroller !== scroller || conversationId.value !== conversation) return;
   pendingScrollAnchor.value = null;
-  restoreScrollAfterHistoryLoad({ scroller, anchor });
+  readingScrollAnchor = restoreScrollAfterHistoryLoad({ scroller, anchor }) ? anchor : null;
+  readingScrollTop = scroller?.scrollTop;
 }
 
-function showEarlierCollaboration(): void {
-  if (feed.collaborationHistoryLoading || !feed.collaborationHistoryHasMore) return;
+function captureReadingScrollAnchor(): void {
+  if (collaborationSearching.value) return;
+  // Restoring layout produces a scroll event too. It keeps the same logical reading point;
+  // only a new scroll position chooses another row, which may now be partly visible above it.
+  if (readingScroller?.scrollTop === readingScrollTop) return;
+  readingScrollAnchor = followLatestSegment.value ? null
+    : captureScrollAnchor({ scroller: readingScroller, visibleRows: visibleRowMembership.value });
+  if (pendingScrollAnchor.value) pendingScrollAnchor.value = readingScrollAnchor;
+  readingScrollTop = readingScroller?.scrollTop;
+}
+
+function followLatestReading(): void {
+  stopCollaborationSearch('');
+  pendingHistoryAnchorId.value = null;
+  pendingScrollAnchor.value = null;
+  readingScrollAnchor = null;
+  followLatestSegment.value = true;
+  segmentStart.value = latestReadingStart();
+}
+
+function handleReadingNavigation(event: Event): void {
+  const intent = userScrollIntentDetail(event);
+  if (!intent || intent.direction === 'none' || intent.source === 'scrollAnchor') return;
+  if (intent.direction === 'jump-end') { followLatestReading(); return; }
+  // Arrival still admits the page, but a newer navigation owns which rows remain on screen.
+  pendingHistoryAnchorId.value = null;
+  stopCollaborationSearch('');
+  if (pendingScrollAnchor.value) pendingScrollAnchor.value = captureScrollAnchor({
+    scroller: readingScroller, visibleRows: visibleRowMembership.value
+  });
+}
+
+function connectReadingScroller(scroller: HTMLElement | null): void {
+  readingScroller?.removeEventListener('scroll', captureReadingScrollAnchor);
+  readingScroller?.removeEventListener(USER_SCROLL_INTENT_EVENT, handleReadingNavigation);
+  readingScroller = scroller;
+  readingScrollTop = undefined;
+  scroller?.addEventListener('scroll', captureReadingScrollAnchor, { passive: true });
+  scroller?.addEventListener(USER_SCROLL_INTENT_EVENT, handleReadingNavigation);
+  captureReadingScrollAnchor();
+}
+
+watch(() => props.scroller, connectReadingScroller, { flush: 'post' });
+watch(followLatestSegment, (following) => { if (following) readingScrollAnchor = null; });
+onMounted(() => {
+  connectReadingScroller(props.scroller);
+  // A history page admits identities before its bodies. Keep the same reading point through
+  // those body/layout commits, including deferred Markdown, until the reader scrolls again.
+  readingResizeObserver = new ResizeObserver(() => {
+    if (followLatestSegment.value || pendingScrollAnchor.value || collaborationSearching.value) return;
+    // Inner content windows can restore their own block position in the same layout cycle.
+    // Adopt that scroll before applying the outer row anchor.
+    if (readingScroller?.scrollTop !== readingScrollTop) { captureReadingScrollAnchor(); return; }
+    if (readingScrollAnchor && restoreScrollAfterHistoryLoad({ scroller: readingScroller, anchor: readingScrollAnchor })) {
+      readingScrollTop = readingScroller?.scrollTop;
+    } else {
+      readingScrollTop = undefined;
+      captureReadingScrollAnchor();
+    }
+  });
+  if (readingRoot.value) readingResizeObserver.observe(readingRoot.value);
+});
+onBeforeUnmount(() => {
+  readingScroller?.removeEventListener('scroll', captureReadingScrollAnchor);
+  readingScroller?.removeEventListener(USER_SCROLL_INTENT_EVENT, handleReadingNavigation);
+  readingResizeObserver?.disconnect();
+});
+
+function showCollaborationHistory(direction: 'before' | 'after'): void {
+  if (session.runtimeError || collaborationSearching.value || feed.historyLoading || feed.collaborationHistoryLoading
+    || !(direction === 'before' ? canRequestEarlierCollaboration.value : canRequestLaterCollaboration.value)) return;
   releaseStickyFromUserScroll(props.scroller);
   followLatestSegment.value = false;
-  const known = new Set(timelineRows.value.map((row) => row.id));
-  if (feed.requestEarlierCollaborationHistory(conversationId.value)) pendingCollaborationRowIds.value = known;
+  readingScrollAnchor = null;
+  collaborationSearchStart.value = feed.collaborationHistoryScannedRows;
+  collaborationSearchNotice.value = '';
+  collaborationSearchDirection.value = direction;
+  pendingCollaborationRowIds.value = new Set(timelineRows.value.map((row) => row.id));
+  collaborationSearching.value = true;
+  if (!feed.requestCollaborationHistoryPage(conversationId.value, direction)) stopCollaborationSearch('查找未开始，请重试');
+}
+function showEarlierCollaboration(): void { showCollaborationHistory('before'); }
+function showLaterCollaboration(): void { showCollaborationHistory('after'); }
+
+function historySourceMessageId(id: string): string {
+  return splitSourceMessageIds.value[id] ?? id;
 }
 
-function showEarlierSegment(): void {
-  if (feed.historyLoading || !hasEarlierSegment.value) return;
-  const scroller = props.scroller;
-  pendingScrollAnchor.value = captureScrollAnchor({
-    scroller,
-    visibleRows: visibleTimelineRows.value
-  });
-  releaseStickyFromUserScroll(scroller);
-
-  if (segmentStart.value > 0) {
-    followLatestSegment.value = false;
-    segmentStart.value = clampTimelineSegmentStart(
-      timelineRows.value.length,
-      segmentStart.value - TIMELINE_SEGMENT_STEP
-    );
+function retainVisibleReadingPage(): void {
+  if (feed.historyLoading || feed.collaborationHistoryLoading || pendingHistoryAnchorId.value || collaborationSearching.value) return;
+  const rows = visibleRowMembership.value.filter(row => row.kind === 'message');
+  const row = rows[Math.floor(rows.length / 2)];
+  const cards = visibleRowMembership.value.filter(row => row.kind === 'collaboration');
+  const card = cards[Math.floor(cards.length / 2)];
+  if (!row && !card) return;
+  const anchor = pendingScrollAnchor.value ?? captureScrollAnchor({ scroller: props.scroller, visibleRows: visibleRowMembership.value });
+  const previousPage = feed.historyCurrentPageId;
+  const previousCollaborationPage = feed.collaborationHistoryCurrentPageId;
+  if (row?.kind === 'message') feed.retainReadingPage(historySourceMessageId(row.message.id));
+  if (card?.kind === 'collaboration') feed.retainCollaborationReadingPage(card.card);
+  if ((feed.historyCurrentPageId !== previousPage || feed.collaborationHistoryCurrentPageId !== previousCollaborationPage) && anchor) {
+    pendingScrollAnchor.value = anchor;
     void restorePendingScrollAnchor();
-  } else if (canRequestEarlierHistory.value) {
-    followLatestSegment.value = false;
-    const anchorId = visibleTimelineRows.value[0]?.id ?? null;
-    if (feed.requestEarlierHistory(conversationId.value)) {
-      pendingHistoryAnchorId.value = anchorId;
-    } else {
-      pendingScrollAnchor.value = null;
-    }
   }
 }
+watch(visibleRowMembership, retainVisibleReadingPage, { flush: 'post' });
 
-function showLaterSegment(): void {
-  const next = clampTimelineSegmentStart(
-    timelineRows.value.length,
-    segmentStart.value + TIMELINE_SEGMENT_STEP
-  );
-  segmentStart.value = next;
-  followLatestSegment.value = next >= latestTimelineSegmentStart(timelineRows.value.length);
+function requestAdjacentHistory(direction: 'before' | 'after'): void {
+  const visible = visibleRowMembership.value;
+  const rows = visible.filter(row => row.kind === 'message'), cards = visible.filter(row => row.kind === 'collaboration');
+  const row = direction === 'before' ? rows[0] : rows[rows.length - 1];
+  const card = direction === 'before' ? cards[0] : cards[cards.length - 1];
+  const anchor = direction === 'before' ? visible[0] : visible[visible.length - 1];
+  if (row?.kind === 'message') feed.retainReadingPage(historySourceMessageId(row.message.id));
+  if (card?.kind === 'collaboration') feed.retainCollaborationReadingPage(card.card);
+  pendingHistoryDirection.value = direction;
+  pendingHistoryAnchorId.value = anchor?.id ?? null;
+  const requestedMessages = row?.kind === 'message' && (direction === 'before'
+    ? feed.requestEarlierHistory(conversationId.value) : feed.requestLaterHistory(conversationId.value));
+  const requestedCollaboration = (direction === 'before' ? canRequestEarlierCollaboration.value : canRequestLaterCollaboration.value)
+    && feed.requestCollaborationHistoryPage(conversationId.value, direction);
+  pendingCollaborationPageForReading.value = Boolean(requestedCollaboration);
+  if (!requestedMessages && !requestedCollaboration) { pendingHistoryAnchorId.value = null; pendingScrollAnchor.value = null; }
 }
+
+function moveReadingSegment(direction: 'before' | 'after'): void {
+  if (readingHistoryLoading.value || collaborationSearching.value || !(direction === 'before' ? hasEarlierSegment.value : hasLaterSegment.value)) return;
+  pendingScrollAnchor.value = captureScrollAnchor({ scroller: props.scroller, visibleRows: visibleTimelineRows.value });
+  releaseStickyFromUserScroll(props.scroller);
+  followLatestSegment.value = false;
+  if (direction === 'before' && segmentStart.value > readingRun.value.start) {
+    segmentStart.value = Math.max(readingRun.value.start, segmentStart.value - TIMELINE_SEGMENT_STEP);
+  } else if (direction === 'after' && segmentEnd.value < readingRun.value.end) {
+    segmentStart.value = clampReadingStart(segmentStart.value + TIMELINE_SEGMENT_STEP);
+    followLatestSegment.value = segmentStart.value >= latestReadingStart() && !canRequestLaterHistory.value && !canRequestLaterCollaboration.value;
+  } else {
+    requestAdjacentHistory(direction);
+    return;
+  }
+  void restorePendingScrollAnchor();
+}
+function showEarlierSegment(): void { moveReadingSegment('before'); }
+function showLaterSegment(): void { moveReadingSegment('after'); }
 
 function retryFrom(message: MessageRecord): void {
   if (!message.retryTarget) return;
@@ -711,6 +866,8 @@ function messageDetailDemandSignature(message: MessageRecord): string {
 }
 
 function messageDetailReady(message: MessageRecord): boolean {
+  const window = projection.value.contentWindowByMessageId[message.id];
+  if (window) return !window.loading;
   const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
   if (!revisionId) return false;
   return feed.details[reliableKernelDetailKey('message-content', revisionId)]?.status === 'ready';
@@ -718,6 +875,8 @@ function messageDetailReady(message: MessageRecord): boolean {
 
 function messageDetailLoading(message: MessageRecord): boolean {
   if (submissionEchoByMessageId.value[message.id]) return false;
+  const window = projection.value.contentWindowByMessageId[message.id];
+  if (window) return window.loading && message.content.parts.length === 0;
   if (message.content.parts.length > 0) return false;
   const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
   if (!revisionId) return false;
@@ -727,7 +886,7 @@ function messageDetailLoading(message: MessageRecord): boolean {
 
 function timelineFloor(message: MessageRecord): number {
   const projected = projection.value.absoluteFloorByMessageId[message.id] ?? message.seq;
-  return absoluteTimelineFloor(projected, Math.max(1, messages.value.findIndex((row) => row.id === message.id) + 1));
+  return absoluteTimelineFloor(projected, (projection.value.index.messagePositionById.get(message.id) ?? 0) + 1);
 }
 
 function modelRequestRetryState(request: Record<string, unknown>, now: number): {
@@ -778,17 +937,21 @@ function messageRenderKey(message: MessageRecord): string {
 </script>
 
 <template>
-  <div class="reliable-message-list">
+  <div ref="readingRoot" class="reliable-message-list">
     <button
-      v-if="feed.collaborationHistoryConversationId === conversationId && feed.collaborationHistoryHasMore"
+      v-if="canRequestEarlierCollaboration"
       type="button"
       class="reliable-segment-control"
-      :disabled="feed.collaborationHistoryLoading"
+      :disabled="!!session.runtimeError || collaborationSearching || feed.collaborationHistoryLoading"
       @click="showEarlierCollaboration"
     >
-      {{ feed.collaborationHistoryLoading ? '正在加载更早协作记录'
-        : feed.collaborationHistoryScanProgress ? '继续查找更早协作记录' : '显示更早协作记录' }}
+      {{ (collaborationSearching || feed.collaborationHistoryLoading) && collaborationSearchDirection === 'before' ? '正在查找更早协作记录'
+        : '查找更早协作记录' }}
     </button>
+    <button v-if="collaborationSearching" type="button" class="reliable-segment-control" @click="stopCollaborationSearch()">停止查找</button>
+    <p v-if="collaborationSearching || collaborationSearchNotice" class="reliable-collaboration-progress" role="status">
+      {{ collaborationSearching ? '正在查找' : collaborationSearchNotice }} · 已检查 {{ collaborationScanned.toLocaleString() }} 条记录
+    </p>
     <p v-if="feed.collaborationHistoryError" class="reliable-history-error" role="alert">
       {{ feed.collaborationHistoryError }}
     </p>
@@ -796,13 +959,13 @@ function messageRenderKey(message: MessageRecord): string {
       v-if="hasEarlierSegment"
       type="button"
       class="reliable-segment-control"
-      :disabled="feed.historyLoading"
+      :disabled="readingHistoryLoading || collaborationSearching"
       @click="showEarlierSegment"
     >
       {{ earlierSegmentLabel }}
     </button>
     <p
-      v-if="feed.historyError && segmentStart === 0"
+      v-if="feed.historyError"
       class="reliable-history-error"
       role="alert"
     >
@@ -824,6 +987,12 @@ function messageRenderKey(message: MessageRecord): string {
         </p>
         <MessageItem
           :message="displayedMessage(row.message)"
+          :scroller="scroller"
+          :content-window="projection.contentWindowByMessageId[row.message.id]"
+          :load-complete-content="() => completeMessageContent(row.message.id)"
+          @earlier-content="feed.moveMessageContentWindow(historySourceMessageId(row.message.id), 'before')"
+          @later-content="feed.moveMessageContentWindow(historySourceMessageId(row.message.id), 'after')"
+          @retry-content="feed.retryMessageContentWindow(historySourceMessageId(row.message.id))"
           :run-id="projection.turnIdByMessageId[row.message.id]"
           :termination="messageTermination(row.message)"
           :termination-notice-suppressed="isMessageTerminationSuppressed(row.message)"
@@ -883,9 +1052,16 @@ function messageRenderKey(message: MessageRecord): string {
       v-if="hasLaterSegment"
       type="button"
       class="reliable-segment-control"
+      :disabled="readingHistoryLoading || collaborationSearching"
       @click="showLaterSegment"
     >
-      显示较新内容
+      {{ readingHistoryLoading && pendingHistoryDirection === 'after' ? '正在加载较新内容' : '显示较新内容' }}
+    </button>
+    <button v-if="canRequestLaterCollaboration" type="button" class="reliable-segment-control"
+      :disabled="!!session.runtimeError || collaborationSearching || feed.historyLoading || feed.collaborationHistoryLoading"
+      @click="showLaterCollaboration">
+      {{ (collaborationSearching || feed.collaborationHistoryLoading) && collaborationSearchDirection === 'after'
+        ? '正在查找较新协作记录' : '查找较新协作记录' }}
     </button>
     <p
       v-if="retryBoundaryLabel && !visibleRetryBoundaryMessageId"
@@ -952,6 +1128,7 @@ function messageRenderKey(message: MessageRecord): string {
 </template>
 
 <style scoped>
+.reliable-collaboration-progress { color: var(--vscode-descriptionForeground); font-size: var(--font-size-xs); margin: 4px 0 8px; }
 .reliable-retry-boundary {
   margin: 4px 0 2px;
   padding: 5px 8px;

@@ -1,0 +1,82 @@
+{
+  "kind": "limcode-phase-e-candidate-evidence",
+  "checkId": "candidate.provider-continuation-disabled-full-request",
+  "passed": true,
+  "commitSha": "59d900ec4fbb6e6ca1549a787d7f4036fe10e9ef",
+  "measuredAt": "2026-08-21T06:05:53.263Z",
+  "provenance": {
+    "worktreeClean": false,
+    "commitExplicitlyBound": false,
+    "authoritative": false,
+    "runnerSha256": "5733c6b2f200b5005ee9abe212a9dcc8316d4152a58ee5d01b5ea6346f42d8ce",
+    "sourceTreeSha256": "ccd3a7345881293be9bf08544bda692056c033546aaa8b88b24a53112ded7428",
+    "sourceFileCount": 455,
+    "sourceFilesTracked": true,
+    "compiledKernelSha256": "865dc9a4ba5ceb9a94fa91b514103a23ebd4541b446ae56561a107421e8fcb2e",
+    "compiledFileCount": 194,
+    "compileProvenance": "dist/extension/reliable-kernel-compile-provenance.json",
+    "compileWorktreeClean": false,
+    "compiledClosureMatches": true,
+    "invocation": [
+      "/Users/lurenxing/.local/node-v24.15.0-darwin-arm64/bin/node",
+      "/Users/lurenxing/GitHub/limcode-test/scripts/reliable-kernel/run-phase-e-check.mjs",
+      "--check=candidate.provider-continuation-disabled-full-request"
+    ],
+    "node": "v24.15.0",
+    "sqlite": "3.53.4",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5"
+  },
+  "assertions": [
+    "ModelRequest/Projection/Operation/attempt在adapter外调前提交，数据库重开后不会自动retry或dispatch",
+    "checkpoint写入与Completed fence之间的真实writer故障回滚整笔事务，不留下checkpoint、fence或SQLite Content引用",
+    "首次请求与Extension Host数据库重开后的显式reconnect均逐字段等于冻结root/authority/recipe完整oracle；推进current head不改变payload；OutputItemDone不冒充Completed fence且重启不自动dispatch",
+    "旧socket transient或正常resolve都标记superseded；已通过reader预检、CAS发布后才遇到reconnect的迟到event由writer精确identity忽略，不终止新socket、不建attempt 2且不留SQLite引用",
+    "旧AuthoritySnapshot兼容原有单次持久retry：明确连接中断创建attempt 2，完整上下文不变且无第二条瞬时observer authority",
+    "WS 1000/1001/1008 等指定关闭码在 Responses 终态前统一创建 durable Attempt 并恢复；已有部分输出由新 Attempt 整体替换",
+    "普通Provider语义deadline冻结为首语义80秒/后续idle60秒；terminal-only压缩只等待270秒CompactDone/CompactError终态；明确传输错误仍走即时重试",
+    "冻结retryMaxAttempts=3允许三个持久transient_failed Attempt后第四次恢复；每次仍复用同一ModelRequest与完整请求",
+    "submit_plan→update_task_list后的本地thought_progress既不算首个语义输出也不能续命，35ms首语义超时自动Attempt恢复而无需用户继续",
+    "terminal-only压缩超过旧60秒等比阈值但早于270秒等比deadline时仅有一个Attempt；超过完成deadline以compression_timeout创建Attempt 2；明确transport错误仍立即恢复",
+    "永久普通Error只外调一次；旧Authority attempt 2再次临时失败后终止；冻结请求本地CAS构造失败在外调前收口terminal而不留下running",
+    "旧attempt/socket与terminal迟到事件均不追加checkpoint；只有Completed建fence，终态maintenance在同一事务裁剪后≤33行",
+    "historical replay只读原root/AuthoritySnapshot/immutable recipe，dry-run不产生Runtime commit",
+    "compression后的新ModelRequest仍发送summary+finite tail完整请求，不发送suffix或已替换原文",
+    "Runtime exact set无ProviderContinuation，完整请求envelope没有continuation槽位；合法tool schema字段不被关键词黑名单误伤，recipe仍不可变且无continuation→full fallback",
+    "同一stream identity仅kind与canonical content完全一致才可去重；冲突事件明确失败且不吞Completed；writer拒绝ModelRequest/Operation/Attempt聚合旁路",
+    "writer事务内Promise.all并发只保留首个delta；1 delta+32 item边界后semantic overflow有界合并且终态≤33；受控late-item在CAS发布后由Completed fence阻断且不留SQLite引用；终态精确保留当前attempt/socket固定32+summary；generic checkpoint/fence insert/delete、错误prune身份和terminal复活均被writer拒绝",
+    "Turn终止后，压缩来源Message edit/delete会在同事务结构化截断并重建current root；writer revision_seq与Context source一致；既有terminal projection仍字节级不变",
+    "Provider request-level cancel由writer原子命中最新reconnect/attempt2 identity；adapter永不settle也会立即收口；Completed与cancel durable first-wins一致；dispatch前Abort不外调；非UTF-8 frozen Context在外调前明确失败；全部终态checkpoint≤33后Turn才可终止，不扩展通用外部自动重试",
+    "OpenAI Responses WS把lock/socket/send/first raw/first semantic/terminal/timeout及continuation decision以无正文元数据写入滚动诊断；下一次无首事件可区分本地排队、发送与Relay等待",
+    "OpenAI Responses WS session key按Conversation稳定隔离，并拒绝缺失conversationId时回退为全局共享锁"
+  ],
+  "faults": [
+    "ModelRequest commit before provider dispatch then database reopen",
+    "checkpoint insert before terminal fence transaction rollback",
+    "typed provider transient disconnect after full request dispatch",
+    "WebSocket close code 1000 before any Responses event or response.completed",
+    "three consecutive retryable Provider failures before recovery",
+    "first semantic output never arrives after task-list tool result while raw/local progress remains",
+    "terminal-only compression emits no semantic delta before a valid long-running CompactDone"
+  ],
+  "metrics": {
+    "preTerminalNormalCloseAttempts": 2,
+    "boundedProviderAttempts": 4,
+    "semanticStallAttempts": 2,
+    "compressionCompletionDeadlineAttempts": 2,
+    "terminalCheckpointCount": 3,
+    "checkpointRowFormula": {
+      "rows": 46,
+      "activeRequests": 3,
+      "terminalRequests": 18,
+      "limit": 786
+    },
+    "finalCheckpointRowFormula": {
+      "rows": 80,
+      "activeRequests": 0,
+      "terminalRequests": 29,
+      "limit": 957
+    }
+  }
+}

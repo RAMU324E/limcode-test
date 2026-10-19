@@ -1,0 +1,62 @@
+{
+  "kind": "limcode-phase-f-candidate-evidence",
+  "checkId": "candidate.subagent-answer-restart-delivery",
+  "stableId": "candidate.subagent-answer-restart-delivery",
+  "passed": true,
+  "commitSha": "528d720f929acd84ece7d6d7bf8f1c68e8557f1e",
+  "measuredAt": "2026-09-11T09:34:30.033Z",
+  "assertionCount": 14,
+  "provenance": {
+    "worktreeClean": false,
+    "commitExplicitlyBound": false,
+    "authoritative": false,
+    "runnerSha256": "4e7bcd9adc82c715b6203e8d9f4f094dca5f50da58f27d8f89eac8ee654e845a",
+    "sourceTreeSha256": "b9190d12a0e28a8379e8c8d9bba7c7a7e67044ac3248d8367b5ddf910ef693b6",
+    "sourceFileCount": 487,
+    "sourceFilesTracked": false,
+    "compiledKernelSha256": "a40adc792ba10fcf831b7eae353962ab6742cc625788da1123f76effe2af0880",
+    "compiledFileCount": 226,
+    "compileProvenance": "dist/extension/reliable-kernel-compile-provenance.json",
+    "compileWorktreeClean": false,
+    "compiledClosureMatches": false,
+    "invocation": [
+      "/Users/lurenxing/.local/node-v24.15.0-darwin-arm64/bin/node",
+      "/Users/lurenxing/GitHub/limcode-test/scripts/reliable-kernel/run-phase-f-check.mjs",
+      "--check",
+      "candidate.subagent-answer-restart-delivery"
+    ],
+    "node": "v24.15.0",
+    "sqlite": "3.53.4",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5"
+  },
+  "assertions": [
+    "Child Conversation 与 spawn 谱系在同一事务继承 Parent 的独立 ProjectContext 关系",
+    "答案CAS publish后SQLite故障只留下raw orphan CAS，Submission/Bridge/Inbox/ToolResult均无半提交",
+    "AnswerSubmission insert、Bridge flip、Inbox dedupe与前台ToolCall结算原子提交，重复callback收敛且只有一个ToolModelResult",
+    "恢复分类读取精确ToolOutcome答案身份，前台已消费的Submission不会被误投为第二份RuntimeDelivery",
+    "Bridge切换到新submission后历史submission及其旧pending delivery继续保留",
+    "Delivery注入与InputLink同事务，handled_at只响应精确input，无关PendingTurnInput不能猜测父处理完成",
+    "Delivery以inbox、目标Conversation和attempt为逻辑身份，phase/target变化不能制造重复首个attempt",
+    "current/next/notify advancement matrix逐项走真实Turn状态：terminal改投、NULL等待、新Turn启动事务回写注入、active注入、notify显式确认；旧generation提交被拒绝且新generation可提交",
+    "target-gone保留Inbox并置failed；人工redeliver创建attempt+1/retry_of新行；writer拒绝复活旧failed或重写handled_at",
+    "答案提交与deadline sweep并发由SQLite assertion/UNIQUE durable first-wins，原ToolCall严格一个模型结果，败方答案仍入Inbox",
+    "同毫秒创建的两代continuation wait以未来Turn稳定身份隔离；A答案独立结算初始wait与A wait而不触碰B，B仅由B来源Turn答案结算",
+    "持久legacy answer_bridge_wait在同parent Turn的1001条干扰CommandReceipt之后，仍由Operation/Receipt/Intent/immutable mode preset完整稳定身份精确恢复",
+    "关闭数据库并新建RuntimeDatabase/services后答案、历史delivery、InputLink.handled_at和唯一ToolResult全部由SQLite恢复",
+    "ChildExecution精确历史读取跨越1000条Turn membership，保留第1002代而不依赖全局LIMIT或目标行排序"
+  ],
+  "faults": [
+    "answer CAS publish followed by SQLite transaction rollback",
+    "delivery advancement across terminal-to-continuation boundary",
+    "answer arrival concurrent with foreground deadline sweep",
+    "same-millisecond continuation generations with multiple independently settling waits",
+    "legacy answer_bridge_wait persisted across restart beyond a 1000-row identity boundary",
+    "Extension Host database/service restart"
+  ],
+  "metrics": {
+    "answerSubmissions": 3,
+    "deliveryAttemptsForGoneTarget": 2
+  }
+}

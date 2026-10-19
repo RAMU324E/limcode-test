@@ -1,0 +1,266 @@
+{
+  "kind": "limcode-phase-e-candidate-evidence",
+  "checkId": "candidate.context-storage-growth",
+  "passed": true,
+  "commitSha": "b967bdca78d7934760628fabed3449c5f192dfc8",
+  "measuredAt": "2026-08-21T01:25:39.645Z",
+  "provenance": {
+    "worktreeClean": true,
+    "commitExplicitlyBound": false,
+    "authoritative": false,
+    "runnerSha256": "8a7471222d822acc2ec7b180d373f2761606cd23c60f44dfd591bcbbb7037e6e",
+    "sourceTreeSha256": "ce6e3695e0a8823ed6b089e4022d2fb4d7ed362ad672c2cb7809fbffe3bacbce",
+    "sourceFileCount": 455,
+    "sourceFilesTracked": true,
+    "compiledKernelSha256": "f1536abe2fe3b04032bb384dcbbd7bd586182d7159cd6b1badaa0f3238cf2a3c",
+    "compiledFileCount": 194,
+    "compileProvenance": "dist/extension/reliable-kernel-compile-provenance.json",
+    "compileWorktreeClean": true,
+    "compiledClosureMatches": true,
+    "invocation": [
+      "/Users/lurenxing/.local/node-v24.15.0-darwin-arm64/bin/node",
+      "/Users/lurenxing/GitHub/limcode-test/scripts/reliable-kernel/run-phase-e-check.mjs",
+      "--check=candidate.context-storage-growth"
+    ],
+    "node": "v24.15.0",
+    "sqlite": "3.53.4",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5"
+  },
+  "assertions": [
+    "同一source tuple并发与顺序重放都稳定收敛为一个ContextSegment/Source/root occurrence，不会把同一 occurrence 再挂一次",
+    "相同正文不同来源只共享一个ContentObject，但产生两个ContextSegment/source occurrence并在物化中出现两次",
+    "同一parent并发不同后继均成功，root_seq不重复且parent本身不唯一；已存在inactive branch可通过一次head CAS激活，不递归重插root",
+    "NULL parent的segment_id partial UNIQUE真实阻止重复根节点；删除历史消息按结构截断其完整suffix，后续runtime segment不会残留在可物化上下文",
+    "真实append路径的segment/source/node/root/head位于同一SQLite writer事务，root+head之后故障不会留下半提交；仅允许raw CAS orphan",
+    "12轮独立512KiB确定性正文使用真实SQLite+CAS，同时量化checkpoint前DB+WAL+CAS写入和checkpoint后retained增长，均≤1.5×正文+128KiB且五类行数严格线性",
+    "普通append使用≤20次identity-bounded Repository读取且不物化/哈希历史；2x规模中位耗时比0.960≤2.5；真实1000节点+CAS物化p95=3.976ms<50ms，整批等待期间Extension Host heartbeat覆盖率=93.3%≥75%；Context CAS缓存保持有界且命中44000次；1000节点后的单次DB+WAL+CAS写入仍低于量化上限"
+  ],
+  "faults": [
+    "real append after root+head before SQLite commit rollback"
+  ],
+  "metrics": {
+    "storage": {
+      "rounds": 12,
+      "contentBytes": 524288,
+      "growth": [
+        {
+          "round": 0,
+          "transactionIncrement": 606720,
+          "retainedIncrement": 524288,
+          "contentBytes": 524288,
+          "limit": 917504,
+          "totalBytes": 2044625
+        },
+        {
+          "round": 1,
+          "transactionIncrement": 606720,
+          "retainedIncrement": 524288,
+          "contentBytes": 524288,
+          "limit": 917504,
+          "totalBytes": 2568913
+        },
+        {
+          "round": 2,
+          "transactionIncrement": 606720,
+          "retainedIncrement": 524288,
+          "contentBytes": 524288,
+          "limit": 917504,
+          "totalBytes": 3093201
+        },
+        {
+          "round": 3,
+          "transactionIncrement": 606720,
+          "retainedIncrement": 524288,
+          "contentBytes": 524288,
+          "limit": 917504,
+          "totalBytes": 3617489
+        },
+        {
+          "round": 4,
+          "transactionIncrement": 606720,
+          "retainedIncrement": 524288,
+          "contentBytes": 524288,
+          "limit": 917504,
+          "totalBytes": 4141777
+        },
+        {
+          "round": 5,
+          "transactionIncrement": 606720,
+          "retainedIncrement": 524288,
+          "contentBytes": 524288,
+          "limit": 917504,
+          "totalBytes": 4666065
+        },
+        {
+          "round": 6,
+          "transactionIncrement": 606720,
+          "retainedIncrement": 524288,
+          "contentBytes": 524288,
+          "limit": 917504,
+          "totalBytes": 5190353
+        },
+        {
+          "round": 7,
+          "transactionIncrement": 606720,
+          "retainedIncrement": 524288,
+          "contentBytes": 524288,
+          "limit": 917504,
+          "totalBytes": 5714641
+        },
+        {
+          "round": 8,
+          "transactionIncrement": 606720,
+          "retainedIncrement": 524288,
+          "contentBytes": 524288,
+          "limit": 917504,
+          "totalBytes": 6238929
+        },
+        {
+          "round": 9,
+          "transactionIncrement": 606720,
+          "retainedIncrement": 524288,
+          "contentBytes": 524288,
+          "limit": 917504,
+          "totalBytes": 6763217
+        },
+        {
+          "round": 10,
+          "transactionIncrement": 619080,
+          "retainedIncrement": 532480,
+          "contentBytes": 524288,
+          "limit": 917504,
+          "totalBytes": 7295697
+        },
+        {
+          "round": 11,
+          "transactionIncrement": 606720,
+          "retainedIncrement": 524288,
+          "contentBytes": 524288,
+          "limit": 917504,
+          "totalBytes": 7819985
+        }
+      ]
+    },
+    "performance": {
+      "lowerSamplesMs": [
+        13.581874999999854,
+        14.137708000000202,
+        17.18816700000025,
+        13.77245800000037,
+        14.346666999999798,
+        13.665666999999303,
+        15.121000000000095,
+        16.148333000000093,
+        22.360125000000153,
+        17.580917000000227,
+        13.919708999999784,
+        17.780749999999898
+      ],
+      "upperSamplesMs": [
+        13.919957999998587,
+        14.243040999999721,
+        13.784458000000086,
+        18.161833000000115,
+        13.918374999999287,
+        17.10149999999885,
+        13.789624999999432,
+        14.35070799999994,
+        13.609833000000435,
+        14.235375000000204,
+        14.041709000000992,
+        15.148416999998517
+      ],
+      "lowerMedianMs": 14.733833499999946,
+      "upperMedianMs": 14.138542000000598,
+      "scaleRatio": 0.9595969711481163,
+      "structuralMaterializationSamplesMs": [
+        3.276292000002286,
+        3.710041000002093,
+        3.3122500000026776,
+        3.1390839999985474,
+        3.0933750000003783,
+        3.1257079999995767,
+        3.224833000000217,
+        3.1120000000009895,
+        3.0917090000002645,
+        3.1282089999986056,
+        3.5207919999993464,
+        3.169208000002982,
+        3.1838750000024447,
+        3.0621250000003783,
+        3.169624999998632,
+        3.1502499999987776,
+        3.138041999998677,
+        3.0226670000010927,
+        3.027874999999767,
+        3.235500000002503
+      ],
+      "structuralMaterializationP95Ms": 3.5207919999993464,
+      "materializationSamplesMs": [
+        3.832209000000148,
+        3.806457999999111,
+        3.848666999998386,
+        3.976041999998415,
+        3.753499999998894,
+        3.9066249999996217,
+        4.058291000001191,
+        3.789375000000291,
+        3.8191250000018044,
+        3.897125000003143,
+        3.7758340000000317,
+        3.695791999998619,
+        3.699000000000524,
+        3.866374999997788,
+        3.5968749999992724,
+        3.6963329999998678,
+        3.7190000000009604,
+        3.663250000001426,
+        3.7781250000007276,
+        3.815207999999984,
+        4.090166999998473,
+        3.768833000001905,
+        3.725750000001426,
+        3.8092499999984284,
+        3.9021670000001905,
+        3.7715419999985897,
+        3.7234169999974256,
+        3.9247080000022834,
+        3.7712919999976293,
+        3.6987499999995634,
+        3.83283400000073,
+        3.700874999998632,
+        3.7054580000003625,
+        3.920916999999463,
+        3.9198340000002645,
+        3.7088329999969574,
+        3.8228330000019923,
+        3.8204590000023018,
+        3.7802080000001297,
+        3.6708749999997963
+      ],
+      "materializationP95Ms": 3.976041999998415,
+      "heartbeatIntervalMs": 5,
+      "heartbeatElapsedMs": 152.0957500000004,
+      "heartbeatTicks": 28,
+      "expectedHeartbeatTicks": 30,
+      "minimumHeartbeatTicks": 23,
+      "minimumHeartbeatCoverage": 0.75,
+      "heartbeatCoverage": 0.9333333333333333,
+      "contextCasCache": {
+        "entries": 1000,
+        "bytes": 115906,
+        "maxEntries": 4096,
+        "maxBytes": 33554432,
+        "hits": 44000,
+        "misses": 1000,
+        "evictions": 0
+      },
+      "ordinaryAppendHistoricalReads": 0,
+      "ordinaryAppendRepositoryReads": 12,
+      "longHistoryWriteBytes": 139920,
+      "longHistoryWriteLimit": 180224
+    }
+  }
+}

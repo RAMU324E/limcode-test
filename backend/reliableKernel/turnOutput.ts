@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
+import { ContentAddressedStore, type ContentObjectMetadata, type PreparedContentObject } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { ContextSequenceControlPlane } from './contextSequence';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
@@ -15,6 +15,9 @@ import {
   type RepositoryTransactionStep
 } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { LogicalMessageContentReader, NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE, prepareNativeMessageComposition,
+  prepareNativeMessageCompositionIndex,
+  type NativeMessageItem, type SerializedNativeMessageItem } from './logicalMessageContent';
 
 export interface AssistantMessageCommit {
   messageId: string;
@@ -29,6 +32,7 @@ export interface AssistantMessageCommit {
 export class TurnOutputControlPlane {
   private readonly context: ContextSequenceControlPlane;
   private readonly now: () => string;
+  private readonly messageContents: LogicalMessageContentReader;
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -37,6 +41,7 @@ export class TurnOutputControlPlane {
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
     this.context = new ContextSequenceControlPlane(database, contentStore, options);
+    this.messageContents = new LogicalMessageContentReader(database, contentStore);
   }
 
   public async appendAssistantMessage(input: {
@@ -183,15 +188,26 @@ export class TurnOutputControlPlane {
     /** Stable response/item key; replay of the same immutable item deduplicates. */
     itemKey: string;
     content: string | Uint8Array;
-    /**
-     * Whole-chain-so-far aggregate content for the durable current projection. The item-only
-     * revision stays the Context source; the cumulative revision is the current pointer target so
-     * a mid-stream reload never shows only one item. The final chain aggregate replaces it.
-     */
-    cumulativeContent: string | Uint8Array;
+    /** Part coordinates produced by this item's one canonical serialization. */
+    partByteLength: number;
+    partByteOffset: number;
+    outputItem?: SerializedNativeMessageItem['outputItem'];
+    /** Only a published ordinary prefix needs the item facts already loaded during recovery. */
+    recoveredItems?: readonly NativeMessageItem[];
     contentType?: string;
     contextDisposition?: 'append' | 'exclude';
   }, options: { beforeSubmit?: () => void } = {}): Promise<AssistantMessageCommit> {
+    return this.appendNativeAssistantRevisionPair(input, options);
+  }
+
+  private async appendNativeAssistantRevisionPair(input: {
+    turnId: string; modelRequestId: string; itemKey: string; content: string | Uint8Array;
+    partByteLength?: number; partByteOffset?: number; outputItem?: SerializedNativeMessageItem['outputItem'];
+    recoveredItems?: readonly NativeMessageItem[];
+    contentType?: string; contextDisposition?: 'append' | 'exclude';
+    /** Failed partial display uses its existing ordinary aggregate pair and stable identity. */
+    partialAggregate?: true;
+  }, options: { beforeSubmit?: () => void }): Promise<AssistantMessageCommit> {
     options.beforeSubmit?.();
     const turnId = requireId(input.turnId, 'turnId');
     const modelRequestId = requireId(input.modelRequestId, 'modelRequestId');
@@ -203,19 +219,18 @@ export class TurnOutputControlPlane {
     }
     // Freeze mutable caller bytes before reads; replay and publication must prove the same content.
     const outputContent = typeof input.content === 'string' ? input.content : new Uint8Array(input.content);
-    const cumulativeOutputContent = typeof input.cumulativeContent === 'string'
-      ? input.cumulativeContent : new Uint8Array(input.cumulativeContent);
     const ids = outputIds(turnId, modelRequestId);
     const revisionId = nativeItemRevisionId(turnId, modelRequestId, itemKey);
     const cumulativeRevisionId = nativeCumulativeRevisionId(turnId, modelRequestId, itemKey);
     const existingRevision = await this.maybeGet('MessageRevision', revisionId);
     if (existingRevision) {
+      const contentObjectId = this.contentStore.identity(outputContent, contentType).id;
       return this.replayNativeAssistantItem(
         ids,
         revisionId,
         cumulativeRevisionId,
-        this.contentStore.identity(outputContent, contentType).id,
-        this.contentStore.identity(cumulativeOutputContent, contentType).id,
+        contentObjectId,
+        input.partialAggregate ? contentObjectId : undefined,
         itemKey
       );
     }
@@ -227,8 +242,26 @@ export class TurnOutputControlPlane {
     const leaseRows = await this.list('ExecutionLease', { turn_id: turnId }, 2);
     if (leaseRows.length !== 1) throw new Error(`Active Turn ${turnId} must have exactly one ExecutionLease.`);
     const content = await this.contentStore.prepare(this.database, outputContent, contentType);
-    const cumulativeContent = await this.contentStore.prepare(this.database, cumulativeOutputContent, contentType);
     const existingMessage = await this.maybeGet('Message', ids.messageId);
+    const currentLink = existingMessage ? await this.requireExisting('MessageCurrentRevisionLink', ids.currentRevisionLinkId) : null;
+    const previousRevision = currentLink ? await this.requireExisting('MessageRevision', requireId(currentLink.revision_id, 'Message current revision')) : null;
+    const previousContent = previousRevision ? await this.requireExisting('ContentObject', requireId(previousRevision.content_object_id, 'MessageRevision.content_object_id')) as ContentObjectMetadata : null;
+    let cumulativeContent: PreparedContentObject;
+    let compositionObjects: PreparedContentObject[] = [];
+    if (input.partialAggregate) {
+      cumulativeContent = content;
+    } else {
+      if (contentType !== 'application/vnd.limcode.message+json' || !Number.isSafeInteger(input.partByteLength)
+        || input.partByteLength! < 1 || !Number.isSafeInteger(input.partByteOffset) || input.partByteOffset! < 0) {
+        throw new TypeError('Native item requires the logical part range from its serializer.');
+      }
+      const composition = await prepareNativeMessageComposition(this.database, this.contentStore, previousContent, {
+        revisionId, contentObjectId: content.metadata.id, partByteLength: input.partByteLength!, partByteOffset: input.partByteOffset!,
+        ...(input.outputItem ? { outputItem: input.outputItem } : {})
+      }, input.recoveredItems, this.messageContents);
+      cumulativeContent = composition.content;
+      compositionObjects = composition.relatedContentObjects;
+    }
     let contextSteps: RepositoryTransactionStep[] = [];
     if (contextDisposition === 'append') {
       const contentEstimatedTokens = estimateStoredMessageContentTokens(outputContent, contentType);
@@ -267,7 +300,8 @@ export class TurnOutputControlPlane {
             scope: { message_id: ids.messageId }
           }),
           DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').assert(ids.currentRevisionLinkId, {
-            message_id: ids.messageId
+            message_id: ids.messageId,
+            revision_id: currentLink!.revision_id
           }),
           DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').update(ids.currentRevisionLinkId, {
             revision_id: cumulativeRevisionId,
@@ -339,7 +373,7 @@ export class TurnOutputControlPlane {
           conversation_id: conversationId,
           turn_id: turnId
         }),
-        ...preparedContentObjectSteps([content, cumulativeContent], 'assistant_output'),
+        ...preparedContentObjectSteps([content, ...compositionObjects, cumulativeContent], 'assistant_output'),
         ...revisionSteps,
         ...contextSteps,
         DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
@@ -373,16 +407,27 @@ export class TurnOutputControlPlane {
     itemRevisionId: string,
     cumulativeRevisionId: string,
     expectedContentObjectId: string,
-    expectedCumulativeObjectId: string,
+    expectedCumulativeObjectId: string | undefined,
     itemKey: string
   ): Promise<AssistantMessageCommit> {
     const revision = await this.requireExisting('MessageRevision', itemRevisionId);
-    if (revision.content_object_id !== expectedContentObjectId || revision.role !== 'model') {
+    if (revision.message_id !== ids.messageId || revision.content_object_id !== expectedContentObjectId || revision.role !== 'model') {
       throw new Error(`Native assistant item ${itemKey} was replayed with different facts.`);
     }
     const cumulative = await this.requireExisting('MessageRevision', cumulativeRevisionId);
-    if (cumulative.content_object_id !== expectedCumulativeObjectId || cumulative.role !== 'model') {
+    if (cumulative.message_id !== ids.messageId || (expectedCumulativeObjectId !== undefined && cumulative.content_object_id !== expectedCumulativeObjectId) || cumulative.role !== 'model') {
       throw new Error(`Native assistant cumulative ${itemKey} was replayed with different facts.`);
+    }
+    if (expectedCumulativeObjectId === undefined) {
+      const metadata = await this.requireExisting('ContentObject', requireId(cumulative.content_object_id, 'Native display ContentObject')) as ContentObjectMetadata;
+      if (metadata.content_type === NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE) {
+        const root = await this.messageContents.readComposition(metadata);
+        const tail = await this.messageContents.readBlock(root.tailBlockContentObjectId);
+        const last = tail.items[tail.items.length - 1]!;
+        if (last.revisionId !== itemRevisionId || last.contentObjectId !== expectedContentObjectId) {
+          throw new Error(`Native assistant composition ${itemKey} does not end at its immutable item.`);
+        }
+      }
     }
     const membership = (await this.list('MessagePartOfConversation', { message_id: ids.messageId }, 2))[0];
     if (!membership) throw new Error(`Assistant output ${ids.messageId} lacks Conversation membership.`);
@@ -431,13 +476,15 @@ export class TurnOutputControlPlane {
     if (existingRevision) {
       return this.replay(ids, this.contentStore.identity(outputContent, contentType).id, modelRequestId);
     }
-    await this.assertNativeAggregateItemsEnteredContext(turnId, modelRequestId, ids.messageId, outputContent);
+    const reorderedItemRevisionIds = await this.assertNativeAggregateItemsEnteredContext(turnId, modelRequestId, ids.messageId, outputContent);
     const turn = await this.requireExisting('Turn', turnId);
     if (turn.status !== 'active') throw new Error(`Turn ${turnId} is not active.`);
     const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
     const leaseRows = await this.list('ExecutionLease', { turn_id: turnId }, 2);
     if (leaseRows.length !== 1) throw new Error(`Active Turn ${turnId} must have exactly one ExecutionLease.`);
     const content = await this.contentStore.prepare(this.database, outputContent, contentType);
+    const orderedIndex = reorderedItemRevisionIds
+      ? await this.prepareOrderedNativeMessageIndex(ids.messageId, reorderedItemRevisionIds) : undefined;
     const now = requireText(this.now(), 'clock result');
     try {
       const committed = await this.database.transaction([
@@ -446,12 +493,16 @@ export class TurnOutputControlPlane {
           conversation_id: conversationId,
           turn_id: turnId
         }),
-        ...preparedContentObjectSteps([content], 'assistant_output'),
+        ...preparedContentObjectSteps([content, ...(orderedIndex?.contentObjects ?? [])], 'assistant_output'),
         DOMAIN_REPOSITORIES.domain('Message').assert(ids.messageId, { deleted_at: null }),
         DOMAIN_REPOSITORIES.domain('ModelRequestMessageLink').assert(ids.modelRequestLinkId, {
           model_request_id: modelRequestId,
           message_id: ids.messageId
         }),
+        ...(orderedIndex ? [DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({
+          id: `${ids.revisionId}:items`, message_id: ids.messageId, role: 'model',
+          content_object_id: orderedIndex.contentObjectId, created_at: now
+        }, { column: 'revision_seq', scope: { message_id: ids.messageId } })] : []),
         DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({
           id: ids.revisionId,
           message_id: ids.messageId,
@@ -488,6 +539,36 @@ export class TurnOutputControlPlane {
     }
   }
 
+  private async prepareOrderedNativeMessageIndex(messageId: string, revisionIds: readonly string[]): Promise<{
+    contentObjectId: string; contentObjects: PreparedContentObject[]
+  } | undefined> {
+    const links = await this.list('MessageCurrentRevisionLink', { message_id: messageId }, 2);
+    if (links.length !== 1) throw new Error('Native final Message requires one current revision.');
+    const revision = await this.requireExisting('MessageRevision', requireId(links[0]!.revision_id, 'Native current revision'));
+    const metadata = await this.requireExisting('ContentObject', requireId(revision.content_object_id, 'Native current content')) as ContentObjectMetadata;
+    // Published ordinary prefixes have no item index; their final aggregate already owns display order.
+    if (metadata.content_type !== NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE) return undefined;
+    const items = new Map<string, NativeMessageItem>();
+    let afterSequence = 0;
+    for (;;) {
+      const page = await this.messageContents.readNativeItems(metadata, { afterSequence, limit: 256 });
+      for (const item of page.items) {
+        const { id: _id, sequence: _sequence, ...descriptor } = item;
+        items.set(item.revisionId, descriptor);
+      }
+      if (page.nextSequence === undefined) break;
+      afterSequence = page.nextSequence;
+    }
+    const ordered = revisionIds.map(revisionId => {
+      const item = items.get(revisionId);
+      if (!item) throw new Error(`Native final Message index lacks immutable item ${revisionId}.`);
+      return item;
+    });
+    const prepared = await prepareNativeMessageCompositionIndex(this.database, this.contentStore, ordered);
+    return { contentObjectId: prepared.content.metadata.id,
+      contentObjects: [...prepared.relatedContentObjects, prepared.content] };
+  }
+
   /** Failed partial output updates the request's one Message; unclosed output never enters Context. */
   public async appendNativeAssistantPartialAggregate(input: {
     turnId: string;
@@ -496,12 +577,12 @@ export class TurnOutputControlPlane {
     content: string | Uint8Array;
     contentType?: string;
   }): Promise<AssistantMessageCommit> {
-    return this.appendNativeAssistantItem({
+    return this.appendNativeAssistantRevisionPair({
       ...input,
       itemKey: `failed-partial:${requireText(input.sourceKey, 'sourceKey')}`,
-      cumulativeContent: input.content,
+      partialAggregate: true,
       contextDisposition: 'exclude'
-    });
+    }, {});
   }
 
   /** Message existence proves only some item was stored. Every final item needs its own proof. */
@@ -510,7 +591,7 @@ export class TurnOutputControlPlane {
     modelRequestId: string,
     messageId: string,
     content: string | Uint8Array
-  ): Promise<void> {
+  ): Promise<string[] | undefined> {
     const aggregate = nativeAssistantMessageParts(JSON.parse(typeof content === 'string'
       ? content : Buffer.from(content).toString('utf8')));
     const revisions = (await listAllDomainRows(this.database, 'MessageRevision', { message_id: messageId }))
@@ -546,6 +627,7 @@ export class TurnOutputControlPlane {
       if (matches.length !== 1) throw new Error('Native completed output without metadata has no unique immutable item proof.');
       return { ...part, outputItem: matches[0]!.part.outputItem! };
     });
+    const orderedRevisionIds: string[] = [];
     for (const parts of nativeAssistantPartGroups(identifiedAggregate)) {
       const part = normalizeNativeAssistantCompletedItem({ role: 'model', parts });
       if (!part) continue;
@@ -554,6 +636,7 @@ export class TurnOutputControlPlane {
       if (!proof || nativeAssistantComparablePart(proof.part) !== nativeAssistantComparablePart(part)) {
         throw new Error(`Native completed output item ${reference.id} has no matching immutable item proof.`);
       }
+      orderedRevisionIds.push(requireId(proof.revision.id, 'Native item revision'));
       const source = nativeRecord(part.functionCall)
         ? sources.find(row => row.provider_call_id === part.id)
         : undefined;
@@ -564,6 +647,9 @@ export class TurnOutputControlPlane {
         throw new Error(`Native completed output item ${reference.id} has not entered Context.`);
       }
     }
+    const priorOrder = [...proofs.values()];
+    return priorOrder.length === orderedRevisionIds.length && priorOrder.every((proof, index) => proof.revision.id === orderedRevisionIds[index])
+      ? undefined : orderedRevisionIds;
   }
 
   private async replay(

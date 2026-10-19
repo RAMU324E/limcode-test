@@ -1,5 +1,5 @@
 import { nextTick, onBeforeUnmount, readonly, ref, watch, type Ref } from 'vue';
-import { USER_SCROLL_INTENT_EVENT, userScrollIntentDetail } from './scrollIntent';
+import { dispatchUserScrollIntent, USER_SCROLL_INTENT_EVENT, userScrollIntentDetail } from './scrollIntent';
 
 export interface BottomStickyScrollerOptions {
   /** 距离底部多少像素内视为“贴底”。 */
@@ -188,7 +188,9 @@ export function useBottomStickyScroller(
   }
 
   function handleWheel(event: WheelEvent): void {
-    if (event.deltaY < 0) releaseStickyFromUserIntent();
+    if (event.deltaY !== 0) dispatchUserScrollIntent(scroller.value, {
+      direction: event.deltaY < 0 ? 'toward-start' : 'toward-end', source: 'wheel'
+    });
   }
 
   function handleUserScrollIntent(event: Event): void {
@@ -223,15 +225,19 @@ export function useBottomStickyScroller(
 
   function handleKeyboardInteraction(event: KeyboardEvent): void {
     if (event.key === 'ArrowUp' || event.key === 'PageUp' || event.key === 'Home') {
-      releaseStickyFromUserIntent();
+      dispatchUserScrollIntent(scroller.value, {
+        direction: event.key === 'Home' ? 'jump-start' : 'toward-start', source: 'keyboard'
+      });
       return;
     }
 
     if (event.key === 'End') {
-      stickyToBottom.value = true;
-      userDetachedFromBottom = false;
-      reattachLockedUntil = 0;
-      keepStickyDuringContentSettle();
+      dispatchUserScrollIntent(scroller.value, { direction: 'jump-end', source: 'keyboard' });
+      return;
+    }
+
+    if (event.key === 'ArrowDown' || event.key === 'PageDown') {
+      dispatchUserScrollIntent(scroller.value, { direction: 'toward-end', source: 'keyboard' });
       return;
     }
 

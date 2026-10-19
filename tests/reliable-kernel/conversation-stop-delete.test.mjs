@@ -1,7 +1,7 @@
 import { before, after, test } from 'node:test';
 import { openStopFixture } from './stop-control-fixture.mjs';
 import { queueCancellationBeforeStop, pendingAnswerDeletionNotice, consumedAnswerDeletionNotice, backgroundChildDeletion, stopWholeTree,
-  timeoutPreservesThenRetry, writerDeletionAtomicRefusal, durableStopRecovery } from './stop-delete-cases.mjs';
+  timeoutPreservesThenRetry, writerDeletionAtomicRefusal, durableStopRecovery, stopClosesOutputCrashWindow } from './stop-delete-cases.mjs';
 import { stopForeignProcess, liveOwnerStops, unknownDispatchIdentity, stopAllWaits, userStopsDeadHost, liveDispatchKeepsReceipt,
   recoverDispatchedSpawn, rejectCancelRace } from './stop-control-cases.mjs';
 let f;
@@ -23,3 +23,5 @@ test('only an explicit user stop closes a proven dead host effect as outcome_unk
 test('a live dispatch remains active until the actual receipt arrives and is never abandoned', () => liveDispatchKeepsReceipt(f));
 test('a dead dispatched spawn recovers its existing child and stops without dispatching twice', { timeout: 10000 }, () => recoverDispatchedSpawn(f));
 test('explicit rejection survives a stop and competing responses commit only one approval outcome', () => rejectCancelRace(f));
+test('停止补建已经提交输出但尚未建成的调用，并把取消结果进入 Context', () => stopClosesOutputCrashWindow(f, 'output-before-calls'));
+test('停止补齐已有终态工具结果的 Context，不再次派发工具', () => stopClosesOutputCrashWindow(f, 'result-before-context'));

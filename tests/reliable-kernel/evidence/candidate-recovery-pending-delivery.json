@@ -1,0 +1,45 @@
+{
+  "kind": "limcode-phase-f-candidate-evidence",
+  "checkId": "candidate.recovery.pending-delivery",
+  "stableId": "candidate.recovery.pending-delivery",
+  "passed": true,
+  "commitSha": "528d720f929acd84ece7d6d7bf8f1c68e8557f1e",
+  "measuredAt": "2026-09-11T09:32:25.574Z",
+  "assertionCount": 3,
+  "provenance": {
+    "worktreeClean": false,
+    "commitExplicitlyBound": false,
+    "authoritative": false,
+    "runnerSha256": "4e7bcd9adc82c715b6203e8d9f4f094dca5f50da58f27d8f89eac8ee654e845a",
+    "sourceTreeSha256": "b9190d12a0e28a8379e8c8d9bba7c7a7e67044ac3248d8367b5ddf910ef693b6",
+    "sourceFileCount": 487,
+    "sourceFilesTracked": false,
+    "compiledKernelSha256": "a40adc792ba10fcf831b7eae353962ab6742cc625788da1123f76effe2af0880",
+    "compiledFileCount": 226,
+    "compileProvenance": "dist/extension/reliable-kernel-compile-provenance.json",
+    "compileWorktreeClean": false,
+    "compiledClosureMatches": false,
+    "invocation": [
+      "/Users/lurenxing/.local/node-v24.15.0-darwin-arm64/bin/node",
+      "/Users/lurenxing/GitHub/limcode-test/scripts/reliable-kernel/run-phase-f-check.mjs",
+      "--check",
+      "candidate.recovery.pending-delivery"
+    ],
+    "node": "v24.15.0",
+    "sqlite": "3.53.4",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5"
+  },
+  "assertions": [
+    "restart后pending delivery按advancement matrix注入真实PendingTurnInput+InputLink并置consumed",
+    "delivery recovery重复扫描不重复注入、不重复推进且不消费handled_at",
+    "notify_only恢复扫描保持pending且不伪造InputLink，直到真实产品通知路径显式ACK"
+  ],
+  "faults": [
+    "pending current_turn and notify_only deliveries across Extension Host restart"
+  ],
+  "metrics": {
+    "inputLinks": 1
+  }
+}

@@ -642,7 +642,7 @@ export function locatedSnapshotCacheFiles(root: LocatedRuntimeRoot, files: strin
 
 /** The exact published epochs a foreign root may keep: its private snapshot copies are upgraded. */
 function isPublishedForeignEpoch(epoch: number): boolean {
-  return epoch === 3 || epoch === 4 || epoch === 5;
+  return epoch === 3 || epoch === 4 || epoch === 5 || epoch === 6;
 }
 
 /** Located again from where it was found (local candidate id, or foreign location): never from its records. */
@@ -701,7 +701,7 @@ export async function tryWithForeignRuntimeRootClaim<T>(
 /**
  * The private copy of a located root's database and WAL, taken under its fence (see
  * {@link copyForeignRuntimeSqliteFiles}). Shared by verification, fingerprints, the read-only view
- * and merges. A foreign root of a published epoch 3/4/5 has its copy upgraded to the current epoch
+ * and merges. A foreign root of a published epoch 3/4/5/6 has its copy upgraded to the current epoch
  * in a worker (the same checks and transaction as the in-place upgrade, never touching the foreign
  * files); `binding` is what the copy's root_binding row holds afterwards, `files` stays the source's
  * exact state.
@@ -915,7 +915,7 @@ export async function openPackedCasSnapshot(
   let worker: PackedCasWorkerClient | undefined;
   let copy: { databasePath: string; remove(): Promise<void> } | undefined;
   let closed = false;
-  if (binding.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) {
+  if (binding.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH || binding.runtimeKernelEpoch === 6) {
     const file = path.join(binding.paths.casRootPath, PACKED_CAS_FILE);
     await assertNoSymbolicPath(containerRoot, binding.paths.casRootPath);
     if (await lstatIfPresent(file)) {
@@ -924,7 +924,7 @@ export async function openPackedCasSnapshot(
       try {
         worker = await PackedCasWorkerClient.open({ ...binding,
           paths: { ...binding.paths, casRootPath: path.dirname(copy.databasePath) }
-        } as RootBinding, { readOnly: true });
+        }, { readOnly: true });
       } catch (error) {
         await copy.remove();
         throw error;

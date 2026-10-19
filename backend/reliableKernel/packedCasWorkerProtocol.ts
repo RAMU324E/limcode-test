@@ -1,5 +1,6 @@
 import type { CasObjectIdentity } from './casObjectAccess';
 import type { RootBinding } from './contracts';
+import type { HistoricalRootBinding } from './rootAuthority';
 
 export const PACKED_CAS_FILE = 'limcode.cas-small.sqlite';
 export const PACKED_CAS_MAX_BODY_BYTES = 8_192;
@@ -9,7 +10,15 @@ export const PACKED_CAS_MAX_QUEUED_REQUESTS = 128;
 export const PACKED_CAS_ENTRY_CHARGE = 256;
 
 export interface PackedCasOpenOptions { readOnly?: boolean }
-export interface PackedCasWorkerData { binding: RootBinding; options: PackedCasOpenOptions }
+export interface PackedCasWorkerData { binding: HistoricalRootBinding; options: PackedCasOpenOptions }
+export interface PackedCasIdentity { dataSetId: string; rootInstanceId: string; rootGeneration: number }
+/** Offline epoch maintenance and its read-only startup probe never publish body rows. */
+export type PackedCasMaintenanceWorkerData =
+  | { kind: 'inspectIdentity'; binding: HistoricalRootBinding }
+  | { kind: 'migrateEpochIdentity'; previous: HistoricalRootBinding; next: RootBinding; allowPrevious: boolean };
+export type PackedCasMaintenanceWorkerResponse =
+  | { ok: true; identity?: PackedCasIdentity }
+  | { ok: false; error: PackedCasWorkerError };
 export interface PackedCasPublication { object: CasObjectIdentity; bytes: Uint8Array }
 export type PackedCasPlacement = 'packed' | 'loose';
 

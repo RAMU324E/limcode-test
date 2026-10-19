@@ -230,7 +230,7 @@ test('Feed：运行Process固定源bundle，结束后原子滚出全部关系且
   assert.equal(h.state.records.ToolCall[first.tool], undefined);
   assert.equal(h.state.records.Process[processId], undefined);
   assert.ok(h.state.records.Message[ids(h.prefix, 202).message]);
-  const page = await h.history.backwardVisibleMessages({ conversationId: h.conversationId, beforeMessageSeq: '2', beforeId: ids(h.prefix, 2).message, limit: 20 });
+  const page = await h.history.visibleMessages({ conversationId: h.conversationId, beforeMessageSeq: '2', beforeId: ids(h.prefix, 2).message, limit: 20 });
   assert.equal(page.records.Message[0].id, first.message);
   assert.equal(page.records.ModelRequest[0].id, first.request);
   assert.equal(page.records.ToolCall[0].id, first.tool);
@@ -414,7 +414,7 @@ test('任务：artifact经Feed和Pinia立即显示，滚出来源与重连后仍
   assert.equal(h.snapshotReads, reads, 'task tools outside the live window update through the same small delta');
   assert.equal(h.store.records.ToolCall?.['task-feed-update-two'], undefined);
   h.store.historyConversationId = 'task-feed-conversation';
-  h.store.historyRecords = { Message: { old: { id: 'task-feed-old-message', conversation_id: 'task-feed-conversation', message_seq: '1', display_seq: '1', role: 'model' } } };
+  h.store.committedRecords = { ...h.store.committedRecords, Message: { ...h.store.committedRecords.Message, old: { id: 'task-feed-old-message', conversation_id: 'task-feed-conversation', message_seq: '1', display_seq: '1', role: 'model' } } };
   assert.ok((await h.render()).includes('1/1'));
   await h.reconnect(); assert.ok((await h.render()).includes('1/1'));
   await h.runtime.settle('task-feed-latest-rewrite', { detail: { kind: 'task-list', operation: { kind: 'task_list.operation', mode: 'rewrite', items: [{ title: 'Latest', status: 'pending' }] } } });
@@ -510,8 +510,8 @@ test('历史：旧消息页保留绝对可见序号，新后缀不增大其读�
   const input = { conversationId: 'visible', beforeMessageSeq: '100', beforeId: 'm-10', limit: 4 };
   const read = () => projection.executeClientVisibleMessageHistoryPage(f.db, input, {}), before = read();
   assert.deepEqual(before.records.Message.map(row => [row.id, row.display_seq]), [['m-5', '4'], ['m-7', '5'], ['m-8', '6'], ['m-9', '7']]);
-  const sql = f.queries.find(sql => sql.includes('WITH page AS MATERIALIZED') && sql.includes('@beforeMessageSeq'));
-  const parameters = { conversationId: 'visible', beforeMessageSeq: 100n, beforeId: 'm-10', limit: 5n }, visits = visited(f.db, sql, parameters);
+  const sql = f.queries.find(sql => sql.includes('WITH page AS MATERIALIZED') && sql.includes('@cursorSeq'));
+  const parameters = { conversationId: 'visible', cursorSeq: 100n, cursorId: 'm-10', limit: 5n }, visits = visited(f.db, sql, parameters);
   f.db.transaction(() => { for (let i = 13; i <= 1000; i++) f.message(`m-${i}`, 'visible', i * 10); })();
   assert.deepEqual(read(), before); assert.equal(visited(f.db, sql, parameters), visits);
 });
@@ -562,7 +562,8 @@ test('滚动：内容检查和贴底共用frame，卸载回收观察者与排队
   t.after(() => { Object.assign(globalThis, old); window.requestAnimationFrame = oldRequest; window.cancelAnimationFrame = oldCancel; });
   const frames = new Map(), resize = [], mutation = []; let next = 0;
   class Element { constructor() { this.scrollTop = 500; this.scrollHeight = 1000; this.clientHeight = 500; this.listeners = new Map(); }
-    addEventListener(name, fn) { this.listeners.set(name, fn); } removeEventListener(name) { this.listeners.delete(name); } closest() { return null; } }
+    addEventListener(name, fn) { this.listeners.set(name, fn); } removeEventListener(name) { this.listeners.delete(name); }
+    dispatchEvent(event) { this.listeners.get(event.type)?.(event); return true; } closest() { return null; } }
   globalThis.Element = globalThis.HTMLElement = Element;
   window.requestAnimationFrame = fn => { const id = ++next; frames.set(id, fn); return id; }; window.cancelAnimationFrame = id => frames.delete(id);
   globalThis.ResizeObserver = class { constructor(callback) { resize.push(callback); } observe() {} unobserve() {} disconnect() {} };
@@ -594,4 +595,431 @@ test('显示：10k行代码只渲染可见窗口，换wrap尺寸和stream内容�
   const streamed = new CodeLineHeights(10001, 20, index => index < heights.count ? heights.height(index) : 20);
   streamed.set(5000, 30000); assert.equal(codeLineReadingAnchorOffset(streamed, anchor), heights.offset(5000) + 10000);
   const visible = codeLineWindow(streamed, codeLineReadingAnchorOffset(streamed, anchor), 520); assert.ok(visible.end - visible.start < 80);
+});
+
+test('显示：transient只更新当前消息，已提交历史正文和工具对象不重新读取', async () => {
+  const { ReliableConversationProjector } = await ui.load('domain/reliableConversationProjector.ts');
+  const records = nativeShellRecords('streaming');
+  records.Message['message-a'].message_seq = '101';
+  const details = { 'message-content:revision-a': ready(JSON.stringify({ role: 'model', parts: [ITEM_ONE] })) };
+  let historicalReads = 0;
+  for (let index = 1; index <= 80; index++) {
+    const id = `historical-${index}`, revision = `history-revision-${index}`, turnId = `historical-turn-${index}`;
+    records.Message[id] = { id, revision_id: revision, conversation_id: 'conversation-a', role: 'user', message_seq: String(index), created_at: '2026-08-01T00:00:00Z' };
+    records.MessageTurnLink[id] = { id, message_id: id, turn_id: turnId, role: 'input' };
+    records.Turn[turnId] = { id: turnId, conversation_id: 'conversation-a', status: 'terminated' };
+    const body = JSON.stringify({ role: 'user', parts: [{ text: 'stable historical body ' + index }] });
+    details[`message-content:${revision}`] = { status: 'ready', totalBytes: body.length, get text() { historicalReads++; return body; } };
+  }
+  const projector = new ReliableConversationProjector();
+  const committed = projector.projectCommitted({ conversationId: 'conversation-a', records, details });
+  const history = committed.messages.slice(0, 80), toolCalls = committed.toolCalls;
+  historicalReads = 0;
+  const first = projector.projectTransient({ transientModelRequests: nativeTransient([ITEM_LIVE]) });
+  const second = projector.projectTransient({ transientModelRequests: nativeTransient([{ ...ITEM_LIVE, text: 'continued live tail' }]) });
+  assert.equal(historicalReads, 0);
+  assert.ok(history.every((message, index) => message === first.messages[index] && message === second.messages[index]));
+  assert.equal(first.toolCalls, toolCalls); assert.equal(second.toolCalls, toolCalls);
+  assert.equal(first.index.messageIds, second.index.messageIds);
+  assert.equal(first.index.messageMetadata, second.index.messageMetadata);
+  assert.equal(second.messages.at(-1).content.parts.at(-1).text, 'continued live tail');
+});
+
+test('历史：阅读页只驻留相邻页面，after游标重载已释放正文并保留展开详情', async t => {
+  const h = ui.stores(t), feed = h.feed;
+  const rows = (first, count) => Array.from({ length: count }, (_, offset) => {
+    const seq = first + offset;
+    return { id: `resident-${seq}`, revision_id: `resident-revision-${seq}`, conversation_id: h.conversationId,
+      role: 'user', message_seq: String(seq), display_seq: String(seq), created_at: '2026-10-13T00:00:00Z' };
+  });
+  feed.observe({ type: 'reliable-kernel.snapshot', sessionId: 'resident-session', hostBootId: 'resident-host',
+    messageSeq: '1', snapshotCommitSeq: '1',
+    projections: { activeConversationWindow: { conversationId: h.conversationId, visibleMessageCount: '120', messages: rows(101, 20) } } });
+  const admit = (direction, first) => {
+    assert.equal(direction === 'before' ? feed.requestEarlierHistory(h.conversationId) : feed.requestLaterHistory(h.conversationId), true);
+    const request = ui.posted.at(-1);
+    assert.equal(Object.hasOwn(request, direction === 'before' ? 'afterMessageSeq' : 'beforeMessageSeq'), false);
+    const messages = rows(first, 20);
+    for (const row of messages) feed.details[`message-content:${row.revision_id}`] = ready(JSON.stringify({ role: 'user', parts: [{ text: row.id }] }));
+    feed.observeHistoryPageResult({ sessionId: feed.sessionId, conversationId: h.conversationId, requestId: request.requestId,
+      page: { records: { Message: messages }, hasMoreBefore: first > 1, hasMoreAfter: first + 19 < 120,
+        nextBeforeMessageSeq: String(first), nextBeforeId: messages[0].id,
+        nextAfterMessageSeq: String(first + 19), nextAfterId: messages.at(-1).id } });
+    assert.ok(feed.historyPages.length <= 3);
+    assert.ok(Object.keys(feed.committedRecords.Message).length <= 80);
+    return request;
+  };
+  admit('before', 81);
+  const heldKey = 'message-content:resident-revision-81';
+  feed.setDetailOwnerKeys('expanded-audit', [heldKey]);
+  admit('before', 61); admit('before', 41); admit('before', 21);
+  assert.equal(feed.committedRecords.Message['resident-81'], undefined);
+  assert.ok(feed.details[heldKey]);
+  feed.setDetailOwnerKeys('expanded-audit', []); assert.equal(feed.details[heldKey], undefined);
+  assert.equal(feed.details['message-content:resident-revision-82'], undefined);
+  assert.equal(admit('after', 41).afterMessageSeq, '40');
+  assert.equal(admit('after', 61).afterMessageSeq, '60');
+  assert.equal(admit('after', 81).afterMessageSeq, '80');
+  assert.equal(feed.committedRecords.Message['resident-81'].display_seq, '81');
+  assert.ok(feed.details[heldKey]);
+  assert.equal(new Set(Object.values(feed.committedRecords.Message).map(row => row.id)).size, Object.keys(feed.committedRecords.Message).length);
+});
+
+test('原生内容：封闭item页与活尾文共存，旧页释放，完整复制使用同一逻辑正文入口', async t => {
+  const h = ui.stores(t), feed = h.feed;
+  const records = nativeShellRecords('streaming');
+  records.Message['message-a'] = { ...records.Message['message-a'], item_index_revision_id: 'index-a', revision_id: 'index-a',
+    content_type: 'application/vnd.limcode.native-message-composition+json', display_seq: '1' };
+  feed.observe({ type: 'reliable-kernel.snapshot', sessionId: 'items-session', hostBootId: 'items-host', messageSeq: '1', snapshotCommitSeq: '1',
+    projections: { activeConversationWindow: { conversationId: 'conversation-a', visibleMessageCount: '1',
+      messages: Object.values(records.Message), turns: Object.values(records.Turn ?? {}),
+      messageTurnLinks: Object.values(records.MessageTurnLink ?? {}), modelRequests: Object.values(records.ModelRequest ?? {}),
+      modelRequestMessageLinks: Object.values(records.ModelRequestMessageLink ?? {}) } } });
+  const nativePart = sequence => ({ text: `content-${sequence}\n`, outputItem: { id: `item-${(sequence - 1) % 32}`,
+    ordinal: (sequence - 1) % 32, providerResponseId: `response-${Math.floor((sequence - 1) / 32)}`,
+    ...(sequence > 32 ? { previousResponseId: `response-${Math.floor((sequence - 1) / 32) - 1}` } : {}) } });
+  const { useReliableConversation } = await ui.load('composables/useReliableConversation.ts');
+  const view = h.scope.run(() => useReliableConversation());
+  const served = new Set();
+  let fullReads = 0;
+  const reply = request => {
+    let value;
+    if (request.kind === 'message-content-items') {
+      const first = (request.itemAfterSequence ?? 64) + 1;
+      const items = Array.from({ length: Math.min(32, 97 - first) }, (_, index) => {
+        const sequence = first + index, part = nativePart(sequence);
+        return { id: `item-revision-${sequence}`, sequence, revisionId: `item-revision-${sequence}`, contentObjectId: `item-object-${sequence}`,
+          partByteLength: Buffer.byteLength(JSON.stringify(part)), outputItem: part.outputItem };
+      });
+      const last = items.at(-1)?.sequence ?? 0;
+      value = { totalItems: 96, totalBytes: 20000, items, ...(last < 96 ? { nextSequence: last } : {}) };
+    } else if (request.kind === 'message-content-item' && request.recordId.startsWith('item-object-')) {
+      value = { role: 'model', parts: [nativePart(Number(request.recordId.slice('item-object-'.length)))] };
+    } else if (request.kind === 'message-content' && request.recordId === 'index-a') {
+      fullReads++; value = { role: 'model', parts: Array.from({ length: 96 }, (_, index) => nativePart(index + 1)) };
+    } else return false;
+    const bytes = Buffer.from(JSON.stringify(value));
+    feed.observeDetailResult({ sessionId: feed.sessionId, requestId: request.requestId,
+      detail: { recordId: request.recordId, offset: 0, totalBytes: bytes.length, chunk: bytes.toString('base64'), hasMore: false } });
+    return true;
+  };
+  const drain = async () => {
+    for (let round = 0; round < 200; round++) {
+      const requests = ui.posted.filter(request => request.type === 'reliable-kernel.detail-request' && request.sessionId === feed.sessionId && !served.has(request.requestId));
+      if (!requests.length) break;
+      for (const request of requests) { served.add(request.requestId); reply(request); }
+      await tick();
+    }
+  };
+  feed.ensureMessageContent('message-a'); await drain();
+  assert.equal(fullReads, 0);
+  assert.deepEqual(view.projection.value.messages[0].content.parts.map(part => part.text), Array.from({ length: 64 }, (_, index) => `content-${index + 33}\n`));
+  const stableItem = view.projection.value.messages[0].content.parts[0];
+  feed.transientModelRequests = nativeTransient([nativePart(97)]);
+  const withLive = view.projection.value.messages[0];
+  assert.equal(withLive.content.parts[0], stableItem); assert.equal(withLive.content.parts.at(-1).text, 'content-97\n');
+  const complete = view.completeMessageContent('message-a'); await drain();
+  const content = await complete;
+  assert.equal(content.parts.length, 97); assert.equal(content.parts[0].text, 'content-1\n'); assert.equal(content.parts.at(-1).text, 'content-97\n');
+  assert.equal(fullReads, 1); assert.equal(feed.details['message-content:index-a'], undefined);
+  feed.moveMessageContentWindow('message-a', 'before'); await drain();
+  assert.equal(view.projection.value.messages[0].content.parts[0].text, 'content-1\n');
+  assert.equal(feed.details['message-content-item:item-object-96'], undefined);
+  assert.ok(feed.messageContentWindows['message-a'].pages.length <= 3);
+  feed.moveMessageContentWindow('message-a', 'after'); await drain();
+  assert.equal(feed.messageContentWindows['message-a'].followTail, true);
+  assert.equal(view.projection.value.messages[0].content.parts.at(-1).text, 'content-97\n');
+  feed.retainMessageContentWindows([]);
+  assert.equal(feed.details['message-content-item:item-object-64'], undefined);
+});
+
+test('原生内容：终态metadata先到时保留未hydrate的transient，逐项正文接管后保持已读内容', async () => {
+  const { projectReliableConversation: project } = await ui.load('domain/reliableConversationProjection.ts');
+  const records = nativeShellRecords('terminal');
+  records.ModelRequest['request-a'].terminal_state = 'completed';
+  records.Message['message-a'] = { ...records.Message['message-a'], revision_id: 'index-ready', item_index_revision_id: 'index-ready' };
+  const parts = [1, 2].map(sequence => ({ text: `visible-${sequence}`, outputItem: { id: `ready-${sequence}`, ordinal: sequence - 1, providerResponseId: 'ready-response' } }));
+  const items = parts.map((part, index) => ({ id: `ready-revision-${index}`, revisionId: `ready-revision-${index}`,
+    sequence: index + 1, contentObjectId: `ready-object-${index}`, partByteLength: 100, outputItem: part.outputItem }));
+  const transientModelRequests = nativeTransient([parts[1]]);
+  transientModelRequests['request-a'].status = 'completed';
+  const input = { conversationId: 'conversation-a', records, transientModelRequests,
+    details: { 'message-content-item:ready-object-0': ready(JSON.stringify({ role: 'model', parts: [parts[0]] })) },
+    messageContentWindows: { 'message-a': { indexRevisionId: 'index-ready', followTail: true, pages: [{
+      key: 'message-content-items:index-ready:tail', indexRevisionId: 'index-ready', totalItems: 2, totalBytes: 200, items
+    }] } } };
+  const window = input.messageContentWindows['message-a'], currentPages = window.pages;
+  window.pages = [{ key: 'message-content-items:index-before:tail', indexRevisionId: 'index-before', totalItems: 1, totalBytes: 100, items: items.slice(0, 1) }];
+  input.details['message-content-items:index-ready:tail'] = { status: 'loading', text: '', totalBytes: 0 };
+  assert.deepEqual(project(input).messages[0].content.parts.map(part => part.text), ['visible-1', 'visible-2']);
+  window.pages = currentPages; delete input.details['message-content-items:index-ready:tail'];
+  const pending = project(input);
+  assert.deepEqual(pending.messages[0].content.parts.map(part => part.text), ['visible-1', 'visible-2']);
+  assert.equal(pending.contentWindowByMessageId['message-a'].loading, true);
+  const stable = pending.messages[0].content.parts[0];
+  input.details['message-content-item:ready-object-1'] = ready(JSON.stringify({ role: 'model', parts: [parts[1]] }));
+  const hydrated = project(input);
+  assert.deepEqual(hydrated.messages[0].content.parts.map(part => part.text), ['visible-1', 'visible-2']);
+  assert.equal(hydrated.messages[0].content.parts[0], stable);
+  assert.equal(hydrated.contentWindowByMessageId['message-a'].loading, false);
+});
+
+test('原生内容：首次终态Feed先于列表正文需求时持续交接已显示的transient', async t => {
+  const h = ui.stores(t), feed = h.feed, records = nativeShellRecords('streaming');
+  const originalResizeObserver = globalThis.ResizeObserver;
+  globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+  t.after(() => { if (originalResizeObserver) globalThis.ResizeObserver = originalResizeObserver; else delete globalThis.ResizeObserver; });
+  feed.projections = { activeConversationWindow: { conversationId: 'conversation-a' } };
+  const modelMessage = records.Message['message-a'], modelLink = records.MessageTurnLink['link-a'];
+  const requestLink = records.ModelRequestMessageLink;
+  records.Turn['turn-a'].source_message_id = 'user-a';
+  records.Message = { 'user-a': { id: 'user-a', conversation_id: 'conversation-a', message_seq: '1', display_seq: '1',
+    revision_id: 'user-revision', role: 'user', created_at: '2026-08-03T00:00:00.000Z' } };
+  records.MessageTurnLink = { 'user-link': { id: 'user-link', message_id: 'user-a', turn_id: 'turn-a', role: 'input' } };
+  records.ModelRequestMessageLink = {};
+  const snapshot = sequence => ({ type: 'reliable-kernel.snapshot', sessionId: 'session', hostBootId: 'host',
+    messageSeq: String(sequence), snapshotCommitSeq: String(sequence), projections: { activeConversationWindow: {
+      conversationId: 'conversation-a', visibleMessageCount: String(sequence), messages: Object.values(records.Message),
+      turns: Object.values(records.Turn), messageTurnLinks: Object.values(records.MessageTurnLink),
+      modelRequests: Object.values(records.ModelRequest), modelRequestMessageLinks: Object.values(records.ModelRequestMessageLink)
+    } } });
+  feed.observe(snapshot(1));
+  feed.details['message-content:user-revision'] = ready(JSON.stringify({ role: 'user', parts: [{ text: 'question' }] }));
+  feed.observe({ type: 'reliable-kernel.transient', sessionId: feed.sessionId, hostBootId: feed.hostBootId,
+    conversationId: 'conversation-a', turnId: 'turn-a', modelRequestId: 'request-a', requestSeq: '1',
+    providerId: 'provider-a', modelId: 'gpt-6-astra', attemptSeq: '1', socketGeneration: '1', afterCommitSeq: '1',
+    observedAt: '2026-08-03T00:00:02.000Z', fromStreamSeq: '1',
+    event: { kind: 'output_delta', streamSeq: '1', content: { type: 'text_delta', text: ITEM_LIVE.text, outputItem: ITEM_LIVE.outputItem } } });
+  const app = ui.renderer.createApp({ ...ui.messageList, render() { return null; }, ssrRender: undefined }).use(h.active);
+  h.cleanup.push(() => app.unmount()); app.provide(ui.vue.ssrContextKey, { modules: new Set() }); app.mount({});
+  const { useReliableConversation } = await ui.load('composables/useReliableConversation.ts');
+  const view = h.scope.run(() => useReliableConversation());
+  await tick();
+  assert.equal(view.projection.value.messages.at(-1).id, 'transient:request-a');
+  assert.deepEqual(Object.keys(feed.messageContentWindows), []);
+  records.Message['message-a'] = { ...modelMessage, message_seq: '2', display_seq: '2',
+    revision_id: 'first-terminal-index', item_index_revision_id: 'first-terminal-index' };
+  records.MessageTurnLink['link-a'] = modelLink; records.ModelRequestMessageLink = requestLink;
+  records.ModelRequest['request-a'] = { ...records.ModelRequest['request-a'], status: 'terminal', terminal_state: 'completed' };
+  feed.observe(snapshot(2));
+  assert.ok(feed.transientModelRequests['request-a']);
+  await tick();
+  assert.deepEqual(view.projection.value.messages.at(-1).content.parts, [ITEM_LIVE]);
+  assert.equal(view.projection.value.contentWindowByMessageId['message-a'].loading, true);
+  const reply = (kind, value) => {
+    const [requestId, request] = Object.entries(feed.pendingDetails).find(([, pending]) => pending.kind === kind);
+    const bytes = Buffer.from(JSON.stringify(value));
+    feed.observeDetailResult({ sessionId: feed.sessionId, requestId, detail: { recordId: request.recordId,
+      offset: 0, totalBytes: bytes.length, chunk: bytes.toString('base64'), hasMore: false } });
+  };
+  reply('message-content-items', { totalItems: 1, totalBytes: 100, items: [{ id: 'terminal-item', revisionId: 'terminal-item',
+    sequence: 1, contentObjectId: 'terminal-body', partByteLength: 100, outputItem: ITEM_LIVE.outputItem }] });
+  assert.deepEqual(view.projection.value.messages.at(-1).content.parts, [ITEM_LIVE]);
+  assert.ok(feed.transientModelRequests['request-a']);
+  reply('message-content-item', { role: 'model', parts: [ITEM_LIVE] });
+  assert.deepEqual(view.projection.value.messages.at(-1).content.parts, [ITEM_LIVE]);
+  assert.equal(feed.transientModelRequests['request-a'], undefined);
+  assert.equal(view.projection.value.contentWindowByMessageId['message-a'].loading, false);
+});
+
+test('原生内容：item正文读取耗尽后展示错误并开放翻页，明确重试沿原详情入口恢复', async t => {
+  const h = ui.stores(t), feed = h.feed, records = nativeShellRecords('terminal');
+  records.ModelRequest['request-a'].terminal_state = 'completed';
+  records.Message['message-a'] = { ...records.Message['message-a'], revision_id: 'index-error', item_index_revision_id: 'index-error' };
+  feed.records = records; feed.committedRecords = records;
+  feed.projections = { activeConversationWindow: { conversationId: 'conversation-a' } };
+  const items = Array.from({ length: 32 }, (_, index) => {
+    const sequence = index + 65;
+    return { id: `error-revision-${sequence}`, revisionId: `error-revision-${sequence}`, sequence,
+      contentObjectId: `error-object-${sequence}`, partByteLength: 100,
+      outputItem: { id: `error-item-${sequence}`, ordinal: sequence - 1, providerResponseId: 'error-response' } };
+  });
+  const pageKey = 'message-content-items:index-error:tail';
+  feed.messageContentWindows['message-a'] = { indexRevisionId: 'index-error', followTail: true, currentPageKey: pageKey, pages: [{
+    key: pageKey, indexRevisionId: 'index-error', totalItems: 96, totalBytes: 9600, items
+  }] };
+  feed.messageContentItemOwners[pageKey] = 'message-a';
+  const body = item => ({ role: 'model', parts: [{ text: `body-${item.sequence}`, outputItem: item.outputItem }] });
+  for (const item of items.slice(0, -1)) feed.details[`message-content-item:${item.contentObjectId}`] = ready(JSON.stringify(body(item)));
+  feed.hydrateMessageContentWindow('message-a');
+  const failed = Object.entries(feed.pendingDetails).find(([, request]) => request.recordId === 'error-object-96');
+  failed[1].retryCount = 3;
+  feed.failDetailRequest(failed[0], 'item body read failed');
+  const { useReliableConversation } = await ui.load('composables/useReliableConversation.ts');
+  const view = h.scope.run(() => useReliableConversation());
+  const state = view.projection.value.contentWindowByMessageId['message-a'];
+  assert.equal(state.loading, false); assert.equal(state.error, 'item body read failed'); assert.equal(state.canRetry, true);
+  const messageItem = (await ui.load('components/conversation/MessageItem.vue')).default;
+  const html = (await h.render(messageItem, { message: view.projection.value.messages[0], contentWindow: state })).html;
+  assert.match(html, /role="alert"[^>]*>item body read failed/);
+  assert.match(html, /<button(?![^>]*disabled)[^>]*>显示前面的内容<\/button>/);
+  assert.match(html, /重试读取内容/);
+  feed.retryMessageContentWindow('message-a');
+  const retry = Object.entries(feed.pendingDetails).find(([, request]) => request.recordId === 'error-object-96');
+  assert.ok(retry); assert.notEqual(retry[0], failed[0]);
+  const bytes = Buffer.from(JSON.stringify(body(items.at(-1))));
+  feed.observeDetailResult({ sessionId: feed.sessionId, requestId: retry[0], detail: { recordId: retry[1].recordId,
+    offset: 0, totalBytes: bytes.length, chunk: bytes.toString('base64'), hasMore: false } });
+  assert.equal(view.projection.value.contentWindowByMessageId['message-a'].error, undefined);
+  assert.equal(view.projection.value.messages[0].content.parts.at(-1).text, 'body-96');
+  feed.moveMessageContentWindow('message-a', 'before');
+  assert.ok(Object.values(feed.pendingDetails).some(request => request.kind === 'message-content-items' && request.itemAfterSequence === 32));
+});
+
+test('原生内容：连续index修订释放被替代metadata请求和owner，迟到响应不恢复旧详情', t => {
+  const h = ui.stores(t), feed = h.feed;
+  const replies = [];
+  for (let revision = 1; revision <= 40; revision += 1) {
+    feed.committedRecords = { Message: { m: { id: 'm', conversation_id: h.conversationId, role: 'model',
+      revision_id: `index-${revision}`, item_index_revision_id: `index-${revision}` } } };
+    feed.ensureMessageContent('m');
+    const requests = Object.entries(feed.pendingDetails).filter(([, request]) => request.kind === 'message-content-items');
+    assert.equal(requests.length, 1); assert.equal(Object.keys(feed.messageContentItemOwners).length, 1);
+    replies.push(requests[0]);
+  }
+  const text = JSON.stringify({ totalItems: 1, totalBytes: 100, items: [{ id: 'latest-revision', revisionId: 'latest-revision',
+    sequence: 1, contentObjectId: 'latest-object', partByteLength: 100,
+    outputItem: { id: 'latest-item', ordinal: 0, providerResponseId: 'latest-response' } }] });
+  for (const [requestId, request] of replies) feed.observeDetailResult({ sessionId: feed.sessionId, requestId,
+    detail: { recordId: request.recordId, offset: 0, totalBytes: Buffer.byteLength(text), chunk: Buffer.from(text).toString('base64'), hasMore: false } });
+  assert.equal(feed.messageContentWindows.m.pages.length, 1);
+  assert.equal(Object.keys(feed.messageContentItemOwners).length, 1);
+  assert.equal(feed.detailOwnerKeys['message-content-window:m'].length, 2);
+  assert.deepEqual(Object.keys(feed.details).filter(key => key.startsWith('message-content-items:')), ['message-content-items:index-40:tail']);
+});
+
+test('原生内容：sealed done使用确切committedPart，恢复marker缺正文不会重建旧累计', async t => {
+  const h = ui.stores(t), feed = h.feed;
+  feed.observe({ type: 'reliable-kernel.snapshot', sessionId: 'marker-session', hostBootId: 'marker-host', messageSeq: '1', snapshotCommitSeq: '1',
+    projections: { activeConversationWindow: { conversationId: 'marker-conversation' } } });
+  const outputItem = { id: 'same-id', ordinal: 0, providerResponseId: 'response-new', previousResponseId: 'response-old' };
+  const event = (sequence, kind, content) => ({ type: 'reliable-kernel.transient', sessionId: feed.sessionId, hostBootId: feed.hostBootId,
+    conversationId: 'marker-conversation', turnId: 'marker-turn', modelRequestId: 'marker-request', requestSeq: '1',
+    providerId: 'provider', modelId: 'model', attemptSeq: '1', socketGeneration: '1', afterCommitSeq: '1', observedAt: '2026-10-13T00:00:00Z',
+    fromStreamSeq: String(sequence), event: { kind, streamSeq: String(sequence), content } });
+  feed.observe(event(1, 'output_delta', { type: 'text_delta', text: 'draft', outputItem }));
+  feed.observe(event(2, 'output_item_done', { type: 'output_item_done', committedRevisionId: 'sealed-revision', committedContentObjectId: 'sealed-object', outputItem,
+    committedPart: { text: 'exact committed text', outputItem } }));
+  assert.equal(JSON.parse(feed.details['message-content-item:sealed-object'].text).parts[0].text, 'exact committed text');
+  assert.equal(feed.transientModelRequests['marker-request'].outputParts[0].text, 'exact committed text');
+  const marker = event(3, 'output_item_done', { type: 'output_item_done', committedRevisionId: 'sealed-revision', committedContentObjectId: 'sealed-object', outputItem });
+  feed.observe({ ...marker, type: 'reliable-kernel.transient-snapshot', deliveryId: 'marker-recovery', headStreamSeq: '3', events: [marker] });
+  assert.equal(feed.transientModelRequests['marker-request'].outputParts.length, 0);
+  assert.equal(feed.transientModelRequests['marker-request'].streamSeq, '3');
+  assert.equal(feed.details['message-content-item:sealed-object'], undefined);
+  for (let sequence = 4; sequence <= 103; sequence++) {
+    const item = { id: `handoff-${sequence}`, ordinal: sequence, providerResponseId: 'handoff-response' };
+    feed.observe(event(sequence, 'output_item_done', { type: 'output_item_done', outputItem: item,
+      committedRevisionId: `handoff-revision-${sequence}`, committedContentObjectId: `handoff-object-${sequence}`,
+      committedPart: { text: `${sequence}:` + 'x'.repeat(2048), outputItem: item } }));
+    assert.ok(feed.transientModelRequests['marker-request'].outputParts.length <= 32);
+    assert.ok((feed.detailOwnerKeys['native-handoff:marker-request'] ?? []).length <= 32);
+  }
+  assert.equal(feed.details['message-content-item:handoff-object-4'], undefined);
+  assert.equal(Object.keys(feed.details).filter(key => key.startsWith('message-content-item:')).length, 32);
+  feed.observe(event(104, 'completed', { type: 'native_completed' }));
+  assert.equal(feed.transientModelRequests['marker-request'].status, 'completed');
+  assert.equal(feed.transientModelRequests['marker-request'].completedContent, undefined);
+  const { appendReliableTransientTextPart } = await ui.load('domain/reliableTransientOutput.ts');
+  const twoResponses = appendReliableTransientTextPart([{ text: 'old response', outputItem: { ...outputItem, providerResponseId: 'response-old', previousResponseId: undefined } }],
+    { text: 'new response', thought: false, outputItem });
+  assert.deepEqual(twoResponses.map(part => part.text), ['old response', 'new response']);
+});
+
+test('显示：单消息已完成render nodes稳定，变动尾块保留原key', async () => {
+  const { RichRenderNodeProjector } = await ui.load('components/content/partRegistry.ts');
+  const projector = new RichRenderNodeProjector();
+  const parts = Array.from({ length: 120 }, (_, index) => ({ text: `block-${index}`, outputItem: { id: `block-${index}`, ordinal: index, providerResponseId: 'render-response' } }));
+  const before = projector.project(parts);
+  const after = projector.project([...parts.slice(0, -1), { ...parts.at(-1), text: 'tail continued' }]);
+  assert.equal(before.length, 120); assert.ok(before.slice(0, -1).every((node, index) => node === after[index]));
+  assert.equal(before.at(-1).key, after.at(-1).key); assert.equal(after.at(-1).props.text, 'tail continued');
+});
+
+test('原生内容：metadata预取耗尽后翻页显示错误，明确重试恢复页面和正文', async t => {
+  const h = ui.stores(t), feed = h.feed, records = nativeShellRecords('terminal');
+  records.ModelRequest['request-a'].terminal_state = 'completed';
+  records.Message['message-a'] = { ...records.Message['message-a'], revision_id: 'index-prefetch-error', item_index_revision_id: 'index-prefetch-error' };
+  feed.records = records; feed.committedRecords = records;
+  feed.projections = { activeConversationWindow: { conversationId: 'conversation-a' } };
+  const { useReliableConversation } = await ui.load('composables/useReliableConversation.ts');
+  const view = h.scope.run(() => useReliableConversation());
+  const part = sequence => ({ text: `prefetch-body-${sequence}`, outputItem: {
+    id: `prefetch-item-${sequence}`, ordinal: sequence - 1, providerResponseId: 'prefetch-response'
+  } });
+  const items = first => Array.from({ length: 32 }, (_, index) => {
+    const sequence = first + index, value = part(sequence);
+    return { id: `prefetch-revision-${sequence}`, revisionId: `prefetch-revision-${sequence}`, sequence,
+      contentObjectId: `prefetch-object-${sequence}`, partByteLength: Buffer.byteLength(JSON.stringify(value)), outputItem: value.outputItem };
+  });
+  const reply = ([requestId, request], value) => {
+    const bytes = Buffer.from(JSON.stringify(value));
+    feed.observeDetailResult({ sessionId: feed.sessionId, requestId, detail: { recordId: request.recordId,
+      offset: 0, totalBytes: bytes.length, chunk: bytes.toString('base64'), hasMore: false } });
+  };
+  for (const item of items(65)) feed.details[`message-content-item:${item.contentObjectId}`] = ready(JSON.stringify({ role: 'model', parts: [part(item.sequence)] }));
+  feed.ensureMessageContent('message-a');
+  const tail = Object.entries(feed.pendingDetails).find(([, request]) => request.kind === 'message-content-items');
+  reply(tail, { totalItems: 96, totalBytes: 9600, items: items(65) });
+  const prefetch = Object.entries(feed.pendingDetails).find(([, request]) => request.kind === 'message-content-items' && request.itemAfterSequence === 32);
+  assert.ok(prefetch); prefetch[1].retryCount = 3;
+  feed.failDetailRequest(prefetch[0], 'metadata prefetch retries exhausted');
+  feed.moveMessageContentWindow('message-a', 'before');
+  const failed = view.projection.value.contentWindowByMessageId['message-a'];
+  assert.equal(failed.loading, false); assert.equal(failed.error, 'metadata prefetch retries exhausted'); assert.equal(failed.canRetry, true);
+  const messageItem = (await ui.load('components/conversation/MessageItem.vue')).default;
+  const failedHtml = (await h.render(messageItem, { message: view.projection.value.messages[0], contentWindow: failed })).html;
+  assert.match(failedHtml, /role="alert"[^>]*>metadata prefetch retries exhausted/);
+  assert.match(failedHtml, /<button(?![^>]*disabled)[^>]*>显示前面的内容<\/button>/);
+  assert.match(failedHtml, /重试读取内容/);
+  feed.retryMessageContentWindow('message-a');
+  const retry = Object.entries(feed.pendingDetails).find(([, request]) => request.kind === 'message-content-items' && request.itemAfterSequence === 32);
+  assert.ok(retry); assert.notEqual(retry[0], prefetch[0]);
+  assert.equal(view.projection.value.contentWindowByMessageId['message-a'].loading, true);
+  reply(retry, { totalItems: 96, totalBytes: 9600, items: items(33), nextSequence: 64 });
+  for (const pending of Object.entries(feed.pendingDetails).filter(([, request]) => request.kind === 'message-content-item')) {
+    reply(pending, { role: 'model', parts: [part(Number(pending[1].recordId.slice('prefetch-object-'.length)))] });
+  }
+  const restored = view.projection.value.contentWindowByMessageId['message-a'];
+  assert.equal(restored.firstSequence, 33); assert.equal(restored.loading, false); assert.equal(restored.error, undefined); assert.ok(!restored.canRetry);
+  assert.equal(view.projection.value.messages[0].content.parts[0].text, 'prefetch-body-33');
+});
+
+test('原生内容：metadata自动重试跟随详情loading，成功后清除界面旧错误', async t => {
+  const h = ui.stores(t), feed = h.feed, records = nativeShellRecords('terminal');
+  records.ModelRequest['request-a'].terminal_state = 'completed';
+  records.Message['message-a'] = { ...records.Message['message-a'], revision_id: 'index-auto-retry', item_index_revision_id: 'index-auto-retry' };
+  feed.records = records; feed.committedRecords = records;
+  feed.projections = { activeConversationWindow: { conversationId: 'conversation-a' } };
+  const { useReliableConversation } = await ui.load('composables/useReliableConversation.ts');
+  const messageItem = (await ui.load('components/conversation/MessageItem.vue')).default;
+  const view = h.scope.run(() => useReliableConversation());
+  const reply = ([requestId, request], value) => {
+    const bytes = Buffer.from(JSON.stringify(value));
+    feed.observeDetailResult({ sessionId: feed.sessionId, requestId, detail: { recordId: request.recordId,
+      offset: 0, totalBytes: bytes.length, chunk: bytes.toString('base64'), hasMore: false } });
+  };
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    feed.ensureMessageContent('message-a');
+    const first = Object.entries(feed.pendingDetails).find(([, request]) => request.kind === 'message-content-items');
+    feed.failDetailRequest(first[0], 'transient metadata failure');
+    const failed = view.projection.value.contentWindowByMessageId['message-a'];
+    assert.equal(failed.loading, false); assert.equal(failed.error, 'transient metadata failure'); assert.equal(failed.canRetry, true);
+    t.mock.timers.tick(250);
+    const retry = Object.entries(feed.pendingDetails).find(([, request]) => request.kind === 'message-content-items');
+    assert.ok(retry); assert.notEqual(retry[0], first[0]);
+    const loading = view.projection.value.contentWindowByMessageId['message-a'];
+    assert.equal(loading.loading, true); assert.equal(loading.error, undefined); assert.ok(!loading.canRetry);
+    const part = { text: 'metadata automatic retry recovered', outputItem: { id: 'auto-retry-item', ordinal: 0, providerResponseId: 'auto-retry-response' } };
+    reply(retry, { totalItems: 1, totalBytes: 100, items: [{ id: 'auto-retry-revision', revisionId: 'auto-retry-revision', sequence: 1,
+      contentObjectId: 'auto-retry-object', partByteLength: Buffer.byteLength(JSON.stringify(part)), outputItem: part.outputItem }] });
+    const body = Object.entries(feed.pendingDetails).find(([, request]) => request.kind === 'message-content-item');
+    assert.ok(body); reply(body, { role: 'model', parts: [part] });
+    const restored = view.projection.value.contentWindowByMessageId['message-a'];
+    assert.equal(restored.loading, false); assert.equal(restored.error, undefined); assert.ok(!restored.canRetry);
+    assert.equal(view.projection.value.messages[0].content.parts[0].text, part.text);
+    const html = (await h.render(messageItem, { message: view.projection.value.messages[0], contentWindow: restored })).html;
+    assert.doesNotMatch(html, /transient metadata failure|重试读取内容/);
+  } finally { t.mock.timers.reset(); }
 });

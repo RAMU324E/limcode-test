@@ -17,7 +17,7 @@ const { ReliableChildAgentCoordinator } = load('backend/reliableKernel/childAgen
 export const policy = overrides => ({ id: 'child-tools', allowedTools: ['read', 'write', 'skills', 'run_agent'], preset: 'custom', toolConfigs: {}, sourceConfigs: {}, ...overrides });
 
 /** One real Runtime/worker for the suite; each case owns separate durable conversation identities. */
-export async function openChildFixture() {
+export async function openChildFixture({ holdRuntimeConvergence = false } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-child-suite-'));
   let elapsed = 0, sequence = 0, preparationMs = 0;
   const base = Date.parse('2001-01-01T00:00:00.000Z');
@@ -42,6 +42,7 @@ export async function openChildFixture() {
   await kernel.initializeEmptyRuntimeRoot(root);
   const app = await kernel.ReliableKernelApplication.open(root, {
     now,
+    holdRuntimeConvergence,
     authorityCompiler: { async compile(request) {
       compileRequests.push(structuredClone(request));
       if (request.executorAgentId === 'child-agent') elapsed += preparationMs;
@@ -105,6 +106,7 @@ export function taskToolsFixture() {
     effects: { async settleWithoutEffect(input) { return { status: input.status, terminal: { status: input.status, detail: input.detail } }; } },
     children: { async spawn(input) { events.spawns.push(input); assert.fail('readonly spawned work'); },
       async readConversationTaskProjection() { observed.resolve(); return { conversationId: 'parent', snapshotCommitSeq: '1', tasks: [task] }; },
+      async readConversationTaskList(_conversationId, options) { observed.resolve(); return kernel.listConversationChildTasks({ conversationId: 'parent', snapshotCommitSeq: '1', tasks: [task] }, options); },
       async send(input) { events.sends.push(input); assert.fail('readonly sent work'); } }
   });
   coordinator.triggerRecoveryPass = () => {};

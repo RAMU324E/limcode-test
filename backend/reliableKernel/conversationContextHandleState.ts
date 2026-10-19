@@ -2,10 +2,10 @@ import { CONTEXT_HANDLE_STATE_CONTENT_TYPE, readFrozenContextHandleCatalogBase,
   rememberFrozenContextHandleCatalogBase } from './frozenModelHandleCatalog';
 export { CONTEXT_HANDLE_STATE_CONTENT_TYPE } from './frozenModelHandleCatalog';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
-import { preparedContentObjectSteps } from './contentObjectTransaction';
+import { prepareStoredHandleCatalog, storedHandleCatalog, type StoredHandleCatalog } from './contextHandleCatalogStorage';
 import { CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION, isPersistentContextHandle,
   mergeModelHandleCatalogs, normalizeModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
-import { canonicalPlainJson, normalizePlainJson } from './plainJson';
+import { normalizePlainJson } from './plainJson';
 import { stablePhaseFId, isTransactionAssertionFailure } from './phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
 import type { RuntimeDatabase } from './runtimeDatabase';
@@ -16,7 +16,6 @@ import { listAllDomainRows } from './repositoryPagination';
 
 export const CONTEXT_HANDLE_STATE_DOMAIN = 'ConversationContextHandleState';
 export const CONTEXT_ROOT_HANDLE_CATALOG_DOMAIN = 'ContextRootHandleCatalog';
-const STATE_KIND = 'conversation-context-handle-state';
 
 export interface CurrentContextHandleState {
   row: DomainRow;
@@ -97,13 +96,16 @@ export async function readContextRootHandleCatalogRow(database: RuntimeDatabase,
 }
 
 async function contextRootCatalogSnapshotSteps(database: RuntimeDatabase, conversationId: string,
-  contextRootId: string, contentObjectId: string | null, now: string, provenanceRevision = 0n, rootShape?: ContextHandleRootShape): Promise<RepositoryTransactionStep[]> {
+  contextRootId: string, contentObjectId: string | null, now: string, provenanceRevision = 0n,
+  rootShape?: ContextHandleRootShape, knownNewRoot = false): Promise<RepositoryTransactionStep[]> {
   const repository = DOMAIN_REPOSITORIES.domain(CONTEXT_ROOT_HANDLE_CATALOG_DOMAIN);
-  const existing = await readContextRootHandleCatalogRow(database, conversationId, contextRootId, provenanceRevision);
-  if (existing) {
-    if (existing.content_object_id !== contentObjectId) throw stateError('An immutable Context root catalog cannot be rebound.');
-    return [repository.assert(String(existing.id), { conversation_id: conversationId,
-      context_root_id: contextRootId, provenance_revision: provenanceRevision, content_object_id: contentObjectId })];
+  if (!knownNewRoot) {
+    const existing = await readContextRootHandleCatalogRow(database, conversationId, contextRootId, provenanceRevision);
+    if (existing) {
+      if (existing.content_object_id !== contentObjectId) throw stateError('An immutable Context root catalog cannot be rebound.');
+      return [repository.assert(String(existing.id), { conversation_id: conversationId,
+        context_root_id: contextRootId, provenance_revision: provenanceRevision, content_object_id: contentObjectId })];
+    }
   }
   const shape = rootShape ?? await readRootShape(database, conversationId, contextRootId);
   return [repository.assertNone({ conversation_id: conversationId, context_root_id: contextRootId, provenance_revision: provenanceRevision }),
@@ -123,6 +125,8 @@ export async function prepareContextHandleHeadTransition(input: {
   /** Retained original chain, excluding an edited user occurrence appended after truncation. */
   compressedPrefix?: { nodeId: string | null; tailSegmentCount: bigint };
   occurrence?: ContextHandleOccurrenceEvidence; occurrences?: readonly ContextHandleOccurrenceEvidence[];
+  /** Roots planned by one atomic append batch are known absent until its commit. */
+  knownNewRootIds?: ReadonlySet<string>;
   current?: DomainRow;
 }): Promise<ContextHandleHeadTransitionPlan> {
   const current = input.current ?? await readConversationContextHandleStateRow(input.database, input.conversationId);
@@ -197,13 +201,15 @@ export async function prepareContextHandleHeadTransition(input: {
       catalog = mergeModelHandleCatalogs(catalog, additions);
     }
     if (!sameCatalog(original, catalog)) {
-      const prepared = await prepareCatalogContent(input.database, input.contentStore, input.conversationId, catalog);
+      const prepared = await prepareCatalogContent(input.database, input.contentStore, input.conversationId, catalog,
+        storedHandleCatalog(input.database, input.contentStore, original));
       contentObjectId = prepared.contentObjectId;
       steps.push(...prepared.steps);
     }
   }
   if (baseReady) steps.push(...await contextRootCatalogSnapshotSteps(input.database, input.conversationId,
-    input.nextRootId, contentObjectId, input.now, provenanceRevision, input.rootShape));
+    input.nextRootId, contentObjectId, input.now, provenanceRevision, input.rootShape,
+    input.knownNewRootIds?.has(input.nextRootId) === true));
   if (!activate) return { state: current, steps };
   const state = { ...current, context_root_id: input.nextRootId, revision: revision(current) + 1n,
     state: baseReady ? 'ready' : 'pending', content_object_id: baseReady ? contentObjectId : null,
@@ -259,7 +265,7 @@ async function prepareCompressedPrefixCatalog(database: RuntimeDatabase, store: 
     { kind: 'compression', content: await store.read(metadata as unknown as ContentObjectMetadata) }, lookup);
   const catalog = mergeModelHandleCatalogs(base, additions);
   const content = sameCatalog(base, catalog) ? { contentObjectId: prefix.content_object_id as string | null, steps: [] }
-    : await prepareCatalogContent(database, store, conversationId, catalog);
+    : await prepareCatalogContent(database, store, conversationId, catalog, storedHandleCatalog(database, store, base));
   return { contentObjectId: content.contentObjectId, steps: [
     ...[prefix, compressedCatalog].map(row => DOMAIN_REPOSITORIES.domain(CONTEXT_ROOT_HANDLE_CATALOG_DOMAIN)
       .assert(String(row.id), { conversation_id: conversationId, provenance_revision: provenanceRevision,
@@ -358,7 +364,7 @@ async function readReadyStateRow(database: RuntimeDatabase, store: ContentAddres
     return { row, catalog: emptyContextHandleCatalog(), requiresNativeReset: BigInt(String(row.requires_native_reset)) > 0n };
   }
   const catalog = await readFrozenContextHandleCatalogBase(database, store, String(row.content_object_id), conversationId);
-  return { row, catalog: normalizeModelHandleCatalog(catalog), requiresNativeReset: BigInt(String(row.requires_native_reset)) > 0n };
+  return { row, catalog, requiresNativeReset: BigInt(String(row.requires_native_reset)) > 0n };
 }
 
 export async function readContextHandleStateContent(database: RuntimeDatabase, store: ContentAddressedStore,
@@ -380,8 +386,9 @@ export async function prepareConversationContextHandleUpdate(input: {
   contextRootId?: string;
   baseContentObjectId?: unknown;
   scope?: unknown;
+  current?: CurrentContextHandleState;
 }): Promise<RepositoryTransactionStep[]> {
-  const current = await readCurrentConversationContextHandleState(input.database, input.contentStore, input.conversationId);
+  const current = input.current ?? await readCurrentConversationContextHandleState(input.database, input.contentStore, input.conversationId);
   const incoming = persistentContextHandleCatalog(input.catalog);
   if (input.baseContentObjectId !== undefined && input.baseContentObjectId !== current.row.content_object_id) {
     throw frontierChanged();
@@ -439,16 +446,15 @@ export async function prepareReadyConversationContextHandleState(input: {
 }
 
 async function prepareCatalogContent(database: RuntimeDatabase, contentStore: ContentAddressedStore,
-  conversationId: string, catalog: ModelHandleCatalog): Promise<{ contentObjectId: string; steps: RepositoryTransactionStep[] }> {
-  const payload = { kind: STATE_KIND, conversationId, catalog };
-  const content = await contentStore.prepare(database,
-    canonicalPlainJson(normalizePlainJson(payload, 'Current Context reference state')), CONTEXT_HANDLE_STATE_CONTENT_TYPE);
-  rememberFrozenContextHandleCatalogBase(database, contentStore, content.metadata, conversationId, catalog);
-  return { contentObjectId: content.metadata.id, steps: preparedContentObjectSteps([content], 'conversation_context_handle_state') };
+  conversationId: string, catalog: ModelHandleCatalog, base?: StoredHandleCatalog): Promise<{ contentObjectId: string; steps: RepositoryTransactionStep[] }> {
+  const content = await prepareStoredHandleCatalog({ database, contentStore, conversationId, catalog, base, kind: 'context' });
+  rememberFrozenContextHandleCatalogBase(database, contentStore, content.stored.metadata, conversationId, content.stored.catalog);
+  return { contentObjectId: content.stored.metadata.id, steps: content.steps };
 }
 
 export function persistentContextHandleCatalog(value: unknown): ModelHandleCatalog {
   const catalog = normalizeModelHandleCatalog(value);
+  if (catalog.entries.every(entry => isPersistentContextHandle(entry.kind))) return catalog;
   return { ...catalog, entries: catalog.entries.filter(entry => isPersistentContextHandle(entry.kind)) };
 }
 

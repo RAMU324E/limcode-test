@@ -11,16 +11,37 @@ export function normalizeCollaborationHistoryCursor(value: unknown): ReliableKer
     return result;
   };
   if (cursor.kind === 'exchange') {
-    if (Object.keys(cursor).some(key => !['kind', 'beforeExchangeSeq'].includes(key))) throw new TypeError('Invalid exchange cursor fields.');
-    return { kind: 'exchange', ...(cursor.beforeExchangeSeq === undefined ? {} : { beforeExchangeSeq: sequence(cursor.beforeExchangeSeq) }) };
+    if (Object.keys(cursor).some(key => !['kind', 'beforeExchangeSeq', 'afterExchangeSeq'].includes(key))
+      || cursor.beforeExchangeSeq !== undefined && cursor.afterExchangeSeq !== undefined) throw new TypeError('Invalid exchange cursor fields.');
+    return { kind: 'exchange',
+      ...(cursor.beforeExchangeSeq === undefined ? {} : { beforeExchangeSeq: sequence(cursor.beforeExchangeSeq) }),
+      ...(cursor.afterExchangeSeq === undefined ? {} : { afterExchangeSeq: sequence(cursor.afterExchangeSeq) }) };
   }
   if (cursor.kind !== 'message' && cursor.kind !== 'answer') throw new TypeError('Invalid exchange history cursor kind.');
-  const key = cursor.kind === 'message' ? 'beforeMessageSeq' : 'beforeCreatedAt';
-  if (Object.keys(cursor).some(field => !['kind', key, 'beforeId'].includes(field))
-    || (cursor[key] === undefined) !== (cursor.beforeId === undefined)) throw new TypeError('Incomplete exchange history cursor.');
-  if (cursor.beforeId === undefined) return { kind: cursor.kind };
-  const beforeId = requireRuntimeId(cursor.beforeId);
-  if (cursor.kind === 'message') return { kind: 'message', beforeMessageSeq: sequence(cursor.beforeMessageSeq), beforeId };
-  if (typeof cursor.beforeCreatedAt !== 'string' || !Number.isFinite(Date.parse(cursor.beforeCreatedAt))) throw new TypeError('Invalid answer inventory cursor.');
-  return { kind: 'answer', beforeCreatedAt: cursor.beforeCreatedAt, beforeId };
+  const beforeKey = cursor.kind === 'message' ? 'beforeMessageSeq' : 'beforeCreatedAt';
+  const afterKey = cursor.kind === 'message' ? 'afterMessageSeq' : 'afterCreatedAt';
+  if (Object.keys(cursor).some(field => !['kind', beforeKey, afterKey, 'beforeId', 'afterId'].includes(field))
+    || (cursor[beforeKey] === undefined) !== (cursor.beforeId === undefined)
+    || (cursor[afterKey] === undefined) !== (cursor.afterId === undefined)
+    || cursor.beforeId !== undefined && cursor.afterId !== undefined) throw new TypeError('Incomplete exchange history cursor.');
+  const after = cursor.afterId !== undefined;
+  const rawId = after ? cursor.afterId : cursor.beforeId;
+  if (rawId === undefined) return { kind: cursor.kind };
+  const id = requireRuntimeId(rawId);
+  const position = cursor[after ? afterKey : beforeKey];
+  if (cursor.kind === 'message') return { kind: 'message', ...(after
+    ? { afterMessageSeq: sequence(position), afterId: id } : { beforeMessageSeq: sequence(position), beforeId: id }) };
+  if (typeof position !== 'string' || !Number.isFinite(Date.parse(position))) throw new TypeError('Invalid answer inventory cursor.');
+  return { kind: 'answer', ...(after ? { afterCreatedAt: position, afterId: id } : { beforeCreatedAt: position, beforeId: id }) };
+}
+
+export function normalizeCollaborationHistoryDirection(value: unknown,
+  cursor?: ReliableKernelCollaborationHistoryCursor): 'before' | 'after' {
+  const direction = value ?? 'before';
+  if (direction !== 'before' && direction !== 'after') throw new TypeError('Invalid collaboration history direction.');
+  const opposite = direction === 'before' ? 'after' : 'before';
+  if (cursor && Object.keys(cursor).some(key => key.startsWith(opposite))) {
+    throw new TypeError('Collaboration history cursor does not match its requested direction.');
+  }
+  return direction;
 }

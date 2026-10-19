@@ -19,6 +19,7 @@ function fixture(shared = { tables: new Map(), contents: new Map(), contentIds: 
   const database = {
     conversationOwners: { async run(_id, run) { return run(); } },
     async withHistoryPreparation(run, options = {}) { return run({ assertActive() { options.signal?.throwIfAborted(); } }); },
+    async assertUsableBinding() { return {}; },
     async snapshot(reads) { metrics.queries.push(...reads); return { snapshot: reads.map(read => read.kind === 'get'
       ? structuredClone(table(read.domain).find(row => row.id === read.id) ?? null) : structuredClone(selected(read).slice(0, read.limit ?? Infinity))) }; },
     async snapshotAll(read) { metrics.queries.push(read); return { snapshot: structuredClone(selected(read)) }; },

@@ -5,23 +5,25 @@ import type { DomainRow } from './repositories';
 export interface TimelineWindow { receives: DomainRow[]; sends: DomainRow[]; oldestSequence?: string; hasMore: boolean }
 
 /** Two indexed suffix seeks; every accepted event remains independently pageable at one cut. */
-export function readTimelineWindow(database: Database.Database, conversationId: string, limit: number, before?: bigint): TimelineWindow {
+export function readTimelineWindow(database: Database.Database, conversationId: string, limit: number,
+  boundary?: bigint, direction: 'before' | 'after' = 'before'): TimelineWindow {
+  const before = direction === 'before';
   const read = (table: string) => (prepareCached(database, `
     SELECT * FROM ${table} WHERE conversation_id = @conversationId
-      ${before === undefined ? '' : 'AND exchange_seq < @before'}
-     ORDER BY exchange_seq DESC LIMIT @limit
-  `).all({ conversationId, limit: BigInt(limit + 1), ...(before === undefined ? {} : { before }) }) as DomainRow[])
+      ${boundary === undefined ? '' : `AND exchange_seq ${before ? '<' : '>'} @boundary`}
+     ORDER BY exchange_seq ${before ? 'DESC' : 'ASC'} LIMIT @limit
+  `).all({ conversationId, limit: BigInt(limit + 1), ...(boundary === undefined ? {} : { boundary }) }) as DomainRow[])
     .map(row => projectTimelineLinkRecord(database, table === 'runtime_delivery_timeline_link' ? 'RuntimeDeliveryTimelineLink' : 'CollaborationSendTimelineLink', row));
   const all = [...read('runtime_delivery_timeline_link').map(row => ({ kind: 'receive', row })),
     ...read('collaboration_send_timeline_link').map(row => ({ kind: 'send', row }))]
-    .sort((left, right) => BigInt(String(left.row.exchange_seq)) > BigInt(String(right.row.exchange_seq)) ? -1 : 1);
+    .sort((left, right) => (BigInt(String(left.row.exchange_seq)) > BigInt(String(right.row.exchange_seq)) ? -1 : 1) * (before ? 1 : -1));
   for (let index = 1; index < all.length; index += 1) {
     if (all[index].row.exchange_seq === all[index - 1].row.exchange_seq) throw new Error('Exchange timeline sequence collision.');
   }
   const selected = all.slice(0, limit);
   return { receives: selected.filter(item => item.kind === 'receive').map(item => item.row),
     sends: selected.filter(item => item.kind === 'send').map(item => item.row),
-    ...(selected.length ? { oldestSequence: String(selected[selected.length - 1].row.exchange_seq) } : {}),
+    ...(selected.length ? { oldestSequence: String(selected[before ? selected.length - 1 : 0].row.exchange_seq) } : {}),
     hasMore: all.length > limit };
 }
 

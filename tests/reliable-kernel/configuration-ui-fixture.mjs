@@ -16,6 +16,7 @@ const componentFiles = {
   Model: path.join(sourceRoot, 'components/settings/config/ModelProfileScopeEditor.vue'),
   Thinking: path.join(sourceRoot, 'components/input/SessionThinkingControl.vue'),
   Composer: path.join(sourceRoot, 'components/input/Composer.vue'),
+  RichEditor: path.join(sourceRoot, 'components/content/RichContentEditor.vue'),
   Tools: path.join(sourceRoot, 'components/settings/tools/ToolPolicyEditor.vue')
 };
 const testedComponents = new Set(Object.values(componentFiles));
@@ -114,9 +115,11 @@ export async function createConfigurationUiGraph() {
           app.provide(vue.ssrContextKey, { modules: new Set() });
           const instance = app.mount(root); apps.push(app);
           return { view: instance.$.setupState, root,
+            unmount() { app.unmount(); apps.splice(apps.indexOf(app), 1); },
             async setProps(next) { Object.assign(instance.$.props, next); await vue.nextTick(); }
           };
         },
+        receive(message) { for (const listener of listeners.get('message') ?? []) listener({ data: message }); },
         messagesOf(type) { return active.messages.filter(message => message.type === type); },
         last(type) { return f.messagesOf(type).at(-1); }
       };

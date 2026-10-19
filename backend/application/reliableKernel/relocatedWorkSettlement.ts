@@ -265,7 +265,7 @@ class RelocatedWorkSettlement {
     // notifies a stopped parent instead of continuing it.
     for (const conversation of conversations) await this.stopTopLevelTurns(conversation.conversationId);
     const listed = new Set(conversations.map((conversation) => conversation.conversationId));
-    await this.interruptChildren(listed);
+    await this.interruptChildren(listed, conversations.flatMap(conversation => conversation.childExecutionIds));
     for (const conversation of conversations) {
       await this.abandonPendingDeliveries(conversation.conversationId);
       await this.abandonUndeliveredAnswers(conversation);
@@ -534,12 +534,13 @@ class RelocatedWorkSettlement {
    * The lineage itself converges in the child scheduler's recovery, exactly as after a user's stop in
    * a window that does not run it.
    */
-  private async interruptChildren(listed: ReadonlySet<string>): Promise<void> {
+  private async interruptChildren(listed: ReadonlySet<string>, inventoriedChildren: readonly string[]): Promise<void> {
     const candidates = new Map<string, DomainRow>();
     for (const status of CHILD_RUNNING_STATUSES) {
       for (const child of await this.list('ChildExecution', { status })) candidates.set(String(child.id), child);
     }
     const linked = [
+      ...inventoriedChildren,
       ...(await this.list('ChildExecutionActiveTurnLink', {})).map((link) => String(link.child_execution_id)),
       ...(await this.list('ChildExecutionIntentLink', { state: 'pending' })).map((link) => String(link.child_execution_id))
     ];
@@ -687,6 +688,9 @@ class RelocatedWorkSettlement {
   }
 
   private async opensTurn(delivery: DomainRow): Promise<boolean> {
+    // An ACKed wake can already have queued a continuation. Explicit offline settlement must
+    // abandon its delivery even when that Intent has since been cancelled.
+    if ((await this.list('RuntimeDeliveryIntentLink', { delivery_id: String(delivery.id) })).length) return true;
     const inbox = await this.get('RuntimeInboxItem', String(delivery.inbox_item_id));
     if (inbox?.source_kind !== 'collaboration_message') return true;
     const message = await this.get('CollaborationMessage', String(inbox.source_id));

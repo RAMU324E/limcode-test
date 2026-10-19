@@ -35,6 +35,7 @@ import { sliceTextFile } from './textFileSlice';
 import { isPathInside } from './filesystem/pathContainment';
 import { realPath } from './filesystem/realPath';
 import { assertNotSqliteDatabaseFile } from './filesystem/sqliteDatabaseFileGuard';
+import { SYSTEM_TEMPORARY_WORK_ENVIRONMENT_ID, systemTemporaryDirectory } from './filesystem/systemTemporaryDirectory';
 import { buildFileDiffRecord, buildFileReplacementHunks } from './fileDiff';
 import { applyHunkEdit, applyInsertEdit, applyDeleteEdit } from './editStrategies';
 import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS, LIVE_DIFF_SCHEME } from '../../shared/extensionIdentity';
@@ -707,6 +708,9 @@ function allowedLocalRootUris(options: WorkEnvironmentCapabilityOptions): vscode
     if (!environment.available || !isLocalFolderWorkEnvironment(environment)) continue;
     add(currentLocalRootUriFromWorkEnvironment(environment, workspaceRoots));
   }
+  if (options.accessibleWorkEnvironments?.some(environment => environment.id === SYSTEM_TEMPORARY_WORK_ENVIRONMENT_ID)) {
+    add(vscode.Uri.file(systemTemporaryDirectory()));
+  }
 
   return roots;
 }
@@ -728,6 +732,7 @@ function currentLocalRootUriFromWorkEnvironment(
 ): vscode.Uri | undefined {
   const uri = localRootUriFromWorkEnvironment(environment);
   if (!uri) return undefined;
+  if (environment?.id === SYSTEM_TEMPORARY_WORK_ENVIRONMENT_ID) return uri;
   // localFolder 环境由 VS Code workspace folder 自动同步。这里在真正解析/校验路径时
   // 再读取当前 workspaceFolders，避免新增 root 依赖 ECS 同步时序，也避免已移除 root
   // 因旧的 workEnvironment 快照仍被当作可访问根目录。

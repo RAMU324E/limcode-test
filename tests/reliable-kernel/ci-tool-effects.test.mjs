@@ -354,7 +354,10 @@ test('TE09 nested workspace claims wait for live owners and recover their verifi
   }
 });
 
-test('TE10 approved physical edits recover the receipt gap and replay frozen results without another mutation', async () => {
+test('TE10 approved physical edits recover the receipt gap and replay frozen results without another mutation', async t => {
+  const coordination = await directory('durable-edit-coordination');
+  // Keep the real file mutation registry inside this test's temporary fixture.
+  t.mock.method(os, 'tmpdir', () => coordination);
   const root = await directory('durable-edit'), first = path.join(root, 'first'), second = path.join(root, 'second'), alias = path.join(root, 'alias');
   await fs.mkdir(first);
   await fs.mkdir(second);

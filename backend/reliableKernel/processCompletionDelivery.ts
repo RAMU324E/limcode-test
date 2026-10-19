@@ -16,7 +16,7 @@ import {
   stablePhaseFId
 } from './phaseFIdentity';
 import { ProcessControlPlane, type ProcessOutputReadResult } from './processEffects';
-import { deadLetterProcessCompletionDispatchSteps } from './deliverySettlementSteps';
+import { cancelIntentDeliverySteps, deadLetterProcessCompletionDispatchSteps } from './deliverySettlementSteps';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
@@ -344,7 +344,6 @@ export class ProcessCompletionDeliveryControlPlane {
     if (this.closing) return report;
     // Sweep facts that pre-date this pass. Facts created later by a failing reconciliation remain a
     // real crash boundary and are picked up by the next level-triggered pass.
-    report.wakesCreated += await this.ensureRecoverableDeliveryWakes();
     // Durable outbox rows stay host-agnostic, but only the target Conversation's owner may settle
     // or dispatch its mutable execution. Foreign rows are left pending untouched — never claimed,
     // never failed, never dead-lettered — so the owning Host's own level scan converges them.
@@ -357,6 +356,7 @@ export class ProcessCompletionDeliveryControlPlane {
     const awaitingTurn = new Set(this.deliveriesAwaitingTurn);
     this.deliveriesAwaitingTurn.clear();
     try {
+    report.wakesCreated += await this.ensureRecoverableDeliveryWakes(gate);
     const dispatches = [
       ...await listAllDomainRows(this.database, 'ProcessCompletionDispatch', { state: 'pending' }),
       ...await listAllDomainRows(this.database, 'ProcessCompletionDispatch', { state: 'claimed' })
@@ -817,7 +817,7 @@ export class ProcessCompletionDeliveryControlPlane {
     return { delivery, wake, deliveryCreated, wakeCreated };
   }
 
-  private async ensureRecoverableDeliveryWakes(): Promise<number> {
+  private async ensureRecoverableDeliveryWakes(gate: ConversationOwnershipGate): Promise<number> {
     const pending = await listAllDomainRows(this.database, 'RuntimeDelivery', { state: 'pending' });
     const unhandledLinks = await listAllDomainRows(this.database, 'RuntimeDeliveryInputLink', {
       handled_at: null
@@ -832,6 +832,7 @@ export class ProcessCompletionDeliveryControlPlane {
     }
     let created = 0;
     for (const delivery of byId.values()) {
+      if (await this.settleCancelledChildDelivery(delivery, gate)) continue;
       const inbox = await this.requireExisting(
         'RuntimeInboxItem',
         requirePhaseFId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id')
@@ -842,6 +843,29 @@ export class ProcessCompletionDeliveryControlPlane {
       if ((await this.ensureWakeForDelivery(delivery)).created) created += 1;
     }
     return created;
+  }
+
+  /** Old interrupted children may have ACKed the wake before cancelling its queued Intent. */
+  private async settleCancelledChildDelivery(delivery: DomainRow, gate: ConversationOwnershipGate): Promise<boolean> {
+    if (delivery.state !== 'pending' || delivery.target_turn_id !== null || delivery.phase !== 'next_turn') return false;
+    const [link] = await this.listRows('RuntimeDeliveryIntentLink', { delivery_id: delivery.id }, 1);
+    if (!link) return false;
+    const intent = await this.maybeGet('TurnIntent', String(link.turn_intent_id));
+    if (intent?.state !== 'cancelled' || intent.turn_id !== null) return false;
+    const [childLink] = await this.listRows('ChildExecutionIntentLink', { turn_intent_id: intent.id }, 1);
+    if (childLink?.state !== 'cancelled') return false;
+    const child = await this.maybeGet('ChildExecution', String(childLink.child_execution_id));
+    if (!child || !['interrupted', 'closed', 'needs_human'].includes(String(child.status))) return false;
+    const result = await gate.run(String(delivery.target_conversation_id), async () => {
+      const steps = await cancelIntentDeliverySteps(this.database, String(intent.id), 'child-continuation-cancelled', this.timestamp());
+      await this.database.transaction([
+        DOMAIN_REPOSITORIES.domain('TurnIntent').assert(String(intent.id), { state: 'cancelled', turn_id: null }),
+        DOMAIN_REPOSITORIES.domain('ChildExecutionIntentLink').assert(String(childLink.id), { state: 'cancelled' }),
+        DOMAIN_REPOSITORIES.domain('ChildExecution').assert(String(child.id), { status: child.status }),
+        ...steps
+      ]);
+    });
+    return result.ran;
   }
 
   private async ensureWakeForDelivery(

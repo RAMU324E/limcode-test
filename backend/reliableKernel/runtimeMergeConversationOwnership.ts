@@ -1,5 +1,11 @@
 import type Database from 'better-sqlite3';
 import { RUNTIME_DOMAIN_SCHEMA_BY_KEY, RUNTIME_DOMAIN_SCHEMAS } from './schema/domainManifest';
+import { CONTEXT_HANDLE_CATALOG_CONTENT_TYPE, CONTEXT_HANDLE_CATALOG_BLOCK_CONTENT_TYPE,
+  NATIVE_PRIVATE_HANDLE_CATALOG_CONTENT_TYPE, contextHandleCatalogReferences } from './contextHandleCatalogStorage';
+import { NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE, nativeToolCallProofReferences } from './nativeToolFacts';
+import { NATIVE_TOOL_RESULT_PROJECTION_CONTENT_TYPE, nativeToolResultProjectionReferences } from './conversationChildHandles';
+import { NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE, NATIVE_MESSAGE_BLOCK_CONTENT_TYPE,
+  parseNativeMessageComposition, parseNativeMessageBlock } from './logicalMessageContent';
 
 export type RuntimeMergeOwnershipCategory = 'conversation-owned' | 'member-shared' | 'cross-conversation' | 'child-tree' | 'content-derived';
 export interface RuntimeMergeOwnershipPath {
@@ -269,6 +275,26 @@ export function runtimeMergeRecipeContentReferences(recipe: unknown): ReadonlySe
     if (typeof id === 'string' && id.length) result.add(id);
   }
   return result;
+}
+
+/** Only contracted system descriptors contain CAS edges; user/tool JSON is never traversed. */
+export const RUNTIME_MERGE_SYSTEM_CONTENT_TYPES: readonly string[] = [
+  'application/vnd.limcode.model-request-recipe+json', CONTEXT_HANDLE_CATALOG_CONTENT_TYPE,
+  CONTEXT_HANDLE_CATALOG_BLOCK_CONTENT_TYPE, NATIVE_PRIVATE_HANDLE_CATALOG_CONTENT_TYPE,
+  NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE, NATIVE_TOOL_RESULT_PROJECTION_CONTENT_TYPE,
+  NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE, NATIVE_MESSAGE_BLOCK_CONTENT_TYPE
+];
+
+export function runtimeMergeSystemContentReferences(contentType: string, value: unknown): readonly string[] | undefined {
+  if (contentType === 'application/vnd.limcode.model-request-recipe+json') return [...runtimeMergeRecipeContentReferences(value)];
+  if (contentType === NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE) return [parseNativeMessageComposition(value).tailBlockContentObjectId];
+  if (contentType === NATIVE_MESSAGE_BLOCK_CONTENT_TYPE) {
+    const block = parseNativeMessageBlock(value);
+    return [...(block.previousBlockContentObjectId ? [block.previousBlockContentObjectId] : []),
+      ...block.items.map(item => item.contentObjectId)];
+  }
+  return contextHandleCatalogReferences(contentType, value) ?? nativeToolCallProofReferences(contentType, value)
+    ?? nativeToolResultProjectionReferences(contentType, value);
 }
 
 export interface RuntimeMergeOwnershipEdge {

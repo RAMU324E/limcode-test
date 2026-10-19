@@ -75,8 +75,31 @@ export class RuntimeMergeConversationExclusions {
     });
   }
 
-  public observeRecipe(domain: string, id: string, recipe: unknown): void {
-    for (const contentId of runtimeMergeRecipeContentReferences(recipe)) this.content.run(contentId, domain, id);
+  /** A descriptor's child is owned through its immutable parent CAS, including shared prefixes. */
+  public observeContentReferences(id: string, references: readonly string[]): void {
+    for (const referenced of references) this.content.run(referenced, 'ContentObject', id);
+  }
+
+  /** Defer attribution until all descriptor edges have reached this same exclusion graph. */
+  public contentProblem(id: string, code: string): void {
+    this.index.prepare(`INSERT OR IGNORE INTO temp.${NODES}(domain,id,code,count,visited)
+      VALUES ('ContentObject',?,?,0,1)`).run(id, code);
+  }
+
+  public async finishContentReferences(chunkRows = 250): Promise<void> {
+    const page = this.index.prepare(`SELECT id,code FROM temp.${NODES}
+      WHERE domain='ContentObject' AND code<>? AND id>? ORDER BY id LIMIT ?`);
+    let after = '';
+    for (;;) {
+      const rows = page.all(DELETED, after, chunkRows) as Array<{id: string; code: string}>;
+      if (!rows.length) return;
+      for (const row of rows) {
+        // All descriptor edges are now present; deleted-only content follows the same skip rule as CAS transfer.
+        if (this.requiredContent(row.id)) this.excludeContent(row.id, row.code);
+      }
+      after = rows[rows.length - 1].id;
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
   }
 
   public exclude(domain: string, row: RawRow, code: string): void {
@@ -91,6 +114,7 @@ export class RuntimeMergeConversationExclusions {
   private contentUsers(id: string): Iterable<{ domain: string; id: string }> {
     return this.pagedUsers(`WITH RECURSIVE users(domain,id) AS (
       SELECT domain,id FROM temp.${CONTENT} WHERE content_id=?
+      UNION SELECT c.domain,c.id FROM temp.${CONTENT} c JOIN users u ON u.domain='ContentObject' AND c.content_id=u.id
       UNION SELECT e.a_domain,e.a_id FROM temp.${CONTENT_EDGES} e JOIN users u ON e.b_domain=u.domain AND e.b_id=u.id
       UNION SELECT e.b_domain,e.b_id FROM temp.${CONTENT_EDGES} e JOIN users u ON e.a_domain=u.domain AND e.a_id=u.id
     ) SELECT domain,id FROM users WHERE domain NOT IN ('ContentObject','Attachment','AttachmentObservationLink','ProjectContext')`, [id]);

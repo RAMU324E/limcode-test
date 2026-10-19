@@ -123,6 +123,8 @@ export interface ModelStreamEventCommitInput {
   terminalFenceId: string | null;
   contentObject: DomainRow;
   contentInsert?: RepositoryInsertMutation;
+  /** Frozen native proof dependencies, registered with its existing checkpoint transaction. */
+  relatedContentObjects?: readonly import('./contentAddressedStore').PreparedContentObject[];
   usage: unknown | null;
   terminalStats: DomainRow | null;
   now: string;
@@ -196,19 +198,19 @@ export interface ClientKeysetPageResult {
   responseBytes: number;
 }
 
-export interface ClientVisibleMessageHistoryPageInput {
+export type ClientVisibleMessageHistoryPageInput = import('../../shared/reliableKernelClientFeed').ReliableKernelMessageHistoryCursor & {
   conversationId: string;
   limit: number;
-  /** Exclusive backward keyset cursor. Both cursor fields are always required. */
-  beforeMessageSeq: string;
-  beforeId: string;
-}
+};
 
 export interface ClientVisibleMessageHistoryPageResult {
   records: Record<string, DomainRow[]>;
   nextBeforeMessageSeq?: string;
   nextBeforeId?: string;
-  hasMore: boolean;
+  nextAfterMessageSeq?: string;
+  nextAfterId?: string;
+  hasMoreBefore: boolean;
+  hasMoreAfter: boolean;
   responseBytes: number;
 }
 
@@ -216,10 +218,15 @@ export interface ClientCollaborationHistoryPageInput {
   conversationId: string;
   limit: number;
   cursor?: ReliableKernelCollaborationHistoryCursor;
+  direction?: 'before' | 'after';
 }
 
 export interface ClientCollaborationHistoryPageResult {
   records: Record<string, DomainRow[]>;
+  nextBeforeCursor?: ReliableKernelCollaborationHistoryCursor;
+  nextAfterCursor?: ReliableKernelCollaborationHistoryCursor;
+  hasMoreBefore: boolean;
+  hasMoreAfter: boolean;
   nextCursor?: ReliableKernelCollaborationHistoryCursor;
   hasMore: boolean;
   scanProgress: boolean;
@@ -344,6 +351,10 @@ export type DatabaseWorkerRequestPayload =
   | { kind: 'nativePendingWork'; input: NativePendingWorkInput }
   | { kind: 'nativeSteeringInFlight'; conversationId: string }
   | { kind: 'nativeAdmittedProviderCallIds'; conversationId: string; segmentIds: string[] }
+  | { kind: 'activeModelRequests'; turnId: string }
+  | { kind: 'modelRequestStopCandidates'; turnId: string }
+  | { kind: 'currentConversationTurns'; conversationId: string; includeLatest: boolean }
+  | { kind: 'nativeSteeringReceipts'; scope: import('./conversationCurrentWorkSnapshot').NativeSteeringReceiptScope }
   | { kind: 'snapshot'; reads: RepositoryRead[] }
   | { kind: 'attachmentProjectionSegments'; conversationId: string; segmentIds: string[] }
   | { kind: 'attachmentProjectionLinks'; revisionIds: string[] }
@@ -351,7 +362,11 @@ export type DatabaseWorkerRequestPayload =
   | { kind: 'snapshotAll'; read: RepositoryListRead }
   | { kind: 'currentTurnTaskSnapshot'; turnId: string }
   | { kind: 'toolFactsSnapshot'; toolCallId: string }
-  | { kind: 'conversationChildTaskSnapshot'; conversationId: string }
+  | { kind: 'conversationChildTaskSnapshot'; conversationId: string; options?: import('./childTaskFactsSnapshot').ConversationChildTaskSnapshotOptions }
+  | { kind: 'childExecutionSnapshot'; childExecutionId: string }
+  | { kind: 'childExecutionList'; limit: number }
+  | { kind: 'childExecutionSubtreeSnapshot'; childExecutionId: string; includeDescendants: boolean }
+  | { kind: 'childContinuationWaitFacts'; input: import('./childExecutionFactsSnapshot').ChildContinuationWaitFactsInput }
   | { kind: 'contextHandleEvidenceFrontier'; conversationId: string }
   | { kind: 'selectedContextAuthoritySource'; input: SelectedContextAuthoritySourceInput }
   | { kind: 'processOutputRegistrationMismatches' }
@@ -459,7 +474,7 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
 
 export type DatabaseWorkerResponse =
   | { type: 'ready'; workerThreadId: number; mode: DatabaseWorkerData['mode'] }
-  | ({ type: 'response'; id: number; ok: true; result: SingleResponseMeasurement | SnapshotBarrier<CurrentTurnTaskSnapshot> | SnapshotBarrier<ContextHandleEvidenceFrontier> | SnapshotBarrier<SelectedContextAuthoritySource> | SnapshotBarrier<NativePendingToolCall[] | NativeSteeringInFlightEntry[] | string[]> | SnapshotBarrier<AttachmentProjectionSegmentSnapshot | AttachmentProjectionLinksSnapshot> | ExecutionLeaseRenewalResult | RuntimeHistoryRepairResult | MergeModelAggregate[] | RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ClientCollaborationHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | RuntimeContentUsageRow[] | RelocatedWorkInventory | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | RuntimeMaintenanceCommitResult | RuntimeMaintenanceRollbackResult | RuntimeWalCheckpointResult | boolean | string | null;
+  | ({ type: 'response'; id: number; ok: true; result: SnapshotBarrier<DomainRow[] | import('./conversationCurrentWorkSnapshot').CurrentConversationTurns | import('./conversationCurrentWorkSnapshot').NativeSteeringReceiptFacts | import('./modelRequestWorkSnapshot').ModelRequestStopCandidates | import('./childExecutionFactsSnapshot').ChildExecutionSnapshot | import('./childExecutionFactsSnapshot').ChildExecutionSnapshot[] | import('./childExecutionFactsSnapshot').ChildExecutionSubtreeFacts | import('./childExecutionFactsSnapshot').ChildContinuationWaitFacts> | SingleResponseMeasurement | SnapshotBarrier<CurrentTurnTaskSnapshot> | SnapshotBarrier<ContextHandleEvidenceFrontier> | SnapshotBarrier<SelectedContextAuthoritySource> | SnapshotBarrier<NativePendingToolCall[] | NativeSteeringInFlightEntry[] | string[]> | SnapshotBarrier<AttachmentProjectionSegmentSnapshot | AttachmentProjectionLinksSnapshot> | ExecutionLeaseRenewalResult | RuntimeHistoryRepairResult | MergeModelAggregate[] | RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ClientCollaborationHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | RuntimeContentUsageRow[] | RelocatedWorkInventory | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | RuntimeMaintenanceCommitResult | RuntimeMaintenanceRollbackResult | RuntimeWalCheckpointResult | boolean | string | null;
       /**
        * Answer of a committed `transaction`: its RuntimeCommitResult is the `commit` message posted
        * right before this response (with this commitSeq) and `result` is null, so a large commit is

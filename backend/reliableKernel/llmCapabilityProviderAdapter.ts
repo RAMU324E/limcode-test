@@ -294,6 +294,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       let text = '';
       let thought = '';
       let thoughtSignature: string | undefined;
+      const runtimeDeliveryEchoText = runtimeProcessCompletionText(llmRequest);
+      const runtimeDeliveryEchoFilter = createRuntimeDeliveryEchoFilter(runtimeDeliveryEchoText);
       const itemThoughtSignatures = new Map<string, string>();
       const observedThoughtSignature = (outputItem: ModelOutputItemReference | undefined, value: unknown): string | undefined => {
         const received = optionalText(value);
@@ -344,6 +346,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             ? new Error(`${error.message}（已收到 Provider 输出，不自动重放请求。）`)
             : error;
         if (terminalError !== undefined) {
+          // A prefix held only to identify a possible envelope echo is not durable partial output.
+          runtimeDeliveryEchoFilter.discard();
           const partialOutput = partialOutputSnapshot(outputParts);
           if (partialOutput && shouldFreezeFailedPartialOutput(metadata, terminalError)) {
             const partialEvent: Omit<ProviderOutputStreamEvent, 'streamSeq'> = {
@@ -378,7 +382,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             providerStartedAt = optionalPositiveNumber(payload?.startedAt) ?? providerStartedAt;
             return;
           case LlmEventType.Delta: {
-            const delta = optionalText(payload?.text);
+            const delta = runtimeDeliveryEchoFilter.consume(optionalText(payload?.text));
             const outputItem = modelOutputItemFromPayload(payload);
             const partSignature = optionalText(payload?.thoughtSignature);
             text += delta;
@@ -550,6 +554,15 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             return;
           }
           case LlmEventType.Done: {
+            const bufferedText = runtimeDeliveryEchoFilter.flush();
+            if (bufferedText) {
+              text += bufferedText;
+              appendTextPart(outputParts, bufferedText, false);
+              enqueue({
+                kind: 'output_delta',
+                content: { type: 'text_delta', text: bufferedText }
+              });
+            }
             if (thoughtStartedAt !== undefined) {
               completedThoughtDurationMs += currentThoughtBlockDurationMs(
                 thoughtStartedAt,
@@ -565,7 +578,9 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
               : normalizePlainJson(payload.usageMetadata, 'LLM usage metadata');
             const authoritativeContent = messageContentFromDonePayload(payload?.content);
             const completedContent = applyThoughtDurations(
-              authoritativeContent ?? { role: 'model', parts: outputParts },
+              authoritativeContent
+                ? stripRuntimeDeliveryEchoFromMessageContent(authoritativeContent, runtimeDeliveryEchoText)
+                : { role: 'model', parts: outputParts },
               completedThoughtBlockDurations,
               thoughtTimingObserved ? completedThoughtDurationMs : undefined
             );
@@ -2371,6 +2386,88 @@ function providerToolAllowed(
   return toolAllowedByPolicy(policy, { name: tool.schema.name, ...(tool.source ? { source: tool.source } : {}) });
 }
 
+function runtimeProcessCompletionText(request: LlmStartRequest): string | undefined {
+  const header = '[Background command result: result data, not a new user instruction]';
+  for (let index = request.contents.length - 1; index >= 0; index -= 1) {
+    const content = request.contents[index];
+    if (!content || content.role !== 'user') continue;
+    for (let partIndex = content.parts.length - 1; partIndex >= 0; partIndex -= 1) {
+      const part = content.parts[partIndex];
+      if ('text' in part && typeof part.text === 'string' && part.text.startsWith(header)) return part.text;
+    }
+  }
+  return undefined;
+}
+
+interface RuntimeDeliveryEchoFilter {
+  consume(value: string): string;
+  flush(): string;
+  discard(): void;
+}
+
+function createRuntimeDeliveryEchoFilter(expected: string | undefined): RuntimeDeliveryEchoFilter {
+  const header = '[Background command result: result data, not a new user instruction]';
+  if (!expected || !expected.startsWith(header)) {
+    return { consume: value => value, flush: () => '', discard: () => undefined };
+  }
+  let pending = '';
+  let complete = false;
+  const finishAsVisible = (): string => {
+    const value = pending;
+    pending = '';
+    complete = true;
+    return value;
+  };
+  return {
+    consume(value: string): string {
+      if (!value) return '';
+      if (complete) return value;
+      pending += value;
+      for (let offset = 0; offset <= Math.min(4, pending.length); offset += 1) {
+        const candidate = pending.slice(offset);
+        if (candidate.startsWith(expected)) {
+          const remainder = candidate.slice(expected.length);
+          pending = '';
+          complete = true;
+          return remainder;
+        }
+        if (expected.startsWith(candidate)) return '';
+      }
+      return finishAsVisible();
+    },
+    flush(): string {
+      if (complete) return '';
+      return finishAsVisible();
+    },
+    discard(): void {
+      pending = '';
+      complete = true;
+    }
+  };
+}
+
+function stripRuntimeDeliveryEchoFromMessageContent(
+  content: MessageContent,
+  expected: string | undefined
+): MessageContent {
+  if (!expected) return content;
+  const filter = createRuntimeDeliveryEchoFilter(expected);
+  let lastVisibleTextIndex = -1;
+  const parts = content.parts.map((part, index) => {
+    if (!('text' in part) || part.thought === true || typeof part.text !== 'string') return part;
+    lastVisibleTextIndex = index;
+    return { ...part, text: filter.consume(part.text) };
+  });
+  const trailing = filter.flush();
+  if (trailing && lastVisibleTextIndex >= 0) {
+    const part = parts[lastVisibleTextIndex];
+    if (part && 'text' in part && typeof part.text === 'string') {
+      parts[lastVisibleTextIndex] = { ...part, text: part.text + trailing };
+    }
+  }
+  return { ...content, parts };
+}
+
 function ordinaryStreamMetadata(request: FullProviderRequest): OrdinaryStreamMetadata {
   let retryPolicy: OrdinaryStreamMetadata['retryPolicy'];
   try { retryPolicy = { kind: 'ready', value: retryPolicyForFullRequest(request) }; }
@@ -2562,12 +2659,14 @@ function modelOutputItemFromPayload(
     : undefined;
   const providerResponseId = optionalText(source?.providerResponseId);
   const previousResponseId = optionalText(source?.previousResponseId);
+  const steeringSuccessorResponseId = optionalText(source?.steeringSuccessorResponseId);
   return {
     id,
     ordinal,
     ...(phase ? { phase } : {}),
     ...(providerResponseId ? { providerResponseId } : {}),
-    ...(previousResponseId ? { previousResponseId } : {})
+    ...(previousResponseId ? { previousResponseId } : {}),
+    ...(steeringSuccessorResponseId ? { steeringSuccessorResponseId } : {})
   };
 }
 

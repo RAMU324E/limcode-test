@@ -7,6 +7,7 @@ export async function createUiWorkflowFixture() {
   const posted = [], readers = [], listeners = new Set(), timers = new Map();
   let nextTimer = 0, persisted = {}, sequence = 0;
   globalThis.window = {
+    atob: globalThis.atob, btoa: globalThis.btoa,
     addEventListener(type, listener) { if (type === 'message') listeners.add(listener); },
     removeEventListener(type, listener) { if (type === 'message') listeners.delete(listener); },
     setTimeout(fn, ms) { const id = ++nextTimer; timers.set(id, { fn, ms }); return id; },
@@ -75,6 +76,7 @@ export async function createUiWorkflowFixture() {
             revision_id: revisionId, revision_seq: '1', role: 'user', message_seq: '1', created_at: '2026-10-08T00:00:00Z' } },
           MessageTurnLink: { ...feed.records.MessageTurnLink, [`link-${messageId}`]: {
             id: `link-${messageId}`, turn_id: turnId, message_id: messageId, role: 'input' } } };
+        feed.committedRecords = feed.records;
       },
       body(revisionId = 'revision', text = 'durable body') {
         const value = JSON.stringify({ role: 'user', parts: [{ text }] });

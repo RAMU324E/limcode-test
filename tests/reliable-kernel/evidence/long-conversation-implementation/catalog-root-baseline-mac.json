@@ -1,0 +1,215 @@
+{
+  "kind": "catalog-root-retest",
+  "mode": "baseline",
+  "measuredAt": "2026-10-17T07:49:04.433Z",
+  "sourceRoot": "/Users/lurenxing/GitHub/limcode-test",
+  "compiledRoot": "/tmp/limcode-perf-20261017-SvoEsr/compiled",
+  "node": "v24.15.0",
+  "platform": "darwin-arm64",
+  "cpu": "Apple M5",
+  "epoch": 6,
+  "size": 18000,
+  "repeats": 5,
+  "resolutionsPerTrial": 4,
+  "seed": {
+    "elapsedMs": 146.631791,
+    "entries": 18000,
+    "blocks": 0,
+    "roots": 1,
+    "rootBytes": 1591096,
+    "reachablePhysicalBytes": 1591096,
+    "recipeBytes": 363,
+    "largestBlockBytes": 0
+  },
+  "method": {
+    "construction": "The published epoch-6 inline catalog uses its exact canonicalPlainJson(normalizePlainJson(payload)) spelling and CAS registration. Generated entries match the current-mode fixture.",
+    "cold": "Each trial reopens RuntimeDatabase and creates a new ContentAddressedStore/provider; its first prepared request reads the registered recipe/root/selected blocks. OS filesystem cache is not flushed.",
+    "request": "A captured synthetic prepared-request descriptor uses real registered recipe CAS and the production ModelProviderControlPlane holder; no provider/network or model execution is started.",
+    "hot": "Four calls to the published resolveFrozenModelHandleCatalog use the same already-parsed immutable recipe. There is no active catalog holder in this implementation; recipe rereads are excluded.",
+    "writes": "Use the already-passed C2 65-admission test for bounded tail/root publication. This script measures one bulk construction and cold versus held reads only.",
+    "instrumentation": "Script-local wrapper counts existing snapshot/store.read calls; production source and compiled code are unchanged."
+  },
+  "idleCacheLimits": {
+    "entries": 8,
+    "bytes": 8388608
+  },
+  "summary": {
+    "runtimeOpenMs": {
+      "median": 75.83191700000009,
+      "min": 69.79449999999997,
+      "max": 83.74699999999996,
+      "raw": [
+        83.74699999999996,
+        77.000583,
+        75.83191700000009,
+        72.16887500000007,
+        69.79449999999997
+      ]
+    },
+    "firstFrozenRequestMs": {
+      "median": 23.50041699999997,
+      "min": 23.198499999999967,
+      "max": 32.44216700000004,
+      "raw": [
+        32.44216700000004,
+        24.52774999999997,
+        23.50041699999997,
+        23.24408399999993,
+        23.198499999999967
+      ]
+    },
+    "hotResolutionsMs": {
+      "median": 94.34108300000003,
+      "min": 88.35916599999996,
+      "max": 108.62816700000002,
+      "raw": [
+        108.62816700000002,
+        97.24604099999999,
+        89.650666,
+        88.35916599999996,
+        94.34108300000003
+      ]
+    },
+    "coldBlockReadsPerTrial": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "hotExtraReads": 20,
+    "hotResolutions": 20
+  },
+  "trials": [
+    {
+      "runtimeOpenMs": 83.74699999999996,
+      "firstFrozenRequestMs": 32.44216700000004,
+      "cold": {
+        "snapshotCalls": 2,
+        "metadataRows": 2,
+        "storeReadCalls": 2,
+        "storeReadBytes": 1591459,
+        "recipeReads": 1,
+        "rootReads": 1,
+        "blockReads": 0
+      },
+      "hotResolutionsMs": 108.62816700000002,
+      "resolutions": 4,
+      "hot": {
+        "snapshotCalls": 4,
+        "metadataRows": 4,
+        "storeReadCalls": 4,
+        "storeReadBytes": 6364384,
+        "recipeReads": 0,
+        "rootReads": 4,
+        "blockReads": 0
+      },
+      "afterReleaseMs": null,
+      "released": null
+    },
+    {
+      "runtimeOpenMs": 77.000583,
+      "firstFrozenRequestMs": 24.52774999999997,
+      "cold": {
+        "snapshotCalls": 2,
+        "metadataRows": 2,
+        "storeReadCalls": 2,
+        "storeReadBytes": 1591459,
+        "recipeReads": 1,
+        "rootReads": 1,
+        "blockReads": 0
+      },
+      "hotResolutionsMs": 97.24604099999999,
+      "resolutions": 4,
+      "hot": {
+        "snapshotCalls": 4,
+        "metadataRows": 4,
+        "storeReadCalls": 4,
+        "storeReadBytes": 6364384,
+        "recipeReads": 0,
+        "rootReads": 4,
+        "blockReads": 0
+      },
+      "afterReleaseMs": null,
+      "released": null
+    },
+    {
+      "runtimeOpenMs": 75.83191700000009,
+      "firstFrozenRequestMs": 23.50041699999997,
+      "cold": {
+        "snapshotCalls": 2,
+        "metadataRows": 2,
+        "storeReadCalls": 2,
+        "storeReadBytes": 1591459,
+        "recipeReads": 1,
+        "rootReads": 1,
+        "blockReads": 0
+      },
+      "hotResolutionsMs": 89.650666,
+      "resolutions": 4,
+      "hot": {
+        "snapshotCalls": 4,
+        "metadataRows": 4,
+        "storeReadCalls": 4,
+        "storeReadBytes": 6364384,
+        "recipeReads": 0,
+        "rootReads": 4,
+        "blockReads": 0
+      },
+      "afterReleaseMs": null,
+      "released": null
+    },
+    {
+      "runtimeOpenMs": 72.16887500000007,
+      "firstFrozenRequestMs": 23.24408399999993,
+      "cold": {
+        "snapshotCalls": 2,
+        "metadataRows": 2,
+        "storeReadCalls": 2,
+        "storeReadBytes": 1591459,
+        "recipeReads": 1,
+        "rootReads": 1,
+        "blockReads": 0
+      },
+      "hotResolutionsMs": 88.35916599999996,
+      "resolutions": 4,
+      "hot": {
+        "snapshotCalls": 4,
+        "metadataRows": 4,
+        "storeReadCalls": 4,
+        "storeReadBytes": 6364384,
+        "recipeReads": 0,
+        "rootReads": 4,
+        "blockReads": 0
+      },
+      "afterReleaseMs": null,
+      "released": null
+    },
+    {
+      "runtimeOpenMs": 69.79449999999997,
+      "firstFrozenRequestMs": 23.198499999999967,
+      "cold": {
+        "snapshotCalls": 2,
+        "metadataRows": 2,
+        "storeReadCalls": 2,
+        "storeReadBytes": 1591459,
+        "recipeReads": 1,
+        "rootReads": 1,
+        "blockReads": 0
+      },
+      "hotResolutionsMs": 94.34108300000003,
+      "resolutions": 4,
+      "hot": {
+        "snapshotCalls": 4,
+        "metadataRows": 4,
+        "storeReadCalls": 4,
+        "storeReadBytes": 6364384,
+        "recipeReads": 0,
+        "rootReads": 4,
+        "blockReads": 0
+      },
+      "afterReleaseMs": null,
+      "released": null
+    }
+  ]
+}

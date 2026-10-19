@@ -1,0 +1,23 @@
+{
+  "kind": "limcode-phase-d-candidate-evidence",
+  "stableId": "candidate.recovery.effect-intent-hanging",
+  "passed": true,
+  "commitSha": "528d720f929acd84ece7d6d7bf8f1c68e8557f1e",
+  "measuredAt": "2026-09-11T09:39:44.691Z",
+  "assertionCount": 5,
+  "assertions": [
+    "并发Host恢复扫描识别存活Turn租约，跳过其三种in-flight外部Effect且不伪造unknown",
+    "真实重开数据库扫描file摘要可证明成功；MCP与file_transfer不可查询均落unknown且不redispatch",
+    "重复恢复扫描不产生第二Receipt/Outcome/ModelResult",
+    "Turn冻结WorkEnvironmentPolicy.enabled=false时recipe隐藏transfer/switch，旧模型调用也持久rejected且无外部写入",
+    "enabled Turn中同环境switch幂等成功；跨环境switch因authority不可变而明确rejected，不伪成功、不建外部Effect"
+  ],
+  "faults": [
+    "file action executed callback lost",
+    "MCP callback lost",
+    "file transfer callback lost",
+    "database reopen",
+    "no redispatch",
+    "repeat recovery scan"
+  ]
+}

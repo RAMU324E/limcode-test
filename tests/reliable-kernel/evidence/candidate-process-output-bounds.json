@@ -1,0 +1,36 @@
+{
+  "kind": "limcode-phase-d-candidate-evidence",
+  "stableId": "candidate.process-output-bounds",
+  "passed": true,
+  "commitSha": "528d720f929acd84ece7d6d7bf8f1c68e8557f1e",
+  "measuredAt": "2026-09-11T09:46:49.509Z",
+  "assertionCount": 10,
+  "assertions": [
+    "前台Bash在原始execute ToolModelResult内直接返回stdout/stderr，无需第二次output调用",
+    "process Operation提交后、model_response前崩溃时普通finalizer保持阻塞，reconcile重放补齐内联输出且不重跑命令",
+    "运行中live tail只进入不推进outputHandle的观察字段，正式retained前缀保持可重复遍历且读取不消费tail",
+    "wrapper持续追加输出时reconcile只导入manifest已发布稳定前缀，不把正常并发误报为完整性损坏",
+    "旧manifest导入事务与exit并发时由Process状态/计数断言回滚，不能倒退终态计数",
+    "CAS尚未登记且spool chunk缺失时read_output明确报完整性错误，不返回空正文配完整计数",
+    "超过4MiB且超过256 chunk后仍持续按序落spool，原始输出不再被丢弃",
+    "并发ProcessOutput reconcile精确收敛；登记事务逐笔受wire bytes约束并持续到全部chunk metadata入SQLite、正文入CAS，重复reconcile不再增长",
+    "初始Bash输出严格限制为16KiB且continuation可从chunk内字节偏移无重叠续读",
+    "read_output以opaque handle从SQLite/CAS分页面完整遍历；spool丢失后不消费历史、不缩小计数，也不一次Buffer.concat全历史；completion tail反向keyset读取且只驻留所需尾部"
+  ],
+  "faults": [
+    "single-call foreground output",
+    "model-response crash recovery",
+    "strict inline pagination",
+    "live tail accounting",
+    "live writer/import race",
+    "stale output commit after exit",
+    "spool loss before CAS import",
+    "sustained output beyond former retention bounds",
+    "continued drain",
+    "competing ProcessOutput reconcile",
+    "CAS/SQLite growth convergence",
+    "spool loss after CAS import",
+    "repeatable read_output",
+    "terminal tail"
+  ]
+}

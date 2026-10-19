@@ -15,6 +15,7 @@ import type {
   ProviderContextPart
 } from '../../shared/protocol';
 import type { Emit } from './types';
+import type { OpenAIResponsesNativeEvent } from '../../shared/openAIResponsesNative';
 
 type UnifiedContent = import('unified-llm-provider').Content;
 type UnifiedPart = import('unified-llm-provider').Part;
@@ -508,7 +509,23 @@ export function mergeUsageMetadata(
 
 /** 原生链上当前正在解码的物理 response；output item 元数据按它标记归属边界。 */
 export interface OpenAIResponsesNativeChainContext {
-  current?: { responseId: string; previousResponseId?: string };
+  current?: { responseId: string; previousResponseId?: string; steeringSuccessorResponseId?: string };
+}
+
+/** Retain the steering segment while physical tool-result responses advance along this chain. */
+export function observeNativeResponseCreated(
+  context: OpenAIResponsesNativeChainContext,
+  event: Pick<OpenAIResponsesNativeEvent, 'responseId' | 'previousResponseId' | 'submissionId'>
+): void {
+  const previous = context.current;
+  if (previous?.responseId === event.responseId) return;
+  const steeringSuccessorResponseId = event.submissionId ? event.responseId
+    : event.previousResponseId === previous?.responseId ? previous?.steeringSuccessorResponseId : undefined;
+  context.current = {
+    responseId: event.responseId,
+    ...(event.previousResponseId ? { previousResponseId: event.previousResponseId } : {}),
+    ...(steeringSuccessorResponseId ? { steeringSuccessorResponseId } : {})
+  };
 }
 
 /**
@@ -673,11 +690,14 @@ function stampNativeResponse(
   // reassign that immutable item merely because it happens to share a local fallback number.
   if (outputItem.providerResponseId && outputItem.providerResponseId !== current.responseId) return outputItem;
   if (outputItem.providerResponseId === current.responseId
-    && outputItem.previousResponseId === current.previousResponseId) return outputItem;
+    && outputItem.previousResponseId === current.previousResponseId
+    && outputItem.steeringSuccessorResponseId === current.steeringSuccessorResponseId) return outputItem;
+  const { previousResponseId: _previous, steeringSuccessorResponseId: _steering, ...identity } = outputItem;
   return {
-    ...outputItem,
+    ...identity,
     providerResponseId: current.responseId,
-    ...(current.previousResponseId ? { previousResponseId: current.previousResponseId } : {})
+    ...(current.previousResponseId ? { previousResponseId: current.previousResponseId } : {}),
+    ...(current.steeringSuccessorResponseId ? { steeringSuccessorResponseId: current.steeringSuccessorResponseId } : {})
   };
 }
 
@@ -708,12 +728,15 @@ function modelOutputItemFromValue(value: unknown): ModelOutputItemReference | un
   const previousResponseId = typeof source.previousResponseId === 'string' && source.previousResponseId.trim()
     ? source.previousResponseId
     : undefined;
+  const steeringSuccessorResponseId = typeof source.steeringSuccessorResponseId === 'string' && source.steeringSuccessorResponseId.trim()
+    ? source.steeringSuccessorResponseId : undefined;
   return {
     id: source.id,
     ordinal: source.ordinal,
     ...(phase ? { phase } : {}),
     ...(providerResponseId ? { providerResponseId } : {}),
-    ...(previousResponseId ? { previousResponseId } : {})
+    ...(previousResponseId ? { previousResponseId } : {}),
+    ...(steeringSuccessorResponseId ? { steeringSuccessorResponseId } : {})
   };
 }
 

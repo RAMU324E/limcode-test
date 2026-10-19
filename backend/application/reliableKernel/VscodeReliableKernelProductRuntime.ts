@@ -1,3 +1,4 @@
+import { ExecutionHandoffError } from '../../reliableKernel/executionLeaseFence';
 import { upgradeContextHandlesWithProgress } from './contextHandleUpgradeNotification';
 import { createRuntimeDeliveryWakeHandler } from './runtimeDeliveryWakeHandler';
 import * as vscode from 'vscode';
@@ -59,6 +60,7 @@ import { isConversationRuntimeOwnerBusyError } from '../../reliableKernel/Conver
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
 import { retryLocalExecution } from '../../reliableKernel/localExecutionRecovery';
 import type { ConversationRecoveryResult } from '../../../vscode/ApplicationFacade';
+import { SYSTEM_TEMPORARY_WORK_ENVIRONMENT_ID, systemTemporaryDirectory } from '../../reliableKernel/systemTemporaryWorkEnvironment';
 
 export interface VscodeReliableKernelProductRuntimeOptions {
   /** Tests/candidate validation may supply an isolated authority. Production resolves it through getPaths(). */
@@ -211,6 +213,15 @@ export class VscodeReliableKernelProductRuntime {
       },
       { onError: (error) => console.error('[LimCode] 跨宿主 Runtime 同步失败。', error) }
     );
+    this.application.database.onClose(failure => {
+      if (!failure || this.closing) return;
+      this.freezeNewExecution([]);
+      this.externalRuntimeWatcher.cancel();
+      this.conversations.dispose();
+      this.recoveryController.abort(failure);
+      void this.childAgents.quiesce(new ExecutionHandoffError(failure.message))
+        .catch(error => console.error('[LimCode] 子任务故障收尾未完成。', error));
+    });
   }
 
   public static async open(
@@ -391,6 +402,9 @@ export class VscodeReliableKernelProductRuntime {
         authorityCompiler: configuration,
         compressionSettingsAuthority: configuration,
         resolveWorkEnvironment: async (workEnvironmentId) => {
+          if (workEnvironmentId === SYSTEM_TEMPORARY_WORK_ENVIRONMENT_ID) {
+            return { id: workEnvironmentId, rootPath: systemTemporaryDirectory() };
+          }
           const environment = await configuration.workEnvironment(workEnvironmentId);
           if (!environment.available || environment.kind !== 'localFolder' || !environment.rootPath) return undefined;
           return { id: environment.id, rootPath: environment.rootPath };

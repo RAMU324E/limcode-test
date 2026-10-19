@@ -1,0 +1,50 @@
+{
+  "kind": "limcode-phase-f-candidate-evidence",
+  "checkId": "candidate.client-snapshot-feed-barrier",
+  "stableId": "candidate.client-snapshot-feed-barrier",
+  "passed": true,
+  "commitSha": "b967bdca78d7934760628fabed3449c5f192dfc8",
+  "measuredAt": "2026-08-21T01:26:36.025Z",
+  "assertionCount": 4,
+  "provenance": {
+    "worktreeClean": true,
+    "commitExplicitlyBound": false,
+    "authoritative": false,
+    "runnerSha256": "4e7bcd9adc82c715b6203e8d9f4f094dca5f50da58f27d8f89eac8ee654e845a",
+    "sourceTreeSha256": "ce6e3695e0a8823ed6b089e4022d2fb4d7ed362ad672c2cb7809fbffe3bacbce",
+    "sourceFileCount": 455,
+    "sourceFilesTracked": true,
+    "compiledKernelSha256": "f1536abe2fe3b04032bb384dcbbd7bd586182d7159cd6b1badaa0f3238cf2a3c",
+    "compiledFileCount": 194,
+    "compileProvenance": "dist/extension/reliable-kernel-compile-provenance.json",
+    "compileWorktreeClean": true,
+    "compiledClosureMatches": true,
+    "invocation": [
+      "/Users/lurenxing/.local/node-v24.15.0-darwin-arm64/bin/node",
+      "/Users/lurenxing/GitHub/limcode-test/scripts/reliable-kernel/run-phase-f-check.mjs",
+      "--check=candidate.client-snapshot-feed-barrier"
+    ],
+    "node": "v24.15.0",
+    "sqlite": "3.53.4",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5"
+  },
+  "assertions": [
+    "snapshot读完但订阅handoff尚未返回时受控提交真实事务，listener预注册缓冲使第一批commitSeq严格=snapshotCommitSeq+1且无遗漏",
+    "已连接Feed的snapshot refresh失败会关闭坏session并显式通知Bridge恢复，不再静默删除后永久冻结",
+    "Bridge首次connect单次失败时connection保持待恢复并沿同一封顶退避成功；已连接session故障通知也复用该恢复路径",
+    "ACK同步flush下一帧时旧帧诊断不丢且不清除新watchdog；同ModelRequest突发transient按32ms窗口合并为一条有序batch"
+  ],
+  "faults": [
+    "deterministic commit between snapshot read and feed handoff",
+    "asynchronous snapshot refresh rejection after connect resolved",
+    "one-shot initial bridge connect failure and post-connect session failure",
+    "queued ACK synchronous refill and nine-event transient IPC burst"
+  ],
+  "metrics": {
+    "snapshotCommitSeq": "0",
+    "firstChangeCommitSeq": "1",
+    "bridgeInitialRecoveryMs": 1002
+  }
+}

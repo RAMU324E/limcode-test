@@ -1,0 +1,51 @@
+{
+  "kind": "limcode-phase-f-candidate-evidence",
+  "checkId": "candidate.recovery.answer-inbox-invariant",
+  "stableId": "candidate.recovery.answer-inbox-invariant",
+  "passed": true,
+  "commitSha": "528d720f929acd84ece7d6d7bf8f1c68e8557f1e",
+  "measuredAt": "2026-09-11T09:30:50.523Z",
+  "assertionCount": 5,
+  "provenance": {
+    "worktreeClean": false,
+    "commitExplicitlyBound": false,
+    "authoritative": false,
+    "runnerSha256": "4e7bcd9adc82c715b6203e8d9f4f094dca5f50da58f27d8f89eac8ee654e845a",
+    "sourceTreeSha256": "26173dcddbd506d036d46722d0ff33afdb90dfdee5e9e2fef48651b06cfb022b",
+    "sourceFileCount": 487,
+    "sourceFilesTracked": false,
+    "compiledKernelSha256": "a40adc792ba10fcf831b7eae353962ab6742cc625788da1123f76effe2af0880",
+    "compiledFileCount": 226,
+    "compileProvenance": "dist/extension/reliable-kernel-compile-provenance.json",
+    "compileWorktreeClean": false,
+    "compiledClosureMatches": false,
+    "invocation": [
+      "/Users/lurenxing/.local/node-v24.15.0-darwin-arm64/bin/node",
+      "/Users/lurenxing/GitHub/limcode-test/scripts/reliable-kernel/run-phase-f-check.mjs",
+      "--check",
+      "candidate.recovery.answer-inbox-invariant"
+    ],
+    "node": "v24.15.0",
+    "sqlite": "3.53.4",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5"
+  },
+  "assertions": [
+    "跨真实数据库关闭/重开按bridge+submission稳定身份补建缺失InboxItem与父目标Delivery且不改AnswerSubmission/Bridge",
+    "answer-inbox scanner重复运行幂等，不产生重复Inbox、Delivery或外部effect",
+    "来源子Turn仍由可验证live Host持有时，即使Inbox缺失，恢复扫描也保持只读；owner退出后才以Turn/Lease authority fence补建",
+    "父Turn以completed终止后的缺失Delivery恢复为next_turn且不续写旧Turn，等待专属调度器启动新Turn",
+    "两个并发恢复扫描经稳定Delivery identity与authority CAS收敛为唯一pending next_turn，后续runAll保持幂等"
+  ],
+  "faults": [
+    "committed AnswerSubmission with missing RuntimeInboxItem and RuntimeDelivery across restart",
+    "parent Turn completed before next-turn delivery creation"
+  ],
+  "metrics": {
+    "firstReconciled": 1,
+    "secondReconciled": 0,
+    "concurrentReconciled": 1,
+    "terminalDeliveries": 1
+  }
+}

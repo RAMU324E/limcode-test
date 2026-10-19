@@ -80,6 +80,28 @@ test('两个Host投影只改变本地可用性，preview按scope有界读取且�
   assert.equal((await first.previewWorkEnvironment(request)).workEnvironmentId, 'remote-b');
 });
 
+test('本机系统临时目录是额外的本地文件根，普通项目外目录仍被拒绝', async t => {
+  const { systemTemporaryDirectory, systemTemporaryWorkEnvironment } = compiled('backend/reliableKernel/systemTemporaryWorkEnvironment.js');
+  const { VscodeReliableToolHost } = compiled('backend/application/reliableKernel/VscodeReliableToolHost.js');
+  const { createVsCodeFsCapability } = compiled('backend/capabilities/vscodeFs.js');
+  const project = await temporaryRoot(t, 'project-boundary'), temp = await fs.mkdtemp(path.join(systemTemporaryDirectory(), 'limcode-tool-'));
+  const target = path.join(temp, 'allowed.txt'), projectEnvironment = local('project', project), temporaryEnvironment = systemTemporaryWorkEnvironment();
+  const toolHost = {
+    async resolveEnvironments() { return { active: projectEnvironment, allowed: [projectEnvironment, temporaryEnvironment] }; },
+    skillDirectoriesFor() { return []; }
+  };
+  t.after(() => fs.rm(temp, { recursive: true, force: true }));
+  const resolved = await VscodeReliableToolHost.prototype.resolveFilePath.call(toolHost, target, {});
+  assert.equal(resolved.absolutePath, target);
+  await assert.rejects(VscodeReliableToolHost.prototype.resolveFilePath.call(toolHost, path.join(path.parse(temp).root, 'outside-project.txt'), {}), /绝对路径不属于/);
+
+  const capability = createVsCodeFsCapability();
+  const options = { workEnvironment: projectEnvironment, accessibleWorkEnvironments: [projectEnvironment, temporaryEnvironment], allowOutsideProjectPaths: false };
+  await capability.writeFile(target, 'system temp', options);
+  assert.equal((await capability.readFile(target, undefined, undefined, options)).content, '1 system temp');
+  assert.equal(temporaryEnvironment.rootPath, systemTemporaryDirectory());
+  assert.equal(temporaryEnvironment.kind, 'localFolder');
+});
 test('真实文件替换以原生身份保护外部改写，声明symlink根不授权目录外路径', async t => {
   const root = await temporaryRoot(t, 'native-file-smoke'), realRoot = path.join(root, 'real'), linked = path.join(root, 'linked');
   await fs.mkdir(realRoot); await fs.symlink(realRoot, linked, process.platform === 'win32' ? 'junction' : 'dir');

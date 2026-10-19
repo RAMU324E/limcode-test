@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { readProviderRequestFailure } from '../../shared/compressionExecution';
 import { normalizeAttachmentCatalogState } from './attachmentCatalog';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
+import { LogicalMessageContentReader, logicalMessageContentType } from './logicalMessageContent';
 import { COMPRESSION_SOURCE_REPLAY_LIMITS, expandTextCompressionSources } from './compressionSourceReplay';
 import { ContextSequenceControlPlane, type StructuralContextRecord } from './contextSequence';
 import { conversationForkSnapshotCopyId } from './conversationForkSnapshot';
@@ -115,7 +116,7 @@ export async function readHistoricalCompressionHandleCatalog(
     segmentKind: record.segment.segment_kind
   })))).digest('hex');
   if (recipe.sourceHash !== hash) throw invalid('Historical compression source identity does not match its frozen hash.');
-  const context = await readSourcePrefix(store, prefix);
+  const context = await readSourcePrefix(database, store, prefix);
   // The published adapter rejected this exact attempt before producing a provider body. Keep its
   // frozen catalog as evidence, but it never exposed any newly derived source addresses. Ownership,
   // prefix boundary/hash and source CAS were still checked above; a failed status alone is no proof.
@@ -383,27 +384,28 @@ function recordIdentities(records: readonly StructuralContextRecord[]): Array<Re
     segmentKind: text(record.segment.segment_kind, 'Historical source kind') }));
 }
 
-async function readSourcePrefix(store: ContentAddressedStore,
+async function readSourcePrefix(database: RuntimeDatabase, store: ContentAddressedStore,
   records: readonly StructuralContextRecord[]): Promise<FullProviderContextItem[]> {
   if (records.length > COMPRESSION_SOURCE_REPLAY_LIMITS.segments) throw invalid('Historical compression source exceeds its replay limit.');
   let bytes = 0;
   const output: FullProviderContextItem[] = [];
   const cached = new Map<string, string>();
+  const messages = new LogicalMessageContentReader(database, store);
   for (const record of records) {
     const metadata = record.contentObject;
     const contentId = text(record.segment.content_object_id, 'Historical segment content id');
     if (metadata.id !== contentId) throw invalid('Historical segment content identity is inconsistent.');
     let content = cached.get(contentId);
     if (content === undefined) {
-      if (Number(metadata.byte_length) > COMPRESSION_SOURCE_REPLAY_LIMITS.bytes - bytes) {
+      if (await messages.byteLength(metadata as unknown as ContentObjectMetadata) > COMPRESSION_SOURCE_REPLAY_LIMITS.bytes - bytes) {
         throw invalid('Historical compression source exceeds its replay byte limit.');
       }
-      content = decode(await store.read(metadata as unknown as ContentObjectMetadata), 'Historical compression source');
+      content = decode(await messages.read(metadata as unknown as ContentObjectMetadata), 'Historical compression source');
       cached.set(contentId, content);
     }
     bytes += Buffer.byteLength(content, 'utf8');
     if (bytes > COMPRESSION_SOURCE_REPLAY_LIMITS.bytes) throw invalid('Historical compression source exceeds its replay byte limit.');
-    const contentType = text(metadata.content_type, 'Historical source content type');
+    const contentType = logicalMessageContentType(text(metadata.content_type, 'Historical source content type'));
     let role: string | null = null;
     if (contentType === 'application/json' || contentType.endsWith('+json')) {
       const document = normalizePlainJson(JSON.parse(content), 'Historical compression source JSON');

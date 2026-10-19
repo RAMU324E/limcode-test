@@ -1,4 +1,5 @@
 import { resolveConversationCompressionBlock, selectConversationCompressionBlock } from './compressionBlockOwnership';
+import { NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE } from './logicalMessageContent';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
@@ -278,10 +279,12 @@ export async function readVisibleTurnMessages(
 /** Native UI aggregates do not own Context; their immutable item revisions do. */
 export async function readNativeMessageContextRevisions(
   database: RuntimeDatabase,
-  messageId: string
+  messageId: string,
+  options: { includeItemIndex?: true } = {}
 ): Promise<NativeMessageContextRevision[]> {
   const revisions = await listAllDomainRows(database, 'MessageRevision', { message_id: messageId });
   const result: NativeMessageContextRevision[] = [];
+  let itemIndex: NativeMessageContextRevision | undefined;
   for (let offset = 0; offset < revisions.length; offset += 64) {
     const batch = revisions.slice(offset, offset + 64).filter(revision => revision.role === 'model');
     if (batch.length === 0) continue;
@@ -291,7 +294,10 @@ export async function readNativeMessageContextRevisions(
       })),
       ...batch.map(revision => DOMAIN_REPOSITORIES.domain('AttachmentLink').list({
         where: { message_revision_id: requireId(revision.id, 'MessageRevision.id') }, limit: 257
-      }))
+      })),
+      ...(options.includeItemIndex ? batch.map(revision => DOMAIN_REPOSITORIES.domain('ContentObject').get(
+        requireId(revision.content_object_id, 'MessageRevision.content_object_id')
+      )) : [])
     ]);
     for (const [index, revision] of batch.entries()) {
       const revisionId = requireId(revision.id, 'MessageRevision.id');
@@ -299,7 +305,9 @@ export async function readNativeMessageContextRevisions(
       const sources = firstSources.length < 257 ? firstSources : await listAllDomainRows(database, 'ContextSegmentSource', {
         source_kind: 'message_revision', source_id: revisionId
       });
-      if (sources.length === 0) continue;
+      const isItemIndex = options.includeItemIndex && requireRow(snapshot.snapshot[batch.length * 2 + index], 'ContentObject')
+        .content_type === NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE;
+      if (sources.length === 0 && !isItemIndex) continue;
       for (const source of sources) {
         if (source.source_revision !== revision.revision_seq) {
           throw new Error(`MessageRevision ${revisionId} has a mismatched Context source revision.`);
@@ -309,9 +317,16 @@ export async function readNativeMessageContextRevisions(
       const attachments = firstAttachments.length < 257 ? firstAttachments : await listAllDomainRows(database, 'AttachmentLink', {
         message_revision_id: revisionId
       });
-      result.push({ revision, sources, attachments });
+      const fact = { revision, sources, attachments };
+      if (sources.length > 0) result.push(fact);
+      if (isItemIndex && (!itemIndex || compareIntegers(revision.revision_seq, itemIndex.revision.revision_seq) > 0)) {
+        itemIndex = fact;
+      }
     }
   }
+  // A completed request points to its final ordinary aggregate. The last small display revision
+  // still supplies its immutable item index; fork copies that row with the existing revision IDs.
+  if (itemIndex && !result.some(fact => fact.revision.id === itemIndex!.revision.id)) result.push(itemIndex);
   return result;
 }
 

@@ -41,7 +41,9 @@ async function browser() {
   return run(process.execPath, ['--test', '--test-reporter=tap', '--test-concurrency=1',
     'tests/webview-session-thinking.browser.mjs',
     'tests/webview-agent-status-panel.browser.mjs',
-    'tests/webview-file-change-preview.browser.mjs'
+    'tests/webview-file-change-preview.browser.mjs',
+    'tests/webview-settings-layout.browser.mjs',
+    'tests/webview-composer-menus.browser.mjs'
   ]);
 }
 

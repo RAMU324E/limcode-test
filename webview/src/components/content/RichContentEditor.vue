@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import { bridge, BridgeMessageType } from '@webview/transport';
-import type { FsStatResultPayload } from '@shared/protocol';
+import { createMessageId, type FsStatResultPayload } from '@shared/protocol';
 
 const props = withDefaults(
   defineProps<{
@@ -25,6 +25,7 @@ const emit = defineEmits<{
 const textarea = ref<HTMLTextAreaElement | null>(null);
 const scrollbarRefreshKey = ref(0);
 const pathDragActive = ref(false);
+const pendingDrops = new Set<() => void>();
 
 const focusRecoveryDelays = [80, 180] as const;
 const focusVerificationDelays = [140] as const;
@@ -60,6 +61,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('blur', invalidateFocusRestore);
   invalidateFocusRestore();
   clearFocusRecoveryTimers();
+  for (const dispose of pendingDrops) dispose();
 });
 
 function onDocumentPointerDown(event: PointerEvent): void {
@@ -140,7 +142,7 @@ function onKeydown(event: KeyboardEvent): void {
 }
 
 function onPaste(event: ClipboardEvent): void {
-  const files = collectPastedFiles(event.clipboardData);
+  const files = collectTransferredFiles(event.clipboardData);
   if (files.length > 0) {
     event.preventDefault();
     emit('paste-files', files);
@@ -169,17 +171,36 @@ function onDrop(event: DragEvent): void {
   pathDragActive.value = false;
 
   const dragPayload = extractDragPayload(event.dataTransfer);
-  if (dragPayload.length === 0) return;
+  const files = collectTransferredFiles(event.dataTransfer);
+  if (dragPayload.length === 0 && files.length === 0) return;
 
   event.preventDefault();
   event.stopPropagation();
+  if (dragPayload.length === 0) {
+    emit('paste-files', files);
+    return;
+  }
 
-  const messageId = bridge.request(BridgeMessageType.FsStatGet, { paths: dragPayload });
-  bridge.on(BridgeMessageType.FsStatResult, (message) => {
+  const messageId = createMessageId();
+  const offResult = bridge.on(BridgeMessageType.FsStatResult, (message) => {
     if (message.correlationId !== messageId) return;
+    dispose();
+    if (props.disabled) return;
     const mentionText = formatMentionsFromStat(message.payload);
     if (mentionText) insertTextAtSelection(mentionText);
+    else if (message.payload?.results.length === 0 && files.length > 0) emit('paste-files', files);
   });
+  const offError = bridge.on(BridgeMessageType.Error, (message) => {
+    if (message.correlationId === messageId) dispose();
+  });
+  const dispose = () => { offResult(); offError(); pendingDrops.delete(dispose); };
+  pendingDrops.add(dispose);
+  try {
+    bridge.request(BridgeMessageType.FsStatGet, { paths: dragPayload }, { requestId: messageId });
+  } catch (error) {
+    dispose();
+    throw error;
+  }
 }
 
 function hasDragData(dataTransfer: DataTransfer | null): boolean {
@@ -219,7 +240,7 @@ function formatMentionsFromStat(payload: FsStatResultPayload | undefined): strin
   return mentions.join(mentions.length > 1 ? '\n' : ' ');
 }
 
-function collectPastedFiles(data: DataTransfer | null): File[] {
+function collectTransferredFiles(data: DataTransfer | null): File[] {
   if (!data) return [];
   const files: File[] = [];
   for (const item of Array.from(data.items)) {

@@ -148,7 +148,7 @@ test('H1 only admitted bindings publish; private allocations reserve ordinals an
   const f = memory.fixture(seeded.shared);
   assert.deepEqual((await readConversationContextHandleState(f.database, f.store, 'conversation')).catalog.entries,
     [memory.processHandle(1)]);
-  assert.equal(f.metrics.reads.length, 1);
+  assert.equal(f.metrics.reads.length, 2, 'cold read opens the root and its one bounded block');
   assert.ok(f.metrics.queries.every(read =>
     [state.CONTEXT_HANDLE_STATE_DOMAIN, 'ConversationContextHeadLink', 'ContentObject'].includes(read.domain)));
   const frozen = structuredClone(f.table(state.CONTEXT_HANDLE_STATE_DOMAIN)[0]);
@@ -157,7 +157,7 @@ test('H1 only admitted bindings publish; private allocations reserve ordinals an
   assert.equal(privateSteps[0].kind, 'assert');
   await f.database.transaction(privateSteps);
   assert.deepEqual(f.table(state.CONTEXT_HANDLE_STATE_DOMAIN)[0], frozen);
-  assert.equal(f.metrics.reads.length, 1);
+  assert.equal(f.metrics.reads.length, 2, 'the same frozen directory stays prepared');
   assert.equal(f.metrics.prepares, 0);
   const second = memory.addModelOccurrence(f, 'second', memory.catalog(memory.processHandle(1), memory.processHandle(2), memory.processHandle(99)), null, 'P2');
   const third = memory.addModelOccurrence(f, 'third', memory.catalog(memory.processHandle(1), memory.processHandle(3)), null, 'P3');
@@ -172,6 +172,252 @@ test('H1 only admitted bindings publish; private allocations reserve ordinals an
   assert.equal(current.catalog.allocationHighWater.process, 99);
   assert.equal(f.table('ContextRootHandleCatalog').some(row => row.context_root_id === 'root-3'), false);
   assert.equal(f.metrics.historicalFrontiers, 0);
+});
+
+
+
+test('H1 warm catalog reuses the same RuntimeDatabase/store cache before a reader snapshot', async () => {
+  const f = memory.fixture();
+  await memory.seedReady(f, memory.catalog(memory.processHandle(1)));
+  const queriesBeforeRead = f.metrics.queries.length;
+  const result = await readConversationContextHandleState(f.database, f.store, 'conversation');
+  assert.deepEqual(result.catalog.entries, [memory.processHandle(1)]);
+  assert.equal(f.metrics.reads.length, 0);
+  assert.ok(f.metrics.queries.slice(queriesBeforeRead).every(read =>
+    [state.CONTEXT_HANDLE_STATE_DOMAIN, 'ConversationContextHeadLink'].includes(read.domain)));
+});
+
+test('A4 sixteen active request holders retain one prepared catalog across preview and replay after idle-cache eviction', async () => {
+  const storage = kernelFile('contextHandleCatalogStorage.js');
+  const { ModelProviderControlPlane } = kernelFile('modelProviderControlPlane.js');
+  const { resolveFrozenModelHandleCatalog } = kernelFile('frozenModelHandleCatalog.js');
+  const f = memory.fixture(), requests = [];
+  for (let agent = 0; agent < 16; agent += 1) {
+    const conversationId = `agent-${agent}`;
+    const prepared = await storage.prepareStoredHandleCatalog({ database: f.database, contentStore: f.store,
+      conversationId, kind: 'context', catalog: memory.catalog(...Array.from({ length: 64 }, (_, index) => ({
+        ...memory.processHandle(index + 1), target: `${conversationId}-process-${index + 1}` }))) });
+    await f.database.transaction(prepared.steps);
+    const recipe = await f.store.prepare(f.database, JSON.stringify({ kind: 'reliable-agent-turn',
+      contextHandleScope: { conversationId, rootId: `root-${agent}`, provenanceRevision: '0', resetFence: '0' },
+      modelHandleCatalogReference: { baseContentObjectId: prepared.stored.metadata.id,
+        attachmentEntries: [], addedEntries: [], metadataExtensions: [] } }), 'application/vnd.limcode.model-request-recipe+json');
+    await f.database.transaction([recipe.insert]);
+    requests.push({ id: `request-${agent}`, turn_id: `turn-${agent}`, status: 'prepared', recipe_object_id: recipe.metadata.id });
+  }
+  const cold = memory.fixture(f.shared);
+  const provider = new ModelProviderControlPlane(cold.database, cold.store);
+  const holders = [];
+  for (const request of requests) holders.push(await provider.readModelRequestRecipe(request));
+  assert.equal(cold.metrics.reads.length, 64, 'each request reads one recipe, one root and two blocks once');
+  for (let round = 0; round < 3; round += 1) for (let index = 0; index < requests.length; index += 1) {
+    const held = await provider.readModelRequestRecipe(requests[index]);
+    assert.equal(held, holders[index]);
+    assert.equal(await resolveFrozenModelHandleCatalog(cold.database, cold.store, held.recipe), held.modelHandleCatalog);
+    assert.deepEqual((await resolveFrozenModelHandleCatalog(cold.database, cold.store, structuredClone(held.recipe))).entries,
+      held.modelHandleCatalog.entries, 'independent readers reuse the active base by its immutable CAS id');
+    const refined = provider.refreezeModelRequestRecipe(held.recipe, { compressionDecision: { estimatedTokens: round } });
+    assert.equal(await resolveFrozenModelHandleCatalog(cold.database, cold.store, refined), held.modelHandleCatalog);
+    assert.ok(Object.isFrozen(held.modelHandleCatalog.entries));
+  }
+  assert.equal(cold.metrics.reads.length, 64, 'active holders survive rotation through the eight-entry idle cache');
+  provider.releasePreparedTurnRecipes('turn-0');
+  for (let index = 0; index <= storage.STORED_HANDLE_CATALOG_CACHE_LIMITS.entries; index += 1) {
+    await storage.prepareStoredHandleCatalog({ database: cold.database, contentStore: cold.store,
+      conversationId: `released-idle-${index}`, kind: 'context', catalog: memory.catalog() });
+  }
+  assert.notEqual(await provider.readModelRequestRecipe(requests[0]), holders[0]);
+  assert.equal(cold.metrics.reads.length, 68, 'a released, evicted request performs a new cold read');
+});
+
+test('C3 large active bases are shared by occurrence readers and delta views, then released with their holders', async () => {
+  const storage = kernelFile('contextHandleCatalogStorage.js');
+  const { ModelProviderControlPlane } = kernelFile('modelProviderControlPlane.js');
+  const { readContextHandleOccurrenceCatalog } = kernelFile('contextHandleOccurrenceEvidence.js');
+  const { retainPreparedModelHandleBase } = kernelFile('frozenModelHandleCatalog.js');
+  const { discoverPreparedModelHandleCatalog, modelHandleTarget, prepareModelHandleCatalogOverlay,
+    projectKnownToolValue, selectModelHandleEntries } = kernelFile('modelHandleCatalog.js');
+  const f = memory.fixture();
+  const base = await storage.prepareStoredHandleCatalog({ database: f.database, contentStore: f.store,
+    conversationId: 'conversation', kind: 'context',
+    catalog: memory.catalog(...Array.from({ length: 18000 }, (_, index) => memory.processHandle(index + 1))) });
+  await f.database.transaction(base.steps);
+  assert.ok(Number(base.stored.storedByteLength) * 8 > storage.STORED_HANDLE_CATALOG_CACHE_LIMITS.bytes);
+  await memory.seedReady(f, base.stored.catalog);
+  const occurrence = memory.addProducer(f, 'active-base', memory.catalog(), 'P1');
+  const request = f.table('ModelRequest').find(row => row.id === occurrence.modelRequestId);
+  request.status = 'prepared';
+  const recipe = { kind: 'reliable-agent-turn',
+    contextHandleScope: { conversationId: 'conversation', rootId: 'root-ready', provenanceRevision: '0', resetFence: '0' },
+    modelHandleCatalogReference: { baseContentObjectId: base.stored.metadata.id,
+      attachmentEntries: [], addedEntries: [{ kind: 'process', ref: 'P18001', target: 'request-private-process' }], metadataExtensions: [] } };
+  const bytes = Buffer.from(JSON.stringify(recipe));
+  f.shared.contents.set(request.recipe_object_id, bytes);
+  f.table('ContentObject').find(row => row.id === request.recipe_object_id).byte_length = BigInt(bytes.length);
+  const provider = new ModelProviderControlPlane(f.database, f.store);
+  const held = await provider.readModelRequestRecipe(request);
+  const persistentBase = storage.cachedStoredHandleCatalog(f.database, f.store, base.stored.metadata.id);
+  const releaseRoundBase = retainPreparedModelHandleBase(f.database, f.store, held.modelHandleCatalog);
+  provider.releasePreparedTurnRecipes(request.turn_id);
+  try {
+    const current = await storage.prepareStoredHandleCatalog({ database: f.database, contentStore: f.store,
+      conversationId: 'conversation', kind: 'context', base: persistentBase,
+      catalog: { entries: held.modelHandleCatalog.entries, identityContractRevision: contract, retiredRefs: [] },
+      operations: recipe.modelHandleCatalogReference.addedEntries.map(entry => ({ kind: 'bind', entry })) });
+    await f.database.transaction(current.steps);
+    assert.notEqual(current.stored.metadata.id, persistentBase.metadata.id);
+    f.metrics.reads.length = 0;
+    await readContextHandleOccurrenceCatalog(f.database, f.store, occurrence, current.stored.catalog);
+    assert.deepEqual(f.metrics.reads, [request.recipe_object_id],
+      'the actual round consumer retains the frozen base after dispatch, even when current Context has a newer CAS root');
+  } finally { releaseRoundBase(); }
+  assert.equal(storage.cachedStoredHandleCatalog(f.database, f.store, base.stored.metadata.id), undefined,
+    'the round holder releases its frozen base before another round begins');
+  const privateView = await storage.prepareStoredHandleCatalog({ database: f.database, contentStore: f.store,
+    conversationId: 'conversation', kind: 'native-private', catalog: held.modelHandleCatalog, base: persistentBase });
+  await f.database.transaction(privateView.steps);
+  let release = storage.retainStoredHandleCatalog(f.database, f.store, privateView.stored);
+  provider.releasePreparedTurnRecipes(request.turn_id);
+  try {
+    const discovered = discoverPreparedModelHandleCatalog(privateView.stored.catalog, [{ processId: 'new-native-process' }]);
+    const next = await storage.prepareStoredHandleCatalog({ database: f.database, contentStore: f.store,
+      conversationId: 'conversation', kind: 'native-private', catalog: discovered.catalog, base: privateView.stored,
+      operations: discovered.delta.addedEntries.map(entry => ({ kind: 'bind', entry })) });
+    await f.database.transaction(next.steps);
+    const releaseNext = storage.retainStoredHandleCatalog(f.database, f.store, next.stored);
+    release(); release = releaseNext;
+    f.metrics.reads.length = 0;
+    const originalMap = Array.prototype.map;
+    let fullCatalogMapVisits = 0;
+    Array.prototype.map = function(callback, thisArg) {
+      if (this.length >= 18000 && this[0]?.kind === 'process') fullCatalogMapVisits += this.length;
+      return originalMap.call(this, callback, thisArg);
+    };
+    try {
+      for (let index = 0; index < 2; index += 1) {
+        const selected = await readContextHandleOccurrenceCatalog(f.database, f.store, occurrence, base.stored.catalog);
+        assert.deepEqual(selected.entries, [memory.processHandle(1)]);
+      }
+    } finally { Array.prototype.map = originalMap; }
+    assert.equal(fullCatalogMapVisits, 0, 'occurrence lookup does not copy or normalize the cumulative base entries');
+    assert.deepEqual(f.metrics.reads, [request.recipe_object_id, request.recipe_object_id],
+      'independent occurrences read only their small recipes while the shared base is active');
+    const shape = memory.addRoot(f, 'large-next');
+    f.metrics.reads.length = 0;
+    await memory.transition(f, 'large-next', 'append', { rootShape: shape, occurrence });
+    assert.deepEqual(f.metrics.reads, [request.recipe_object_id], 'Context append reuses the same base throughout admission');
+    const operations = [{ kind: 'retire', ref: 'P1' },
+      { kind: 'extend-metadata', entry: { ...memory.processHandle(2), name: 'frozen process name' } }];
+    const changed = await storage.prepareStoredHandleCatalog({ database: f.database, contentStore: f.store,
+      conversationId: 'conversation', kind: 'native-private', base: next.stored, operations,
+      catalog: prepareModelHandleCatalogOverlay(next.stored.catalog, operations) });
+    await f.database.transaction(changed.steps);
+    const restored = await storage.readNativePrivateHandleCatalog(f.database, f.store, changed.stored.metadata.id);
+    assert.equal(modelHandleTarget(restored.catalog, 'process', 'P1'), undefined);
+    assert.equal(modelHandleTarget(restored.catalog, 'process', 'P18002'), 'new-native-process');
+    const selected = selectModelHandleEntries(restored.catalog, new Set(['P2', 'P3']), new Set());
+    assert.equal(selected[0].name, 'frozen process name');
+    assert.equal(selected[1], persistentBase.catalog.entries[2], 'unchanged entries keep their immutable base identity');
+    assert.deepEqual(restored.catalog.retiredRefs, ['P1']);
+    assert.equal(projectKnownToolValue('bash', { stdout: 'process-1' }, restored.catalog).stdout, 'process-1',
+      'a retired identity is absent from the text projection as well as direct lookup');
+    assert.equal(projectKnownToolValue('bash', { stdout: 'process-3' }, restored.catalog).stdout, 'P3');
+    assert.equal(modelHandleTarget(base.stored.catalog, 'process', 'P1'), 'process-1', 'retirement does not change an earlier view');
+  } finally { release(); }
+  assert.equal(storage.cachedStoredHandleCatalog(f.database, f.store, base.stored.metadata.id), undefined,
+    'the oversized base leaves the active cache after the last request/native holder releases it');
+  f.metrics.reads.length = 0;
+  await readContextHandleOccurrenceCatalog(f.database, f.store, occurrence, base.stored.catalog);
+  assert.deepEqual(f.metrics.reads, [request.recipe_object_id], 'one occurrence shares its already materialized input base');
+  assert.equal(storage.cachedStoredHandleCatalog(f.database, f.store, base.stored.metadata.id), undefined,
+    'an occurrence releases its temporary holder when the operation ends');
+});
+
+test('C3 native proof and result readers share the active private catalog and keep later deltas separate', async () => {
+  const storage = kernelFile('contextHandleCatalogStorage.js');
+  const { readNativeToolCallCatalog } = kernelFile('nativeToolFacts.js');
+  const { parseNativeChildProjection, NATIVE_TOOL_RESULT_PROJECTION_CONTENT_TYPE } = kernelFile('conversationChildHandles.js');
+  const { discoverPreparedModelHandleCatalog, modelHandleRef } = kernelFile('modelHandleCatalog.js');
+  const seeded = memory.fixture();
+  const base = await storage.prepareStoredHandleCatalog({ database: seeded.database, contentStore: seeded.store,
+    conversationId: 'native-owner', kind: 'context',
+    catalog: memory.catalog(...Array.from({ length: 64 }, (_, index) => memory.processHandle(index + 1))) });
+  await seeded.database.transaction(base.steps);
+  const privateView = await storage.prepareStoredHandleCatalog({ database: seeded.database, contentStore: seeded.store,
+    conversationId: 'native-owner', kind: 'native-private', catalog: base.stored.catalog, base: base.stored });
+  await seeded.database.transaction(privateView.steps);
+  const cold = memory.fixture(seeded.shared);
+  const proof = { modelHandleCatalogContentObjectId: privateView.stored.metadata.id };
+  const catalog = await readNativeToolCallCatalog(cold.database, cold.store, proof);
+  assert.equal(cold.metrics.reads.length, 4, 'one cold read opens the private root, persistent root and two blocks');
+  const original = await storage.readNativePrivateHandleCatalog(cold.database, cold.store, proof.modelHandleCatalogContentObjectId);
+  const release = storage.retainStoredHandleCatalog(cold.database, cold.store, original);
+  const projection = stored => JSON.stringify({ kind: 'native_child_handle_projection', modelRequestId: 'request',
+    toolCallId: 'call', toolModelResultId: 'result', toolName: 'bash',
+    modelHandleCatalogContentObjectId: stored.metadata.id, output: 'ready' });
+  try {
+    const result = await parseNativeChildProjection(cold.database, cold.store,
+      projection(original), NATIVE_TOOL_RESULT_PROJECTION_CONTENT_TYPE);
+    assert.equal(result.modelHandleCatalog, catalog);
+    assert.equal(await readNativeToolCallCatalog(cold.database, cold.store, proof), catalog);
+    const discovered = discoverPreparedModelHandleCatalog(catalog, [{ processId: 'native-new-process' }]);
+    const next = await storage.prepareStoredHandleCatalog({ database: cold.database, contentStore: cold.store,
+      conversationId: 'native-owner', kind: 'native-private', catalog: discovered.catalog, base: original,
+      operations: discovered.delta.addedEntries.map(entry => ({ kind: 'bind', entry })) });
+    await cold.database.transaction(next.steps);
+    const nextResult = await parseNativeChildProjection(cold.database, cold.store,
+      projection(next.stored), NATIVE_TOOL_RESULT_PROJECTION_CONTENT_TYPE);
+    assert.equal(modelHandleRef(nextResult.modelHandleCatalog, 'process', 'native-new-process'), 'P65');
+    assert.equal(modelHandleRef(catalog, 'process', 'native-new-process'), undefined, 'the earlier proof keeps its exact view');
+    for (let index = 0; index < storage.STORED_HANDLE_CATALOG_CACHE_LIMITS.entries + 1; index += 1) {
+      await storage.prepareStoredHandleCatalog({ database: cold.database, contentStore: cold.store,
+        conversationId: `idle-${index}`, kind: 'context', catalog: memory.catalog() });
+    }
+    assert.equal(await readNativeToolCallCatalog(cold.database, cold.store, proof), catalog,
+      'an active native holder survives idle-cache eviction');
+    assert.equal(cold.metrics.reads.length, 4, 'proof, projection and delta preparation add no full-catalog reads');
+  } finally { release(); }
+});
+
+test('C2 catalog roots share immutable 32-operation blocks across growth, retirement and fork scope', async t => {
+  const storage = kernelFile('contextHandleCatalogStorage.js');
+  const f = memory.fixture();
+  let previous, at32;
+  for (let count = 1; count <= 65; count += 1) {
+    const prepared = await storage.prepareStoredHandleCatalog({ database: f.database, contentStore: f.store,
+      conversationId: 'producer', kind: 'context', base: previous,
+      catalog: memory.catalog(...Array.from({ length: count }, (_, index) => memory.processHandle(index + 1))) });
+    assert.equal(prepared.contents.length, 2, 'one admission publishes one bounded tail and one root');
+    assert.ok(prepared.stored.metadata.byte_length < 400n);
+    assert.ok(prepared.stored.tail.block.operations.length <= 32);
+    await f.database.transaction(prepared.steps);
+    previous = prepared.stored;
+    if (count === 32) at32 = previous;
+  }
+  const retired = await storage.prepareStoredHandleCatalog({ database: f.database, contentStore: f.store,
+    conversationId: 'producer', kind: 'context', base: previous,
+    catalog: { ...memory.catalog(...previous.catalog.entries.filter(entry => entry.ref !== 'P1')
+      .map(entry => entry.ref === 'P2' ? { ...entry, name: 'stable process metadata' } : entry)),
+      retiredRefs: ['P1'], allocationHighWater: { process: 200 } } });
+  await f.database.transaction(retired.steps);
+  assert.deepEqual(retired.stored.tail.block.operations.map(operation => operation.kind), ['bind', 'retire', 'extend-metadata']);
+  const fork = await storage.prepareStoredHandleCatalog({ database: f.database, contentStore: f.store,
+    conversationId: 'fork', kind: 'context', base: retired.stored, catalog: retired.stored.catalog });
+  assert.equal(fork.contents.length, 1, 'fork publishes only its own scoped root');
+  assert.equal(fork.stored.root.tailBlockContentObjectId, retired.stored.root.tailBlockContentObjectId);
+  await f.database.transaction(fork.steps);
+  const cold = memory.fixture(f.shared);
+  const old = await storage.readStoredHandleCatalog(cold.database, cold.store, at32.metadata);
+  assert.equal(old.catalog.entries.length, 32);
+  assert.equal(old.catalog.entries[0].ref, 'P1', 'later retirement cannot reinterpret an old root');
+  cold.metrics.reads.length = 0;
+  const restored = await storage.readStoredHandleCatalog(cold.database, cold.store, fork.stored.metadata);
+  assert.equal(restored.conversationId, 'fork');
+  assert.deepEqual(restored.catalog.retiredRefs, ['P1']);
+  assert.equal(restored.catalog.allocationHighWater.process, 200);
+  assert.equal(restored.catalog.entries.find(entry => entry.ref === 'P2').name, 'stable process metadata');
+  assert.equal(cold.metrics.reads.length, 4, 'selected root plus three actual blocks; no producer row is needed');
+  t.diagnostic(`65 admissions: ${f.table('ContentObject').filter(row => row.content_type === storage.CONTEXT_HANDLE_CATALOG_BLOCK_CONTENT_TYPE).length} physical bounded blocks; selected chain: 3 blocks; root bytes: ${fork.stored.metadata.byte_length}`);
 });
 
 test('H2 retry branches bind the same process ref independently and reactivate exact immutable catalogs', async () => {
@@ -235,7 +481,7 @@ test('H3 selected-root upgrade resumes 65 occurrences across 32 and 64 checkpoin
     { onProgress: value => progress.push(value.completedRequests) }), []);
   assert.equal(progress[0], 32);
   assert.equal(reopened.metrics.reads.filter(id => id.startsWith('recipe-checkpoint-')).length, 33);
-  assert.ok(reopened.metrics.prepares <= 2);
+  assert.equal(reopened.metrics.prepares, 3, 'one upgrade checkpoint, one bounded catalog block and its root');
   assert.equal(reopened.metrics.reads.includes('recipe-discarded'), false);
   const ready = await readConversationContextHandleState(reopened.database, reopened.store, 'conversation');
   assert.deepEqual(ready.catalog.entries.map(entry => entry.ref), ['P9001', 'P9002']);

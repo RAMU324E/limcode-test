@@ -39,6 +39,7 @@ import { resolveFrozenWorkEnvironmentBoundary } from '../../reliableKernel/workE
 import { frozenSkillPolicy } from '../../reliableKernel/frozenAuthority';
 import { frozenToolPolicyDocument } from '../../reliableKernel/childExecutionBoundary';
 import { realPathOfNearestExisting } from '../../capabilities/vscodeFs';
+import { systemTemporaryDirectory, systemTemporaryWorkEnvironment } from '../../reliableKernel/systemTemporaryWorkEnvironment';
 import { lazySkillCatalogWithinPolicy, skillCatalogWithinPolicy } from '../../world/modules/skill/policy';
 import { describeSkillLookupFailure, renderSkillRecord } from '../../world/modules/skill/skillLookup';
 import type { ExecutionHandoffError } from '../../reliableKernel/executionLeaseFence';
@@ -74,6 +75,11 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   private disposed = false;
   private mcpInitialization: Promise<void> | undefined;
   private onStateChange: (() => void) | undefined;
+  private readonly agentTypeEntriesByAuthority = new WeakMap<object, Promise<{ id: string; label?: string }[]>>();
+  private readonly workEnvironmentsByAuthority = new WeakMap<object, Promise<{
+    active?: WorkEnvironmentRecord;
+    allowed: WorkEnvironmentRecord[];
+  }>>();
 
   public constructor(
     context: vscode.ExtensionContext,
@@ -392,7 +398,22 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   }
 
   /** 供 toolDispatcher 构建模型可见的 agent.type 列表；排除运行时镜像（mirror id 不是合法 agent.type）。 */
-  public async agentTypeEntries(): Promise<{ id: string; label?: string }[]> {
+  public async agentTypeEntries(authority?: ReliableToolDispatchAuthority): Promise<{ id: string; label?: string }[]> {
+    const key = authority?.document && typeof authority.document === 'object'
+      ? authority.document as object : undefined;
+    if (!key) return this.readAgentTypeEntries();
+    let pending = this.agentTypeEntriesByAuthority.get(key);
+    if (!pending) {
+      pending = this.readAgentTypeEntries();
+      this.agentTypeEntriesByAuthority.set(key, pending);
+      void pending.catch(() => {
+        if (this.agentTypeEntriesByAuthority.get(key) === pending) this.agentTypeEntriesByAuthority.delete(key);
+      });
+    }
+    return (await pending).map(entry => ({ ...entry }));
+  }
+
+  private async readAgentTypeEntries(): Promise<{ id: string; label?: string }[]> {
     const agents = await this.configuration.agents();
     return agents
       .filter((agent) => agent.runtimeRole !== 'mirror')
@@ -404,7 +425,22 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     active?: WorkEnvironmentRecord;
     allowed: WorkEnvironmentRecord[];
   }> {
-    return this.resolveEnvironments(authority);
+    const key = authority.document && typeof authority.document === 'object'
+      ? authority.document as object : undefined;
+    if (!key) return this.resolveEnvironments(authority);
+    let pending = this.workEnvironmentsByAuthority.get(key);
+    if (!pending) {
+      pending = this.resolveEnvironments(authority);
+      this.workEnvironmentsByAuthority.set(key, pending);
+      void pending.catch(() => {
+        if (this.workEnvironmentsByAuthority.get(key) === pending) this.workEnvironmentsByAuthority.delete(key);
+      });
+    }
+    const environments = await pending;
+    return {
+      ...(environments.active ? { active: { ...environments.active } } : {}),
+      allowed: environments.allowed.map(environment => ({ ...environment }))
+    };
   }
 
   private async resolveEnvironments(authority: ReliableToolDispatchAuthority): Promise<{
@@ -414,7 +450,11 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     const policy = authorityWorkEnvironmentPolicy(authority.document);
     const records = await this.configuration.workEnvironments();
     const boundary = resolveFrozenWorkEnvironmentBoundary(policy, records);
-    return cloneEnvironmentBoundary(boundary);
+    const local = boundary.allowed.some(environment => environment.kind === 'localFolder');
+    return {
+      ...(boundary.active ? { active: { ...boundary.active } } : {}),
+      allowed: local ? [...boundary.allowed, systemTemporaryWorkEnvironment()] : [...boundary.allowed]
+    };
   }
 
   private async loadAttachmentMaxBytes(): Promise<number> {
@@ -426,16 +466,6 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     }
     return maxMb * 1024 * 1024;
   }
-}
-
-function cloneEnvironmentBoundary(boundary: {
-  active?: WorkEnvironmentRecord;
-  allowed: WorkEnvironmentRecord[];
-}): { active?: WorkEnvironmentRecord; allowed: WorkEnvironmentRecord[] } {
-  return {
-    ...(boundary.active ? { active: { ...boundary.active } } : {}),
-    allowed: boundary.allowed.map((environment) => ({ ...environment }))
-  };
 }
 
 function authorityWorkEnvironmentPolicy(document: PlainJsonValue): {

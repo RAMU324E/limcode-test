@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import test from 'node:test';
+import { startService } from './fixtures/ci-storage-authority.mjs';
 const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const kernel = require(path.join(compiled, 'backend/reliableKernel/index.js'));
@@ -11,8 +12,57 @@ const shared = require(path.join(compiled, 'shared/reliableKernelClientFeed.js')
 const NativeDatabase = require('better-sqlite3');
 const { ExternalClientCommits } = require(path.join(compiled, 'backend/reliableKernel/externalClientCommits.js'));
 const { runtimeHostLivenessDirectory } = require(path.join(compiled, 'backend/reliableKernel/runtimeHostControl.js'));
+const { ReliableTransientReplayStore } = require(path.join(compiled, 'backend/reliableKernel/transientReplay.js'));
 const NOW = '2026-10-15T00:00:00.000Z';
 const insert = (domain, record) => kernel.DOMAIN_REPOSITORIES.domain(domain).insert(record);
+
+test('原生已提交 item 从恢复缓存释放，跨 response 的同名在飞 item 保留正文与流前沿', () => {
+  const replay = new ReliableTransientReplayStore();
+  let sequence = 0;
+  const identity = { conversationId: 'conversation', modelRequestId: 'request', attemptSeq: '1', socketGeneration: '1' };
+  const emit = (kind, content, afterCommitSeq = String(sequence + 1)) => replay.observe({ ...identity, turnId: 'turn', requestSeq: '1',
+    providerId: 'provider', modelId: 'model', afterCommitSeq, observedAt: new Date().toISOString(),
+    event: { kind, streamSeq: String(++sequence), content } });
+  for (let index = 0; index < 1000; index++) {
+    const outputItem = { id: 'item-' + index, ordinal: index, providerResponseId: 'response' };
+    emit('output_delta', { type: 'text_delta', text: 'x'.repeat(2048), outputItem });
+    emit('output_item_done', { type: 'output_item_done', committedRevisionId: 'revision-' + index,
+      outputItem, committedPart: { text: 'x'.repeat(2048), outputItem } });
+  }
+  const sealed = replay.snapshot(identity);
+  assert.equal(sealed.events.length, 1);
+  assert.equal(sealed.headStreamSeq, '2000');
+  assert.equal(sealed.events[0].event.content.committedRevisionId, 'revision-999');
+  assert.equal(sealed.events[0].event.content.committedPart, undefined);
+  assert.ok(Buffer.byteLength(JSON.stringify(sealed)) < 1200);
+
+  const left = { id: 'reused-id', ordinal: 0, providerResponseId: 'left-response' };
+  const right = { id: 'reused-id', ordinal: 0, providerResponseId: 'right-response' };
+  emit('output_delta', { type: 'text_delta', text: 'left item', outputItem: left });
+  emit('output_delta', { type: 'text_delta', text: 'right unfinished tail', outputItem: right });
+  emit('output_item_done', { type: 'output_item_done', committedRevisionId: 'left-revision', outputItem: left,
+    committedPart: { text: 'left item', outputItem: left } });
+  const active = replay.snapshot(identity);
+  assert.equal(active.events.length, 2);
+  assert.equal(active.headStreamSeq, '2003');
+  assert.equal(active.events[0].event.content.text, 'right unfinished tail');
+  assert.equal(active.events[0].event.content.outputItem.providerResponseId, 'right-response');
+  assert.equal(active.events[1].event.content.committedRevisionId, 'left-revision');
+  assert.ok(active.events.every(item => item.afterCommitSeq === active.afterCommitSeq));
+  // A new response still uses the request's dispatch barrier, below the preceding item commit.
+  emit('output_delta', { type: 'text_delta', text: 'right next response delta', outputItem: right }, '50');
+  const resumed = replay.snapshot(identity);
+  assert.equal(resumed.afterCommitSeq, '2003');
+  assert.ok(resumed.events.every(item => item.afterCommitSeq === resumed.afterCommitSeq));
+  assert.equal(resumed.events.at(-1).event.content.text, 'right next response delta');
+  emit('failed', { type: 'failed', message: 'stopped' }, '50');
+  const failed = replay.snapshot(identity);
+  assert.equal(failed.headStreamSeq, '2005');
+  assert.equal(failed.afterCommitSeq, '2003');
+  assert.ok(failed.events.every(item => item.afterCommitSeq === failed.afterCommitSeq));
+  assert.equal(failed.events[0].event.content.text, 'right unfinished tail');
+  assert.equal(failed.events.at(-1).event.kind, 'failed');
+});
 
 async function fixture(run) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-external-feed-'));
@@ -44,7 +94,7 @@ async function fixture(run) {
     const initial = shared.applyReliableKernelDataMessage(shared.createEmptyReliableKernelClientState(), frames[0]);
     feed.acknowledge(initial.ack);
     const waitFrame = () => new Promise(resolve => { nextFrame = resolve; });
-    await run({ database, cas, feed, peer, notify, frames, connection, initial: initial.state, waitFrame });
+    await run({ database, authority: root.authority, cas, feed, peer, notify, frames, connection, initial: initial.state, waitFrame });
   } finally {
     feed.close(); peer.close(); notices.close(); await fs.rm(registration, { force: true });
     await database.close(); await fs.rm(directory, { recursive: true, force: true });
@@ -162,5 +212,60 @@ test('写入窗口在两次轮询之间开启后退出，不能被另一窗口�
     await fs.writeFile(path.join(runtimeHostLivenessDirectory(database.binding.paths), '.client-membership'), 'writer-opened-and-closed');
     await feed.pollExternalCommits();
     assert.equal((await changed).type, 'reliable-kernel.snapshot');
+  });
+});
+
+async function seedRemovalMessages(database, cas) {
+  const body = await cas.ingest(database, JSON.stringify({ role: 'user', parts: [{ text: 'scope' }] }),
+    'application/vnd.limcode.message+json');
+  const steps = [];
+  for (const [conversationId, count] of [['self', 205], ['peer', 1]]) for (let sequence = 1; sequence <= count; sequence++) {
+    const id = `${conversationId}-remove-${sequence}`;
+    steps.push(insert('Message', { id, created_at: NOW, updated_at: NOW, deleted_at: null }),
+      insert('MessageRevision', { id: `${id}-revision`, message_id: id, revision_seq: 1n, role: 'user', content_object_id: body.id, created_at: NOW }),
+      insert('MessageCurrentRevisionLink', { id: `${id}-current`, message_id: id, revision_id: `${id}-revision`, updated_at: NOW }),
+      insert('MessagePartOfConversation', { id: `${id}-member`, message_id: id, conversation_id: conversationId, message_seq: BigInt(sequence), created_at: NOW }));
+    if (sequence === 1) steps.push(insert('MessageTurnLink', {
+      id: `${id}-turn-link`, message_id: id, turn_id: `${conversationId}-turn`, role: 'input', created_at: NOW
+    }));
+  }
+  await database.transaction(steps);
+}
+
+for (const external of [false, true]) test(`${external ? '外部' : '本地'}结构删除只刷新所属会话，窗口外删除保留楼层数量语义`, { timeout: 15000 }, async () => {
+  await fixture(async ({ database, cas, feed, connection }) => {
+    feed.disconnect(connection.sessionId);
+    await seedRemovalMessages(database, cas);
+    const service = external ? startService(database, { name: 'feed-removal-writer' }) : undefined;
+    if (service) { await service.ready; await service.command('writer-open'); }
+    const transaction = steps => service ? service.command('mutate', { steps }) : database.transaction(steps);
+    try {
+      const frames = [];
+      let nextFrame;
+      const current = await feed.connect({ activeConversationId: 'self', send(frame) { frames.push(frame); nextFrame?.(frame); } });
+      feed.acknowledge({ ...current, messageSeq: frames[0].messageSeq });
+      assert.equal(frames[0].projections.activeConversationWindow.messages.some(row => row.id === 'self-remove-1'), false);
+      const snapshot = database.clientProjectionSnapshot.bind(database);
+      let reads = 0;
+      database.clientProjectionSnapshot = (...args) => { reads++; return snapshot(...args); };
+      const removed = await transaction([
+        kernel.DOMAIN_REPOSITORIES.domain('Message').update('peer-remove-1', { deleted_at: NOW, updated_at: NOW }),
+        kernel.DOMAIN_REPOSITORIES.domain('MessageTurnLink').delete('peer-remove-1-turn-link')
+      ]);
+      assert.deepEqual(removed.changes.find(row => row.domain === 'Message' && row.id === 'peer-remove-1').scope.conversationIds, ['peer']);
+      if (external) await feed.pollExternalCommits();
+      assert.equal(reads, 0);
+      assert.equal(frames.length, 1);
+      const changed = new Promise(resolve => { nextFrame = resolve; });
+      const affected = await transaction([kernel.DOMAIN_REPOSITORIES.domain('Message').update('self-remove-1', { deleted_at: NOW, updated_at: NOW })]);
+      assert.deepEqual(affected.changes.find(row => row.domain === 'Message' && row.id === 'self-remove-1').scope.conversationIds, ['self']);
+      if (external) await feed.pollExternalCommits();
+      const refreshed = await changed;
+      assert.equal(refreshed.type, 'reliable-kernel.snapshot');
+      assert.equal(refreshed.projections.activeConversationWindow.visibleMessageCount, '204');
+      const messages = refreshed.projections.activeConversationWindow.messages;
+      assert.equal(messages.at(-1).display_seq, '204');
+      assert.equal(reads, 1);
+    } finally { await service?.stop(); }
   });
 });

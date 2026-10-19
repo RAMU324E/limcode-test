@@ -5,7 +5,8 @@ import { RuntimeDataInvariantError } from './runtimeDataInvariant';
 import { prepareCached } from './runtimeStatementCache';
 
 const DOMAIN = 'ConversationContextHandleState';
-const READY_TYPE = 'application/vnd.limcode.conversation-context-handle-state+json';
+const READY_TYPES = new Set(['application/vnd.limcode.conversation-context-handle-state+json',
+  'application/vnd.limcode.context-handle-catalog+json']);
 const PENDING_TYPE = 'application/vnd.limcode.conversation-context-handle-upgrade+json';
 const stateIds = new Map<string, string>();
 function stateId(conversationId: string): string {
@@ -32,7 +33,7 @@ export function assertConversationContextHandleState(database: Database.Database
   }
   const metadata = prepareCached(database, 'SELECT content_type FROM content_object WHERE id = ?')
     .get(row.content_object_id) as { content_type: string } | undefined;
-  if (metadata?.content_type !== (row.state === 'ready' ? READY_TYPE : PENDING_TYPE)) {
+  if (!metadata || (row.state === 'ready' ? !READY_TYPES.has(metadata.content_type) : metadata.content_type !== PENDING_TYPE)) {
     fail('Context reference state does not reference its own typed catalog or upgrade checkpoint.');
   }
 }
@@ -53,7 +54,7 @@ export function assertContextRootHandleCatalog(database: Database.Database, row:
   if (row.content_object_id === null) return;
   const metadata = prepareCached(database, 'SELECT content_type FROM content_object WHERE id = ?')
     .get(row.content_object_id) as { content_type: string } | undefined;
-  if (metadata?.content_type !== READY_TYPE) fail('Context root catalog must reference a ready typed catalog.');
+  if (!metadata || !READY_TYPES.has(metadata.content_type)) fail('Context root catalog must reference a ready typed catalog.');
 }
 
 function assertRootOwner(database: Database.Database, row: DomainRow, fail: (message: string) => never): void {

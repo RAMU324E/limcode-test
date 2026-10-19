@@ -1,6 +1,8 @@
 import { resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
+import { retainStoredHandleCatalog, storedHandleCatalog } from './contextHandleCatalogStorage';
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
+import { LogicalMessageContentReader, logicalMessageContentType } from './logicalMessageContent';
 import { ContextSequenceControlPlane, type MaterializedContextStructure } from './contextSequence';
 import { compressionBlockIdFor } from './contextCompression';
 import { ContextHandleReadMemo } from './contextHandleReadMemo';
@@ -11,11 +13,13 @@ import { readForkContextHandleReservationEvidence } from './forkContextHandleRes
 import { readHistoricalCompressionHandleCatalog } from './historicalCompressionHandleCatalog';
 import { buildModelHandleCatalog, CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION,
   isCollaborationHandleTool, isPersistentContextHandle, normalizeModelHandleCatalog,
-  mergeModelHandleCatalogs, ModelHandleIdentityConflictError,
+  mergeModelHandleCatalogs, ModelHandleIdentityConflictError, modelHandleAllocationFrontier, modelHandleTarget,
+  selectModelHandleEntries, sharedPreparedModelHandleCatalog,
   reconcileHistoricalModelHandleCatalogs, type ModelHandleCatalog,
   type ModelHandleEntry, type ModelHandleKind } from './modelHandleCatalog';
 import { originalNativeMessageRevisionId, nativeMessageRevisionItemKey } from './contextNativeMessageProvenance';
-import { parseNativeToolCallCheckpoint } from './nativeToolFacts';
+import { parseNativeToolCallCheckpoint, readNativeToolCallCatalog } from './nativeToolFacts';
+import { parseNativeChildProjection } from './conversationChildHandles';
 import type { PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
@@ -87,16 +91,19 @@ interface SegmentEvidence {
 export async function readContextHandleOccurrenceCatalog(database: RuntimeDatabase, store: ContentAddressedStore,
   occurrence: ContextHandleOccurrenceEvidence, baseCatalog: ModelHandleCatalog,
   onProducerScope?: (scope: ContextHandleProducerScope) => void | Promise<void>): Promise<ModelHandleCatalog> {
-  const reader = new OccurrenceReader(database, store);
-  reader.onProducerScope = onProducerScope;
-  reader.reserve(baseCatalog);
-  const facts = await reader.occurrence(occurrence, baseCatalog);
-  return withFloor(reconcileHistoricalModelHandleCatalogs(facts, { allocationHighWater: reader.highWater }), reader.highWater);
+  const storedBase = storedHandleCatalog(database, store, baseCatalog);
+  const releaseBase = storedBase && retainStoredHandleCatalog(database, store, storedBase);
+  try {
+    const reader = new OccurrenceReader(database, store);
+    reader.onProducerScope = onProducerScope;
+    reader.reserve(baseCatalog);
+    const facts = await reader.occurrence(occurrence, baseCatalog);
+    return withFloor(reconcileHistoricalModelHandleCatalogs(facts, { allocationHighWater: reader.highWater }), reader.highWater);
+  } finally { releaseBase?.(); }
 }
 
 /** Exact visible input values select a subset of the already allocated request-private lookup. */
 export function selectContextHandleBindings(values: readonly unknown[], catalogInput: ModelHandleCatalog): ModelHandleCatalog {
-  const catalog = normalizeModelHandleCatalog(catalogInput);
   const refs = new Set<string>();
   const scan = (value: unknown): void => {
     if (typeof value === 'string') for (const match of value.matchAll(REF)) refs.add(match[0]);
@@ -105,8 +112,13 @@ export function selectContextHandleBindings(values: readonly unknown[], catalogI
   };
   values.forEach(scan);
   const targets = new Set(buildModelHandleCatalog(values).entries.map(entry => `${entry.kind}\0${entry.target}`));
-  return { ...empty(), entries: catalog.entries.filter(entry => isPersistentContextHandle(entry.kind)
-    && (refs.has(entry.ref) || targets.has(`${entry.kind}\0${entry.target}`))) };
+  return { ...empty(), entries: selectModelHandleEntries(catalogInput, refs, targets) };
+}
+
+function selectedCatalog(catalog: ModelHandleCatalog, entries: readonly ModelHandleEntry[]): ModelHandleCatalog {
+  return { entries, ...(catalog.identityContractRevision ? { identityContractRevision: catalog.identityContractRevision,
+    retiredRefs: catalog.retiredRefs ?? [] } : {}),
+    ...(catalog.allocationHighWater ? { allocationHighWater: catalog.allocationHighWater } : {}) };
 }
 
 /**
@@ -293,7 +305,7 @@ export async function readContextHandleRootEvidence(database: RuntimeDatabase, s
     if (segment.occurrences.length) {
       for (const planned of segment.occurrences) {
         const occurrence = planned.kind === 'message' ? { ...planned, content: content.text,
-          contentType: id(content.metadata.content_type) } : planned;
+          contentType: logicalMessageContentType(id(content.metadata.content_type)) } : planned;
         for (const fact of await reader.occurrence(occurrence, base, lookups)) facts.add(fact, reader.origins.get(fact));
       }
     } else {
@@ -410,8 +422,11 @@ class OccurrenceReader {
   private readonly compressionIndexes = new Map<string, Map<string, string[]>>();
   private readonly legacyCompressionIndexes = new Set<string>();
   private readonly scopes = new Map<string, Promise<string[]>>();
+  private readonly messageContents: LogicalMessageContentReader;
   public constructor(private readonly database: RuntimeDatabase, private readonly store: ContentAddressedStore,
-    private readonly signal?: AbortSignal) {}
+    private readonly signal?: AbortSignal) {
+    this.messageContents = new LogicalMessageContentReader(database, store);
+  }
   public check(): void { this.signal?.throwIfAborted(); }
   public maybe(domain: string, key: string): Promise<DomainRow | null> {
     const cacheKey = `${domain}\0${key}`;
@@ -454,7 +469,9 @@ class OccurrenceReader {
     if (!pending) {
       pending = (async () => {
         const metadata = await this.get('ContentObject', key);
-        const text = (await this.store.read(metadata as unknown as ContentObjectMetadata)).toString('utf8');
+        // The shared reader dispatches only the explicit Message composition type; recipe,
+        // proof, projection and authority objects keep their original physical bytes.
+        const text = (await this.messageContents.read(metadata as unknown as ContentObjectMetadata)).toString('utf8');
         const bytes = text.length * 2;
         this.contentSizes.set(key, bytes); this.contentBytes += bytes;
         while (this.contentBytes > 8 * 1024 * 1024 || this.contents.size > 64) {
@@ -486,19 +503,17 @@ class OccurrenceReader {
             || typeof scope.resetFence !== 'string' || !/^\d+$/.test(scope.resetFence)) throw invalid('Frozen Context handle scope is invalid.');
           producerScope = scope as unknown as ContextHandleProducerScope;
         }
-        // The memo can share equal maps across requests. A private shallow wrapper keeps their
-        // diagnostic origins distinct without copying the cumulative entries or changing markers.
-        const catalog = { ...this.memo.persistent(this.memo.catalog(
-          await resolveFrozenModelHandleCatalog(this.database, this.store, parsed) as unknown as PlainJsonValue)) };
+        // Diagnostic origins belong to this producer; its immutable lookup and entries remain
+        // shared. Occurrence selection below publishes only the persistent identities it used.
+        const catalog = sharedPreparedModelHandleCatalog(await resolveFrozenModelHandleCatalog(this.database, this.store, parsed));
         this.origins.set(catalog, { source: 'frozen_recipe', requestId: key, contentObjectId: id(request.recipe_object_id) });
         let inputBindings: ModelHandleCatalog | undefined;
         if (parsed.contextHandleInputBindings !== undefined) {
           inputBindings = normalizeModelHandleCatalog(parsed.contextHandleInputBindings);
-          const frozen = new Map(catalog.entries.map(entry => [entry.ref, `${entry.kind}\0${entry.target}`]));
           if (inputBindings.identityContractRevision !== CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION
             || (inputBindings.retiredRefs?.length ?? 0) > 0
             || inputBindings.entries.some(entry => !isPersistentContextHandle(entry.kind)
-              || frozen.get(entry.ref) !== `${entry.kind}\0${entry.target}`)) {
+              || modelHandleTarget(catalog, entry.kind, entry.ref) !== entry.target)) {
             throw invalid('Frozen input bindings are not an exact subset of their producer lookup.');
           }
         }
@@ -577,12 +592,9 @@ class OccurrenceReader {
     }
   }
   public reserve(catalog: ModelHandleCatalog): void {
-    this.reserveFloor((catalog as ModelHandleCatalog & { allocationHighWater?: ContextHandleAllocationHighWater }).allocationHighWater ?? {});
-    for (const entry of catalog.entries) if (isPersistentContextHandle(entry.kind)) {
-      this.highWater[entry.kind] = Math.max(this.highWater[entry.kind] ?? 0, Number(entry.ref.slice(1)));
-    }
-    for (const ref of catalog.retiredRefs ?? []) if (REF_KINDS[ref[0]]) {
-      const kind = REF_KINDS[ref[0]]; this.highWater[kind] = Math.max(this.highWater[kind] ?? 0, Number(ref.slice(1)));
+    for (const [name, ordinal] of Object.entries(modelHandleAllocationFrontier(catalog))) {
+      const kind = name as ModelHandleKind;
+      if (isPersistentContextHandle(kind)) this.highWater[kind] = Math.max(this.highWater[kind] ?? 0, ordinal);
     }
   }
   public select(values: unknown[], catalogs: readonly ModelHandleCatalog[], base: ModelHandleCatalog): ModelHandleCatalog[] {
@@ -605,11 +617,10 @@ class OccurrenceReader {
     const resolvedTargets = new Set<string>();
     for (const catalog of catalogs) {
       this.reserve(catalog);
-      const entries = catalog.entries.filter(entry => isPersistentContextHandle(entry.kind)
-        && (refs.has(entry.ref) || targets.has(`${entry.kind}\0${entry.target}`)));
+      const entries = selectModelHandleEntries(catalog, refs, targets);
       for (const entry of entries) { resolvedRefs.add(entry.ref); resolvedTargets.add(`${entry.kind}\0${entry.target}`); }
       if (entries.length || catalog.retiredRefs?.length) {
-        const selected = { ...catalog, entries };
+        const selected = selectedCatalog(catalog, entries);
         const origin = this.origins.get(catalog);
         if (origin) this.origins.set(selected, origin);
         chosen.push(selected);
@@ -620,10 +631,9 @@ class OccurrenceReader {
       chosen.push(fact);
       for (const entry of fact.entries) { resolvedRefs.add(entry.ref); resolvedTargets.add(`${entry.kind}\0${entry.target}`); }
     }
-    const fallback = base.entries.filter(entry => isPersistentContextHandle(entry.kind)
-      && ((refs.has(entry.ref) && !resolvedRefs.has(entry.ref))
-        || (targets.has(`${entry.kind}\0${entry.target}`) && !resolvedTargets.has(`${entry.kind}\0${entry.target}`))));
-    if (fallback.length || base.retiredRefs?.length) chosen.push({ ...base, entries: fallback });
+    const fallback = selectModelHandleEntries(base, new Set([...refs].filter(ref => !resolvedRefs.has(ref))),
+      new Set([...targets].filter(target => !resolvedTargets.has(target))));
+    if (fallback.length || base.retiredRefs?.length) chosen.push(selectedCatalog(base, fallback));
     return chosen;
   }
   public async occurrence(occurrence: ContextHandleOccurrenceEvidence, base: ModelHandleCatalog,
@@ -669,12 +679,14 @@ class OccurrenceReader {
           if (typeof value.checkpointId !== 'string') continue;
           const checkpoint = await this.maybe('ModelStreamCheckpoint', value.checkpointId);
           if (!checkpoint) continue; // Bounded stream proofs may have been pruned after admission.
-          const envelope = object(JSON.parse((await this.content(id(checkpoint.content_object_id))).text), 'Native checkpoint');
-          const proof = parseNativeToolCallCheckpoint(envelope.content);
+          const checkpointContent = await this.content(id(checkpoint.content_object_id));
+          const envelope = object(JSON.parse(checkpointContent.text), 'Native checkpoint');
+          const proof = parseNativeToolCallCheckpoint(envelope.content, String(checkpointContent.metadata.content_type));
           if (proof.providerCallId !== source.provider_call_id || proof.toolName !== call.tool_name) throw invalid('Native call proof conflicts with its source.');
-          this.origins.set(proof.modelHandleCatalog, { source: 'native_admission', requestId: id(evidence.request.id),
+          const catalog = await readNativeToolCallCatalog(this.database, this.store, proof);
+          this.origins.set(catalog, { source: 'native_admission', requestId: id(evidence.request.id),
             contentObjectId: id(checkpoint.content_object_id), eventId: id(admission.id) });
-          catalogs.push(proof.modelHandleCatalog); values.push(proof.arguments, proof.resolvedArguments);
+          catalogs.push(catalog); values.push(proof.arguments, proof.resolvedArguments);
         }
         if (this.selectedFacts) catalogs.push(...await this.nativeLookups(evidence));
       } else {
@@ -687,9 +699,11 @@ class OccurrenceReader {
         const projections = await this.list('ToolCallEvent', { tool_call_id: occurrence.toolCallId, event_kind: NATIVE_PROJECTION });
         if (projections.length > 1) throw invalid('Native result has multiple frozen projections.');
         if (projections.length) {
-          const projection = object(JSON.parse((await this.content(id(projections[0].content_object_id))).text), 'Native result projection');
+          const projectionContent = await this.content(id(projections[0].content_object_id));
+          const projection = await parseNativeChildProjection(this.database, this.store,
+            projectionContent.text, String(projectionContent.metadata.content_type), this.memo);
           await this.validateProjection(projection, evidence, occurrence.toolCallId, occurrence.toolModelResultId);
-          const catalog = projectionCatalog(projection);
+          const catalog = projection.modelHandleCatalog;
           this.origins.set(catalog, { source: 'native_projection', requestId: id(evidence.request.id),
             contentObjectId: id(projections[0].content_object_id), eventId: id(projections[0].id) });
           catalogs.push(catalog);
@@ -711,10 +725,11 @@ class OccurrenceReader {
       let catalog = evidence.catalog;
       for (const source of await this.list('ToolCallSourceLink', { model_request_id: requestId })) {
         for (const event of await this.list('ToolCallEvent', { tool_call_id: source.tool_call_id, event_kind: NATIVE_PROJECTION })) {
-          const projection = object(JSON.parse((await this.content(id(event.content_object_id))).text), 'Native projection');
+          const projectionContent = await this.content(id(event.content_object_id));
+          const projection = await parseNativeChildProjection(this.database, this.store,
+            projectionContent.text, String(projectionContent.metadata.content_type), this.memo);
           await this.validateProjection(projection, evidence, id(source.tool_call_id));
-          const incoming = this.memo.persistent(this.memo.catalog((projection.modelHandleCatalog
-            ?? { entries: projection.childHandles }) as PlainJsonValue));
+          const incoming = this.memo.persistent(projection.modelHandleCatalog);
           // One native request has one strict private scope, even for published window-local maps.
           const merged = mergeModelHandleCatalogs(catalog, incoming);
           catalog = evidence.catalog.identityContractRevision === undefined && incoming.identityContractRevision === undefined
@@ -740,7 +755,7 @@ class OccurrenceReader {
     }
     await this.onProducerScope(scope);
   }
-  private async validateProjection(projection: Record<string, unknown>, evidence: RequestEvidence,
+  private async validateProjection(projection: { kind: unknown; modelRequestId: unknown; toolCallId: unknown; toolModelResultId: unknown }, evidence: RequestEvidence,
     toolCallId: string, resultId?: string): Promise<void> {
     if (projection.kind !== NATIVE_PROJECTION
       || !await this.matchesCopy(evidence.conversationId, 'model_request', id(projection.modelRequestId), id(evidence.request.id))
@@ -859,9 +874,6 @@ class OccurrenceReader {
   }
 }
 
-function projectionCatalog(value: Record<string, unknown>): ModelHandleCatalog {
-  return normalizeModelHandleCatalog(value.modelHandleCatalog ?? { entries: value.childHandles });
-}
 /** Compact raw identity facts plus O(1) unambiguous lookup. No cumulative recipe is retained. */
 class SelectedFactIndex {
   private readonly facts = new Map<string, { entry: ModelHandleEntry; current: boolean;
@@ -903,7 +915,7 @@ class SelectedFactIndex {
     Object.assign(error, { contextHandleEvidence: { conversationId, rootId, witnesses } });
   }
   public catalogs(): ModelHandleCatalog[] {
-    const current = empty(); const legacy: ModelHandleCatalog = { entries: [] };
+    const current = { ...empty(), entries: [] as ModelHandleEntry[] }; const legacy = { entries: [] as ModelHandleEntry[] };
     current.retiredRefs = [...this.retired];
     for (const fact of this.facts.values()) (fact.current ? current : legacy).entries.push(fact.entry);
     // Individually conflicting facts cannot be represented as one normalized catalog. Keep each
@@ -925,7 +937,7 @@ class SelectedFactIndex {
     const keys = new Set<string>();
     for (const ref of refs) if (!resolvedRefs.has(ref)) for (const key of this.byRef.get(ref) ?? []) keys.add(key);
     for (const target of targets) if (!resolvedTargets.has(target)) for (const key of this.byTarget.get(target) ?? []) keys.add(key);
-    const current = empty(); const legacy: ModelHandleCatalog = { entries: [] };
+    const current = { ...empty(), entries: [] as ModelHandleEntry[] }; const legacy = { entries: [] as ModelHandleEntry[] };
     for (const key of keys) {
       const fact = this.facts.get(key)!; const entry = fact.entry;
       if (this.retired.has(entry.ref) || this.byRef.get(entry.ref)!.size !== 1

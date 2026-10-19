@@ -23,15 +23,19 @@ const { NativeRequestSession } = load('backend/reliableKernel/nativeRequestSessi
 const { readConversationChildHandles, readNativeRequestChildHandles, NATIVE_CHILD_HANDLE_PROJECTION_EVENT } =
   load('backend/reliableKernel/conversationChildHandles.js');
 
-const { resolveModelToolArguments } = load('backend/reliableKernel/modelHandleCatalog.js');
+const { resolveModelToolArguments, prepareModelHandleCatalog, CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION } =
+  load('backend/reliableKernel/modelHandleCatalog.js');
+const { parseNativeToolCallCheckpoint, readNativeToolCallCatalog, NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE } =
+  load('backend/reliableKernel/nativeToolFacts.js');
 
 const capabilities = { asyncTools: true, steering: true, reasoningUpdates: true, multiplexing: false, explicitCaching: true };
 
 const definition = { name: 'run_agent', description: 'native child handle fixture', parameters: { type: 'object' } };
 
-function nativeResultProjectionFixture(results) {
+function nativeResultProjectionFixture(results, initialCatalog = { entries: [] }) {
   const domains = new Map();
   const bodies = new Map();
+  const reads = [];
   const put = (domain, row) => {
     if (!domains.has(domain)) domains.set(domain, new Map());
     domains.get(domain).set(row.id, row);
@@ -81,7 +85,7 @@ function nativeResultProjectionFixture(results) {
   };
   let counter = 0;
   const contentStore = {
-    async read(metadata) { assert.ok(bodies.has(metadata.id)); return Buffer.from(bodies.get(metadata.id)); },
+    async read(metadata) { reads.push(metadata.id); assert.ok(bodies.has(metadata.id)); return Buffer.from(bodies.get(metadata.id)); },
     async readMany(metadata) { return Promise.all(metadata.map(value => this.read(value))); },
     async prepare(_database, content, contentType) {
       const metadata = { id: `projection-body-${counter++}`, content_type: contentType, sha256: 'fixture',
@@ -94,8 +98,10 @@ function nativeResultProjectionFixture(results) {
   const submitted = [];
   let ended = 0;
   const session = new NativeRequestSession({ database, contentStore, tools: {}, capabilities,
-    modelRequestId: 'projection-request', turnId: 'projection-turn', providerId: 'projection-provider',
-    modelHandleCatalog: { entries: [] }, now: () => new Date().toISOString(),
+    modelRequestId: 'projection-request', turnId: 'projection-turn', conversationId: 'projection-conversation',
+    providerId: 'projection-provider', modelId: 'gpt-6-astra',
+    modelHandleCatalog: initialCatalog, now: () => new Date().toISOString(),
+    resolveCallArguments: (name, args) => ({ arguments: resolveModelToolArguments(name, args, session.currentModelHandleCatalog()) }),
     budget: { planningInputCapacityTokens: 200000, compressionThresholdTokens: 180000, autoCompressionEnabled: false },
     modelProvider: { async readNativeLatestResponseUsage() { return {
       responseId: 'projection-response', streamSeq: '3', attemptSeq: '1', socketGeneration: '1',
@@ -116,12 +122,13 @@ function nativeResultProjectionFixture(results) {
     responseId: 'projection-response', providerOrdinal: results.length, asyncDeclared: true,
     admitted: true, settled: false, delivered: false });
   session.controller = { endLogicalRequest() { ended += 1; }, async submitToolResults(outputs) { submitted.push(outputs); } };
-  return { session, database, contentStore, bodies, domains, submitted, ended: () => ended };
+  return { session, database, contentStore, bodies, domains, reads, submitted, ended: () => ended };
 }
 
 function registerCases(test) {
 
-test('recovery of admitted unsettled native calls dispatches frozen canonical arguments and settles frozen unknown-reference errors', { timeout: 5000 }, async () => {
+for (const frozenFormat of ['published inline', 'private reference']) {
+test(`recovery of admitted unsettled native calls dispatches frozen canonical arguments and settles frozen unknown-reference errors (${frozenFormat})`, { timeout: 5000 }, async () => {
   const catalog = { entries: [{ kind: 'child', ref: 'A1', target: 'answer_bridge_original' }] };
   const unknownArgs = { operation: 'send', childRef: 'A999', prompt: 'must remain rejected' };
   let unknownMessage;
@@ -133,6 +140,14 @@ test('recovery of admitted unsettled native calls dispatches frozen canonical ar
     { type: 'native_tool_call', responseId: 'response', toolName: 'run_agent', providerCallId: 'invalid-send', providerOrdinal: 1,
       async: true, arguments: unknownArgs, resolvedArguments: unknownArgs, argumentResolutionError: unknownMessage, modelHandleCatalog: catalog }
   ];
+  const privateBodies = new Map();
+  if (frozenFormat === 'private reference') {
+    privateBodies.set('private-root', { kind: 'native-private-handle-catalog', conversationId: 'parent',
+      baseContentObjectId: null, identityContractRevision: null, tailBlockContentObjectId: 'private-block', allocationHighWater: {} });
+    privateBodies.set('private-block', { kind: 'context-handle-catalog-block', previousBlockContentObjectId: null,
+      operations: catalog.entries.map(entry => ({ kind: 'bind', entry })) });
+    for (const proof of proofs) { delete proof.modelHandleCatalog; proof.modelHandleCatalogContentObjectId = 'private-root'; }
+  }
   const admissions = new Map(proofs.map(proof => [proof.providerCallId, { toolCallId: proof.providerCallId, declaredAsync: true }]));
   const terminals = new Map();
   const dispatched = [];
@@ -155,7 +170,11 @@ test('recovery of admitted unsettled native calls dispatches frozen canonical ar
       })) };
       return { snapshot: [] };
     },
-    async snapshot(queries) { return { snapshot: queries.map(query => query.domain === 'ContentObject' ? { id: query.id } : null) }; }
+    async snapshot(queries) { return { snapshot: queries.map(query => query.domain === 'ContentObject'
+      ? { id: query.id, byte_length: 100n, content_type: query.id === 'private-root'
+          ? 'application/vnd.limcode.native-private-handle-catalog+json' : query.id === 'private-block'
+            ? 'application/vnd.limcode.context-handle-catalog-block+json' : frozenFormat === 'private reference'
+              ? NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE : 'application/vnd.limcode.model-stream-checkpoint+json' } : null) }; }
   };
   // Reproduce the precise crash boundary: provider proof and admission are committed, neither
   // valid execution nor invalid-reference failure has settled yet. The original raw args remain.
@@ -164,7 +183,8 @@ test('recovery of admitted unsettled native calls dispatches frozen canonical ar
     assert.equal(await effects.readTerminalResult(proof.providerCallId), undefined);
   }
   const session = new NativeRequestSession({
-    database, contentStore: { async read(metadata) { return Buffer.from(JSON.stringify({ content: proofs[Number(metadata.id)] })); } },
+    database, contentStore: { async read(metadata) { return Buffer.from(JSON.stringify(privateBodies.get(metadata.id)
+      ?? { kind: 'native_tool_call', content: proofs[Number(metadata.id)] })); } },
     effects, tools: {}, modelProvider: {
       async readNativeLatestResponseUsage() { return undefined; },
       nativeSteering: { async receiptsForTurn() { return []; } }
@@ -188,6 +208,92 @@ test('recovery of admitted unsettled native calls dispatches frozen canonical ar
   assert.equal(rejected[0].toolCallId, 'invalid-send');
   assert.equal(rejected[0].status, 'failed');
   assert.equal(rejected[0].detail.error, unknownMessage);
+});
+}
+
+test('C3 proof and result descriptors stay bounded at 18000 handles and replay their original private view', async t => {
+  const { prepareStoredHandleCatalog } = load('backend/reliableKernel/contextHandleCatalogStorage.js');
+  const { rememberPreparedModelHandleBase } = load('backend/reliableKernel/frozenModelHandleCatalog.js');
+  const { projectToolResultForModel } = load('backend/reliableKernel/modelHandleCatalog.js');
+  const measurements = [];
+  for (const count of [1, 18000]) {
+    const initial = prepareModelHandleCatalog({ identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION,
+      retiredRefs: [], entries: Array.from({ length: count }, (_, index) => ({
+      kind: 'process', ref: `P${index + 1}`, target: `catalog-process-${index + 1}` })) });
+    const fixture = nativeResultProjectionFixture([
+      { name: 'bash', value: { status: 'succeeded', detail: { processId: 'new-native-process', stdout: 'ready' } } },
+      { name: 'bash', value: { status: 'succeeded', detail: { processId: 'next-native-process', stdout: 'ready' } } }
+    ], initial);
+    const base = await prepareStoredHandleCatalog({ database: fixture.database, contentStore: fixture.contentStore,
+      conversationId: 'projection-conversation', kind: 'context', catalog: initial });
+    rememberPreparedModelHandleBase(fixture.database, fixture.contentStore, initial, base.stored.catalog);
+    fixture.session.deps.modelHandleCatalogBaseContentObjectId = base.stored.metadata.id;
+    const item = { outputItem: { id: 'proof-item', ordinal: 0, providerResponseId: 'projection-response' },
+      call: { id: 'proof-call', ordinal: 0, name: 'bash', arguments: { mode: 'output', processRef: 'P1' }, async: true } };
+    const proof = await fixture.session.buildCallProof(item);
+    assert.equal(fixture.reads.length, 0, 'the live frozen request holds its base beyond the idle-cache budget');
+    assert.equal(proof.relatedContentObjects.length, 1, 'an unchanged base requires only the small private root');
+    assert.equal(proof.contentType, NATIVE_TOOL_CALL_PROOF_CONTENT_TYPE);
+    assert.equal('modelHandleCatalog' in proof.content, false);
+    assert.equal(typeof proof.content.modelHandleCatalogContentObjectId, 'string');
+    assert.equal(proof.content.resolvedArguments.processId, 'catalog-process-1');
+    const before = [...fixture.domains.get('ContentObject').keys()];
+    const output = await fixture.session.buildFunctionCallOutput(fixture.session.calls.get('projection-call-0'));
+    const event = [...fixture.domains.get('ToolCallEvent').values()][0];
+    const projectionText = fixture.bodies.get(event.content_object_id);
+    const projection = JSON.parse(projectionText);
+    assert.equal('modelHandleCatalog' in projection, false);
+    assert.equal(fixture.domains.get('ContentObject').get(event.content_object_id).content_type,
+      'application/vnd.limcode.native-tool-result-projection+json');
+    assert.equal(projection.output, output.output);
+    const readFrozen = async (value, processRef, expectedProcess) => {
+      const originalMap = Array.prototype.map;
+      let fullCatalogMapVisits = 0;
+      Array.prototype.map = function(callback, thisArg) {
+        if (this.length >= 18000 && this[0]?.kind === 'process') fullCatalogMapVisits += this.length;
+        return originalMap.call(this, callback, thisArg);
+      };
+      let frozen;
+      try {
+        frozen = await readNativeToolCallCatalog(fixture.database, fixture.contentStore,
+          parseNativeToolCallCheckpoint(value.content, value.contentType));
+        assert.equal(resolveModelToolArguments('bash', { mode: 'output', processRef }, frozen).processId, expectedProcess);
+        assert.equal(projectToolResultForModel('bash', { processId: expectedProcess, complete: false }, frozen).processRef,
+          processRef, 'old proof projection uses the same prepared target lookup');
+      } finally { Array.prototype.map = originalMap; }
+      assert.equal(fullCatalogMapVisits, 0, 'proof replay and tool resolution reuse the prepared base indexes');
+      return frozen;
+    };
+    for (let replay = 0; replay < 2; replay += 1) {
+      const readsBeforeReplay = fixture.reads.length;
+      const frozen = await readFrozen(proof, 'P1', 'catalog-process-1');
+      assert.equal(frozen, initial, 'an empty private overlay is the exact original prepared base');
+      assert.equal(frozen.entries.length, count, 'a later result cannot enter the earlier proof view');
+      assert.deepEqual(fixture.reads.slice(readsBeforeReplay), count === 18000
+        ? [proof.content.modelHandleCatalogContentObjectId] : [],
+      'delta replay reads at most its small original private root, never the active persistent base blocks');
+    }
+    const resolveArguments = fixture.session.deps.resolveCallArguments;
+    fixture.session.deps.resolveCallArguments = () => { throw new Error('a frozen proof must not resolve arguments again'); };
+    assert.deepEqual((await fixture.session.buildCallProof(item)).content, proof.content);
+    fixture.session.deps.resolveCallArguments = resolveArguments;
+    const newBytes = [...fixture.domains.get('ContentObject').values()].filter(row => !before.includes(row.id))
+      .reduce((total, row) => total + Number(row.byte_length), 0);
+    assert.ok(newBytes < 6000, 'one new result rewrites at most one 32-operation tail plus small descriptors');
+    measurements.push({ handles: count, proofBytes: Buffer.byteLength(JSON.stringify(proof.content)),
+      projectionBytes: Buffer.byteLength(projectionText), resultPublicationBytes: newBytes });
+    const laterProof = await fixture.session.buildCallProof({ ...item,
+      outputItem: { ...item.outputItem, id: 'later-proof-item', ordinal: 1 }, call: { ...item.call, id: 'later-proof-call', ordinal: 1,
+      arguments: { mode: 'output', processRef: `P${count + 1}` } } });
+    await fixture.session.buildFunctionCallOutput(fixture.session.calls.get('projection-call-1'));
+    const earlierDelta = await readFrozen(laterProof, `P${count + 1}`, 'new-native-process');
+    assert.equal(earlierDelta.entries[0], initial.entries[0], 'private overlays share immutable base entry objects');
+    assert.equal(earlierDelta.entries.length, count + 1);
+    await fixture.session.dispose('handoff');
+  }
+  assert.ok(measurements[1].proofBytes - measurements[0].proofBytes < 32);
+  assert.ok(measurements[1].projectionBytes - measurements[0].projectionBytes < 32);
+  t.diagnostic(JSON.stringify(measurements));
 });
 test('native async process results are bounded, actionable and durably replayed without changing receipts', async () => {
   const raw = { status: 'succeeded', detail: { status: 'background_started', processId: 'new-native-process',

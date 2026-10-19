@@ -1,3 +1,4 @@
+import { COMPLETED_CHILD_ANSWER_FROM } from './completedChildAnswer';
 import type Database from 'better-sqlite3';
 import { createConversationRuntimeWorkProbe } from './conversationRuntimePendingWork';
 import { prepareCached } from './runtimeStatementCache';
@@ -77,7 +78,8 @@ const WORK_QUERIES: ReadonlyArray<readonly [WorkList, string]> = Object.freeze([
       FROM child_execution AS child
       JOIN child_execution_parent_link AS parent ON parent.child_execution_id = child.id
       JOIN turn AS parent_turn ON parent_turn.id = parent.parent_turn_id
-     WHERE child.status IN ('starting', 'active', 'interrupting')
+     WHERE child.id IN (SELECT child.id ${COMPLETED_CHILD_ANSWER_FROM})
+        OR child.status IN ('starting', 'active', 'interrupting')
         OR EXISTS(SELECT 1 FROM child_execution_active_turn_link AS link WHERE link.child_execution_id = child.id)
         OR EXISTS(SELECT 1 FROM child_execution_intent_link AS link
                    WHERE link.child_execution_id = child.id AND link.state = 'pending')`],

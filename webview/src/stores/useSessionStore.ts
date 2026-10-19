@@ -17,6 +17,7 @@ interface SessionState {
   planProposalId: string;
   /** Extension Host 进程级构建指纹；用于识别 stale host / transport 实现。 */
   runtime: RuntimeBuildInfoRecord | null;
+  runtimeError: string | null;
   /** 连接状态：是否已收到 Hello。 */
   status: 'connecting' | 'ready';
 }
@@ -35,6 +36,7 @@ export const useSessionStore = defineStore('session', {
     toolCallId: '',
     planProposalId: '',
     runtime: null,
+    runtimeError: null,
     status: 'connecting'
   }),
   getters: {

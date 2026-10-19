@@ -146,7 +146,7 @@ export interface ReliableToolDispatcherHost {
     authority: ReliableToolDispatchAuthority
   ): Promise<{ active?: WorkEnvironmentRecord; allowed: WorkEnvironmentRecord[] }>;
   /** 可指派的 agent.type 列表（含内置与自定义，已排除运行时镜像）；用于拼进 runAgent 工具描述。 */
-  agentTypeEntries?(): Promise<AgentTypeListEntry[]> | AgentTypeListEntry[];
+  agentTypeEntries?(authority?: ReliableToolDispatchAuthority): Promise<AgentTypeListEntry[]> | AgentTypeListEntry[];
   /** Pure/repeatable capability call. The dispatcher persists its returned result before finalization. */
   executeNoEffect?(
     definition: ToolDefinition,
@@ -2176,7 +2176,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     }));
     this.augmentSkillsInput(inputs, authority.document);
     await this.augmentWorkEnvironmentInputs(inputs, authority, workEnvironmentPolicy.enabled);
-    await this.augmentRunAgentInput(inputs);
+    await this.augmentRunAgentInput(inputs, authority);
     return inputs;
   }
 
@@ -2189,13 +2189,13 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
   }
 
   /** Render live assignable types; schema copying occurs only on an effective-revision miss. */
-  private async augmentRunAgentInput(inputs: EffectiveToolDefinitionInput[]): Promise<void> {
+  private async augmentRunAgentInput(inputs: EffectiveToolDefinitionInput[], authority: ReliableToolDispatchAuthority): Promise<void> {
     const host = this.dependencies.host;
     if (!host.agentTypeEntries) return;
     const target = inputs.find((input) => input.definition.declaration.name === RUN_AGENT_TOOL_NAME);
     if (!target) return;
     try {
-      const typeList = formatAgentTypeList(await host.agentTypeEntries());
+      const typeList = formatAgentTypeList(await host.agentTypeEntries(authority));
       if (typeList) target.agentTypeList = typeList;
     } catch {
       // Preserve the static declaration while the live catalog is unavailable.

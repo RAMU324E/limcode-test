@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { before, after, afterEach, test } from 'node:test';
+import Database from 'better-sqlite3';
 import { kernel, load, llm, sse, compatDelta, geminiChunk, claudeSse } from './fixtures/ci-model-provider-support.mjs';
 import { openProviderRuntimeFixture } from './fixtures/ci-model-provider-runtime.mjs';
 import { registerExtraObservationTests } from './fixtures/ci-model-extra-observation.mjs';
@@ -8,6 +9,128 @@ let fixture;
 before(async () => { fixture = await openProviderRuntimeFixture(); });
 after(async () => { await fixture?.close(); });
 afterEach(() => fixture.setFetch(() => sse([compatDelta({ content: 'reply' }), compatDelta({}, 'stop')])));
+
+test('A1 活跃请求按确切 Turn 读取三种状态，跨千条完整分页；完整历史按 request_seq 和 id 排序', async () => {
+  const local = await openProviderRuntimeFixture();
+  let raw;
+  try {
+    const database = local.app.database;
+    const seeds = [];
+    for (const conversationId of ['active-page-a', 'active-page-b']) {
+      await local.createConversation(conversationId);
+      const { turnId } = await local.input(conversationId, 'fixture input');
+      const created = await local.request(conversationId, turnId, `${conversationId}-request`);
+      seeds.push({ turnId, requestId: created.modelRequestId });
+    }
+    raw = new Database(database.binding.paths.databasePath);
+    raw.defaultSafeIntegers(true);
+    raw.pragma('foreign_keys = ON');
+    const expected = [];
+    // Reuse real request/Operation/Attempt rows. Only bulk population bypasses the writer;
+    // the observations below all use the production Runtime reader and its keyset traversal.
+    const templates = seeds.map(seed => {
+      const request = raw.prepare('SELECT * FROM model_request WHERE id = ?').get(seed.requestId);
+      const operation = raw.prepare("SELECT * FROM operation WHERE owner_kind = 'model_request' AND owner_id = ?")
+        .get(seed.requestId);
+      const attempt = raw.prepare('SELECT * FROM attempt WHERE operation_id = ?').get(operation.id);
+      expected.push({ id: request.id, turnId: seed.turnId, seq: 1n, status: 'prepared' });
+      return { request, operation, attempt };
+    });
+    const inserts = Object.fromEntries(Object.entries({ model_request: templates[0].request,
+      operation: templates[0].operation, attempt: templates[0].attempt }).map(([table, row]) => {
+      const names = Object.keys(row);
+      return [table, raw.prepare(`INSERT INTO ${table} (${names.join(', ')}) VALUES (${names.map(name => `@${name}`).join(', ')})`)];
+    }));
+    const seedRequest = (scope, seq, status) => {
+      const template = templates[scope];
+      const id = `scope-${scope}-${String(2000 - seq).padStart(4, '0')}`;
+      const operationId = `${id}-operation`;
+      const retrying = status === 'retrying';
+      const terminal = status === 'terminal';
+      const operationStatus = terminal ? 'cancelled' : status === 'prepared' ? 'pending' : 'running';
+      const streamStats = { attemptSeq: retrying ? '2' : '1', socketGeneration: status === 'streaming' ? '1' : '0',
+        retryReason: null, ...(retrying ? { retryMaxAttempts: 1, retryDelayMs: 1, retryNotBeforeAt: Date.now() } : {}) };
+      inserts.operation.run({ ...template.operation, id: operationId, owner_id: id, status: operationStatus });
+      inserts.attempt.run({ ...template.attempt, id: `${id}-attempt-1`, operation_id: operationId,
+        status: retrying ? 'transient_failed' : operationStatus,
+        completed_at: retrying || terminal ? template.attempt.created_at : null });
+      if (retrying) inserts.attempt.run({ ...template.attempt, id: `${id}-attempt-2`, operation_id: operationId,
+        attempt_seq: 2n, status: 'pending', completed_at: null });
+      inserts.model_request.run({ ...template.request, id, request_seq: BigInt(seq), status,
+        terminal_state: terminal ? 'fixture-cancelled' : null, stream_stats_json: JSON.stringify(streamStats) });
+      expected.push({ id, turnId: seeds[scope].turnId, seq: BigInt(seq), status });
+    };
+    raw.transaction(() => {
+      for (let seq = 2; seq <= 1006; seq++) seedRequest(0, seq, 'prepared');
+      seedRequest(0, 1007, 'streaming'); seedRequest(0, 1008, 'streaming');
+      seedRequest(0, 1009, 'retrying'); seedRequest(0, 1010, 'retrying');
+      seedRequest(0, 1011, 'terminal'); seedRequest(0, 1012, 'terminal');
+      seedRequest(1, 2, 'streaming'); seedRequest(1, 3, 'retrying'); seedRequest(1, 4, 'terminal');
+      // The global 1000-row page ends between the two owners' request_seq=996 rows.
+      seedRequest(1, 996, 'prepared');
+    })();
+    expected.sort((a, b) => a.seq < b.seq ? -1 : a.seq > b.seq ? 1 : a.id.localeCompare(b.id));
+    for (const seed of seeds) {
+      const active = (await database.activeModelRequests(seed.turnId)).snapshot;
+      assert.deepEqual(active.map(row => [row.id, row.status, row.turn_id]),
+        expected.filter(row => row.turnId === seed.turnId && row.status !== 'terminal')
+          .map(row => [row.id, row.status, row.turnId]));
+    }
+    assert.equal((await database.activeModelRequests('no-such-turn')).snapshot.length, 0);
+    const { listAllDomainRows } = load('backend/reliableKernel/repositoryPagination.js');
+    const all = await listAllDomainRows(database, 'ModelRequest');
+    assert.deepEqual(all.map(row => row.id), expected.map(row => row.id));
+    const selected = await listAllDomainRows(database, 'ModelRequest', { turn_id: seeds[0].turnId });
+    assert.deepEqual(selected.map(row => row.id), expected.filter(row => row.turnId === seeds[0].turnId).map(row => row.id));
+    assert.equal(selected.length, 1012);
+  } finally { raw?.close(); await local.close(); }
+});
+
+test('A3 终态 Turn 元数据不重审历史请求，本事务触及的坏 request 或 Operation 仍回滚', async () => {
+  const local = await openProviderRuntimeFixture();
+  let raw;
+  const operations = [];
+  try {
+    await local.createConversation('terminal-metadata');
+    const terminalTurnId = await local.turn('terminal-metadata', 'completed input');
+    const [completed] = await local.rows('ModelRequest', { turn_id: terminalTurnId });
+    await local.createConversation('touched-aggregate');
+    const { turnId } = await local.input('touched-aggregate', 'prepared input');
+    const prepared = await local.request('touched-aggregate', turnId, 'prepared-aggregate');
+    for (const id of [completed.id, prepared.modelRequestId]) {
+      operations.push((await local.rows('Operation', { owner_kind: 'model_request', owner_id: id }))[0]);
+    }
+    raw = new Database(local.app.database.binding.paths.databasePath);
+    // A bad historical aggregate makes a broad Turn audit observable; the prepared one also
+    // proves that narrowing the Turn scope has not removed checks for a touched request.
+    raw.prepare("UPDATE operation SET status = 'running' WHERE id IN (?, ?)")
+      .run(operations[0].id, operations[1].id);
+    const repo = domain => kernel.DOMAIN_REPOSITORIES.domain(domain);
+    const metadataTime = '2026-10-18T00:00:00.000Z';
+    const rollbackTime = '2026-10-19T00:00:00.000Z';
+    await local.app.database.transaction([repo('Turn').update(terminalTurnId, { updated_at: metadataTime })]);
+    assert.equal((await local.rows('Turn', { id: terminalTurnId }))[0].updated_at, metadataTime);
+    for (const [domain, id, error] of [
+      ['ModelRequest', prepared.modelRequestId, /Prepared ModelRequest .* aggregate is inconsistent/],
+      ['Operation', operations[0].id, /Completed ModelRequest .* aggregate is inconsistent/]
+    ]) {
+      const [before] = await local.rows(domain, { id });
+      await assert.rejects(local.app.database.transaction([
+        repo('Turn').update(terminalTurnId, { updated_at: rollbackTime }),
+        repo(domain).update(id, { updated_at: rollbackTime })
+      ]), error);
+      assert.equal((await local.rows('Turn', { id: terminalTurnId }))[0].updated_at, metadataTime);
+      assert.equal((await local.rows(domain, { id }))[0].updated_at, before.updated_at);
+    }
+  } finally {
+    if (raw) {
+      for (const operation of operations) raw.prepare('UPDATE operation SET status = ? WHERE id = ?')
+        .run(operation.status, operation.id);
+      raw.close();
+    }
+    await local.close();
+  }
+});
 
 test('普通请求冻结、预算和发送共用一次 Context 读取，发送前释放准备结果，下一轮不复用旧根', async () => {
   await fixture.createConversation('one-context-read');

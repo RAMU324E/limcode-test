@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { LogicalMessageContentReader, logicalMessageContentType } from './logicalMessageContent';
 import type { ExecutionLeaseRenewalResult } from './databaseWorkerProtocol';
 export type { ExecutionLeaseRenewalFailureReason, ExecutionLeaseRenewalResult } from './databaseWorkerProtocol';
 import type {
@@ -614,6 +615,7 @@ export class TurnControlPlane {
   private readonly prepareTerminalDeliverySteps?: TurnControlPlaneOptions['prepareTerminalDeliverySteps'];
   private readonly prepareRuntimeContinuationSteps: TurnControlPlaneOptions['prepareRuntimeContinuationSteps'];
   private readonly contextSequence: ContextSequenceControlPlane;
+  private readonly messageContents: LogicalMessageContentReader;
   private readonly guidanceQueue: TurnGuidanceQueueOperations;
 
   public constructor(
@@ -633,6 +635,7 @@ export class TurnControlPlane {
     this.now = options.now ?? (() => new Date().toISOString());
     this.systemClock = options.now === undefined;
     this.contextSequence = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
+    this.messageContents = new LogicalMessageContentReader(database, contentStore);
     this.guidanceQueue = new TurnGuidanceQueueOperations({
       database,
       contentStore,
@@ -1639,7 +1642,7 @@ export class TurnControlPlane {
       const memberReceiptId = intentDependentEntityId(admission.intentId, 'admission_command_receipt');
       const content = admission.decoded.messageContent;
       const attachmentAdmission = content
-        ? await this.prepareFrozenMessageAttachments(await this.contentStore.read(content.metadata), content.metadata.content_type)
+        ? await this.prepareFrozenMessageAttachments(await this.messageContents.read(content.metadata), logicalMessageContentType(content.metadata.content_type))
         : undefined;
       const messageContent = attachmentAdmission
         ? await this.contentStore.prepare(this.database, attachmentAdmission.value, attachmentAdmission.contentType)

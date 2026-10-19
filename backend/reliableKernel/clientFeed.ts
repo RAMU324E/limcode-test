@@ -1,3 +1,4 @@
+import { CLIENT_STRUCTURAL_REMOVAL_DOMAINS, clientRemovalAffectsSession } from './clientChangeScope';
 import { needsSingleResponseMeasurement } from './singleResponseMeasurement';
 import { AcceptedAnswerTextPages } from './acceptedAnswerTextPages';
 import { CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE } from './deliverySettlementSteps';
@@ -43,10 +44,12 @@ import {
 } from './clientFeedBounds';
 import {
   boundClientRecordSummary as boundRecord,
+  boundPlainClientRecordSummary,
   clientWireBytes as wireBytes,
   settleClientWireResponseBytes,
   toClientWirePlain as toWirePlain
 } from './clientWireData';
+import { LogicalMessageContentReader, logicalMessageContentType } from './logicalMessageContent';
 import type {
   ClientCollaborationHistoryPageInput,
   ClientKeysetPageInput,
@@ -577,7 +580,10 @@ export class BoundedClientFeed {
       }
       if (change.kind === 'remove') {
         const key = recordKey(change.domain, change.id);
-        if (change.domain === 'Message') requiresSnapshot = true;
+        const affectsSession = clientRemovalAffectsSession(change, session.activeConversationId,
+          (domain, id) => domain === 'Conversation' ? id === session.activeConversationId
+            || session.activeRecordKeys.has(recordKey(domain, id)) : session.materializedRecordKeys.has(recordKey(domain, id)));
+        if (CLIENT_STRUCTURAL_REMOVAL_DOMAINS.has(change.domain) && affectsSession) requiresSnapshot = true;
         // Removing the independent relationship changes ProjectContext reachability; a bounded
         // snapshot atomically removes the now-unreferenced context instead of retaining an orphan.
         if (change.domain === 'ConversationProjectLink' && session.materializedRecordKeys.has(key)) {
@@ -589,7 +595,6 @@ export class BoundedClientFeed {
         }
         // Structural owner/link removal is replayed from one fresh causal snapshot. Ephemeral
         // leaves such as an ExecutionLease can still be removed in the atomic live batch.
-        if (SNAPSHOT_ON_STRUCTURAL_REMOVE_DOMAINS.has(change.domain)) requiresSnapshot = true;
         continue;
       }
       pending.push(change);
@@ -1015,8 +1020,9 @@ export class BoundedClientFeed {
         // SQLite snapshot, never applied from another Host's potentially superseded row payload.
         const relevant = scopedChanges.some(change => {
           if (['ContextSequenceRoot', 'ConversationContextHeadLink', 'ProcessOutputChunk'].includes(change.domain)) return false;
-          if (change.kind === 'remove') return session.materializedRecordKeys.has(recordKey(change.domain, change.id))
-            || SNAPSHOT_ON_STRUCTURAL_REMOVE_DOMAINS.has(change.domain);
+          if (change.kind === 'remove') return clientRemovalAffectsSession(change, session.activeConversationId,
+            (domain, id) => domain === 'Conversation' ? id === session.activeConversationId
+              || session.activeRecordKeys.has(recordKey(domain, id)) : session.materializedRecordKeys.has(recordKey(domain, id)));
           return Boolean(change.record && this.recordVisibleToSession(session, change.domain, change.id, change.record));
         });
         if (relevant) {
@@ -1056,7 +1062,7 @@ function toReliableClientChange(change: ClientScopedRuntimeChange): ReliableKern
   // or frozen policy. Normal change-batch bounds still apply to the resulting projection.
   const record = change.domain === 'ConversationTaskList' || change.domain === 'ConversationExecutionBoundary'
     ? boundProjectionRecords(toWirePlain(change.record) as Record<string, PlainData>)
-    : boundRecord(toWirePlain(change.record) as Record<string, PlainData>, change.domain);
+    : boundRecord(change.record, change.domain);
   if (record.id !== change.id) throw new Error('Committed client upsert record identity mismatch.');
   return { type: change.domain, operation: 'upsert', id: change.id, record };
 }
@@ -1102,6 +1108,7 @@ export class ClientHistoryReader {
     return toWirePlain(result) as unknown as ClientKeysetPageResult;
   }
 
+  /** Defaults to older history; explicit after cursors rehydrate released newer causal bundles. */
   public async backwardCollaboration(
     input: ClientCollaborationHistoryPageInput
   ): Promise<ReliableKernelCollaborationHistoryPage> {
@@ -1116,26 +1123,11 @@ export class ClientHistoryReader {
       || result.responseBytes > CLIENT_PAGE_MAX_BYTES) {
       throw new Error('Database worker returned an out-of-bounds collaboration history page.');
     }
-    const records: ReliableKernelCollaborationHistoryPage['records'] = {};
-    for (const [domain, rows] of Object.entries(result.records)) {
-      records[domain] = rows.map((row) => boundRecord(toWirePlain(row) as Record<string, PlainData>, domain));
-    }
-    const page: ReliableKernelCollaborationHistoryPage = {
-      records,
-      ...(result.nextCursor === undefined ? {} : { nextCursor: result.nextCursor }),
-      hasMore: result.hasMore,
-      scanProgress: result.scanProgress,
-      scannedRows: result.scannedRows,
-      responseBytes: 0
-    };
-    settleClientWireResponseBytes(page);
-    if (page.responseBytes > CLIENT_PAGE_MAX_BYTES) {
-      throw new Error('Collaboration history page exceeds maxPageBytes after wire encoding.');
-    }
-    return page;
+    // The Worker produced the final bounded plain page and its exact byte count.
+    return result as ReliableKernelCollaborationHistoryPage;
   }
 
-  public async backwardVisibleMessages(
+  public async visibleMessages(
     input: ClientVisibleMessageHistoryPageInput
   ): Promise<ReliableKernelHistoryPage> {
     if ('offset' in (input as unknown as Record<string, unknown>)) {
@@ -1148,26 +1140,7 @@ export class ClientHistoryReader {
     ) {
       throw new Error('Database worker returned an out-of-bounds visible Message history page.');
     }
-    const records: ReliableKernelHistoryPage['records'] = {};
-    for (const [domain, rows] of Object.entries(result.records)) {
-      records[domain] = rows.map((row) => boundRecord(
-        toWirePlain(row) as Record<string, PlainData>, domain
-      ));
-    }
-    const page: ReliableKernelHistoryPage = {
-      records,
-      ...(result.nextBeforeMessageSeq === undefined
-        ? {}
-        : { nextBeforeMessageSeq: result.nextBeforeMessageSeq }),
-      ...(result.nextBeforeId === undefined ? {} : { nextBeforeId: result.nextBeforeId }),
-      hasMore: result.hasMore,
-      responseBytes: 0
-    };
-    settleClientWireResponseBytes(page);
-    if (page.responseBytes > CLIENT_PAGE_MAX_BYTES) {
-      throw new Error('Visible Message history page exceeds maxPageBytes after wire encoding.');
-    }
-    return page;
+    return result as ReliableKernelHistoryPage;
   }
 }
 
@@ -1225,6 +1198,7 @@ const TURN_INTENT_SOURCE_ARGUMENTS_MAX_BYTES = 64 * 1024;
 /** On-demand CAS detail reader with an actual wire-byte response cap. */
 export class ClientDetailReader {
   private readonly acceptedAnswerPages: AcceptedAnswerTextPages;
+  private readonly messageContents: LogicalMessageContentReader;
   /** Immutable member/CAS identities; every access still verifies the member exists. */
   private readonly fileDiffDetails = new Map<string, { identity: string; bytes: Buffer }>();
   private fileDiffDetailBytes = 0;
@@ -1235,14 +1209,19 @@ export class ClientDetailReader {
   private readonly processOutputReconciliations = new Map<string, Promise<ProcessDetailReconciliation>>();
   /** MessageRevision and ContentObject are immutable, so continuation pages and revisits can reuse them. */
   private readonly messageContentMetadata = new Map<string, ContentObjectMetadata>();
-  private readonly pendingMessageContentMetadata = new Map<string, MessageContentMetadataWaiter[]>();
+  private readonly pendingMessageContentMetadata = new Map<string, {
+    domain: 'MessageRevision' | 'ContentObject'; id: string; waiters: MessageContentMetadataWaiter[]
+  }>();
   private messageContentMetadataFlushScheduled = false;
   private reconcileProcessOutput: ((processId: string) => Promise<ProcessDetailReconciliation>) | undefined;
 
   public constructor(
     private readonly database: RuntimeDatabase,
     private readonly contentStore: ContentAddressedStore
-  ) { this.acceptedAnswerPages = new AcceptedAnswerTextPages(contentStore); }
+  ) {
+    this.messageContents = new LogicalMessageContentReader(database, contentStore);
+    this.acceptedAnswerPages = new AcceptedAnswerTextPages(this.messageContents);
+  }
 
   /** Product composition supplies the verified spool importer after ProcessControlPlane exists. */
   public setProcessOutputReconciler(
@@ -1257,6 +1236,8 @@ export class ClientDetailReader {
     offset: number;
     maxBytes: number;
     expectedTotalBytes?: number;
+    itemAfterSequence?: number;
+    itemLimit?: number;
     /** Webview transport scope. Undefined is reserved for trusted in-process callers. */
     conversationId?: string | null;
   }): Promise<ClientDetailChunk> {
@@ -1264,6 +1245,15 @@ export class ClientDetailReader {
     if (!Number.isSafeInteger(input.offset) || input.offset < 0) throw new RangeError('Detail offset must be non-negative.');
     if (!Number.isSafeInteger(input.maxBytes) || input.maxBytes <= 0) throw new RangeError('Detail maxBytes must be positive.');
     const maxRawBytes = detailRawByteLimit(input.maxBytes);
+    if (input.kind === 'message-content-items') {
+      const metadata = await this.loadMessageContentMetadata(recordId);
+      const limit = input.itemLimit ?? 32;
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 96) throw new RangeError('Native item page limit must be from 1 to 96.');
+      const page = await this.messageContents.readNativeItems(metadata, { afterSequence: input.itemAfterSequence, limit });
+      const bytes = Buffer.from(JSON.stringify(page), 'utf8');
+      if (input.offset > bytes.length) throw new RangeError('Detail offset exceeds native item page length.');
+      return buildDetailChunk(recordId, input.offset, bytes.subarray(input.offset, input.offset + maxRawBytes), bytes.length);
+    }
     if (input.kind === 'accepted-answer-content') {
       return this.readAcceptedAnswerDetail(recordId, input.offset, maxRawBytes, input.conversationId, input.expectedTotalBytes);
     }
@@ -1299,8 +1289,10 @@ export class ClientDetailReader {
     }
     const contentRow = input.kind === 'message-content'
       ? await this.loadMessageContentMetadata(recordId)
-      : await this.resolveContentMetadata(input.kind, recordId, input.conversationId);
-    const range = await this.contentStore.readChunk(contentRow, input.offset, maxRawBytes);
+      : input.kind === 'message-content-item'
+        ? await this.loadMessageContentMetadata(recordId, 'ContentObject')
+        : await this.resolveContentMetadata(input.kind, recordId, input.conversationId);
+    const range = await this.messageContents.readChunk(contentRow, input.offset, maxRawBytes);
     return buildDetailChunk(recordId, input.offset, range.chunk, range.totalBytes);
   }
 
@@ -1317,7 +1309,7 @@ export class ClientDetailReader {
       } });
     } else if (body.content_type === CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE) {
       range = await this.acceptedAnswerPages.read(body, 'source-deleted-notice', offset, maximum, { expected });
-    } else if (body.content_type === 'application/vnd.limcode.message+json' && presentation.body_representation === 'effective-input') {
+    } else if (logicalMessageContentType(body.content_type) === 'application/vnd.limcode.message+json' && presentation.body_representation === 'effective-input') {
       // The input's exact normalized text already exists in its committed Context. Read it lazily
       // instead of reparsing or duplicating a potentially large raw MessageContent payload.
       const links = await this.listRows('RuntimeDeliveryInputLink', { delivery_id: String(presentation.delivery_id) }, 2);
@@ -1330,7 +1322,7 @@ export class ClientDetailReader {
       range = await this.acceptedAnswerPages.read(context, 'historical-runtime-envelope', offset, maximum, { expected: {
         ...expected, deliveryId: String(presentation.delivery_id), inboxItemId: String(presentation.inbox_item_id)
       } });
-    } else if (body.content_type === 'application/vnd.limcode.message+json') {
+    } else if (logicalMessageContentType(body.content_type) === 'application/vnd.limcode.message+json') {
       range = await this.acceptedAnswerPages.readMessageContent(body, offset, maximum);
     } else {
       range = await this.contentStore.readChunk(body, offset, maximum);
@@ -1347,7 +1339,7 @@ export class ClientDetailReader {
   private async resolveContentMetadata(
     kind: Exclude<
       ClientDetailKind,
-      'message-content' | 'context-projection-detail' | 'file-change-diff' | 'turn-intent-preview' | 'model-request-purpose' | 'compression-presentation' | 'process-stdout' | 'process-stderr'
+      'message-content' | 'message-content-item' | 'message-content-items' | 'context-projection-detail' | 'file-change-diff' | 'turn-intent-preview' | 'model-request-purpose' | 'compression-presentation' | 'process-stdout' | 'process-stderr'
     >,
     recordId: string,
     conversationId?: string | null
@@ -1356,17 +1348,18 @@ export class ClientDetailReader {
     return await this.requireExisting('ContentObject', contentObjectId) as ContentObjectMetadata;
   }
 
-  private loadMessageContentMetadata(revisionId: string): Promise<ContentObjectMetadata> {
-    const cached = this.messageContentMetadata.get(revisionId);
+  private loadMessageContentMetadata(id: string, domain: 'MessageRevision' | 'ContentObject' = 'MessageRevision'): Promise<ContentObjectMetadata> {
+    const key = `${domain}\0${id}`;
+    const cached = this.messageContentMetadata.get(key);
     if (cached) {
-      this.messageContentMetadata.delete(revisionId);
-      this.messageContentMetadata.set(revisionId, cached);
+      this.messageContentMetadata.delete(key);
+      this.messageContentMetadata.set(key, cached);
       return Promise.resolve(cached);
     }
     return new Promise<ContentObjectMetadata>((resolve, reject) => {
-      const waiters = this.pendingMessageContentMetadata.get(revisionId) ?? [];
-      waiters.push({ resolve, reject });
-      this.pendingMessageContentMetadata.set(revisionId, waiters);
+      const entry = this.pendingMessageContentMetadata.get(key) ?? { domain, id, waiters: [] };
+      entry.waiters.push({ resolve, reject });
+      this.pendingMessageContentMetadata.set(key, entry);
       if (this.messageContentMetadataFlushScheduled) return;
       this.messageContentMetadataFlushScheduled = true;
       // Webview postMessage deliveries and the four CAS completions are separate callbacks. Waiting
@@ -1377,8 +1370,8 @@ export class ClientDetailReader {
 
   /**
    * Four Webview detail reads normally arrive in one turn. Resolve all revisions in one worker
-   * snapshot and all distinct ContentObjects in a second snapshot, instead of two worker round
-   * trips per message.
+   * snapshot and all distinct ContentObjects in a second snapshot. Native item CAS references
+   * join the content batch directly and keep working after their producer revision is deleted.
    */
   private async flushMessageContentMetadata(): Promise<void> {
     this.messageContentMetadataFlushScheduled = false;
@@ -1388,22 +1381,24 @@ export class ClientDetailReader {
     const revisions = DOMAIN_REPOSITORIES.domain('MessageRevision');
     const contents = DOMAIN_REPOSITORIES.domain('ContentObject');
     try {
-      const revisionBarrier = await this.database.snapshot(
-        batch.map(([revisionId]) => revisions.get(revisionId))
-      );
-      if (revisionBarrier.snapshot.length !== batch.length) {
+      const revisionEntries = batch.filter(([, entry]) => entry.domain === 'MessageRevision');
+      const revisionBarrier = revisionEntries.length > 0 ? await this.database.snapshot(
+        revisionEntries.map(([, entry]) => revisions.get(entry.id))
+      ) : { snapshot: [] as Array<DomainRow | DomainRow[] | null> };
+      if (revisionBarrier.snapshot.length !== revisionEntries.length) {
         throw new Error('Message detail metadata batch returned the wrong revision count.');
       }
-      const contentIdByRevision = new Map<string, string>();
-      batch.forEach(([revisionId], index) => {
+      const contentIdByKey = new Map(batch.flatMap(([key, entry]) =>
+        entry.domain === 'ContentObject' ? [[key, entry.id] as const] : []));
+      revisionEntries.forEach(([key], index) => {
         const row = revisionBarrier.snapshot[index];
         if (!row || Array.isArray(row)) return;
-        contentIdByRevision.set(
-          revisionId,
+        contentIdByKey.set(
+          key,
           requirePhaseFId(row.content_object_id, 'MessageRevision.content_object_id')
         );
       });
-      const contentIds = [...new Set(contentIdByRevision.values())];
+      const contentIds = [...new Set(contentIdByKey.values())];
       const contentBarrier = contentIds.length > 0
         ? await this.database.snapshot(contentIds.map((contentId) => contents.get(contentId)))
         : { snapshot: [] as Array<DomainRow | DomainRow[] | null> };
@@ -1415,11 +1410,11 @@ export class ClientDetailReader {
         const row = contentBarrier.snapshot[index];
         if (row && !Array.isArray(row)) contentById.set(contentId, row as ContentObjectMetadata);
       });
-      for (const [revisionId, waiters] of batch) {
-        const contentId = contentIdByRevision.get(revisionId);
+      for (const [key, { domain, id, waiters }] of batch) {
+        const contentId = contentIdByKey.get(key);
         const metadata = contentId ? contentById.get(contentId) : undefined;
         if (!contentId) {
-          const error = new Error(`MessageRevision ${revisionId} does not exist.`);
+          const error = new Error(`${domain} ${id} does not exist.`);
           for (const waiter of waiters) waiter.reject(error);
           continue;
         }
@@ -1428,19 +1423,19 @@ export class ClientDetailReader {
           for (const waiter of waiters) waiter.reject(error);
           continue;
         }
-        this.rememberMessageContentMetadata(revisionId, metadata);
+        this.rememberMessageContentMetadata(key, metadata);
         for (const waiter of waiters) waiter.resolve(metadata);
       }
     } catch (error) {
-      for (const [, waiters] of batch) {
+      for (const [, { waiters }] of batch) {
         for (const waiter of waiters) waiter.reject(error);
       }
     }
   }
 
-  private rememberMessageContentMetadata(revisionId: string, metadata: ContentObjectMetadata): void {
-    this.messageContentMetadata.delete(revisionId);
-    this.messageContentMetadata.set(revisionId, metadata);
+  private rememberMessageContentMetadata(key: string, metadata: ContentObjectMetadata): void {
+    this.messageContentMetadata.delete(key);
+    this.messageContentMetadata.set(key, metadata);
     while (this.messageContentMetadata.size > MESSAGE_CONTENT_METADATA_CACHE_ENTRIES) {
       const oldest = this.messageContentMetadata.keys().next().value as string | undefined;
       if (!oldest) break;
@@ -1919,10 +1914,10 @@ export class ClientDetailReader {
       position = inputEnvelope.guidance.position;
       hold = inputEnvelope.guidance.hold;
     }
-    const source = (await this.contentStore.read(metadata)).toString('utf8');
+    const source = (await this.messageContents.read(metadata)).toString('utf8');
     let text = '';
     let hasAttachments = false;
-    if (metadata.content_type === 'application/vnd.limcode.message+json') {
+    if (logicalMessageContentType(metadata.content_type) === 'application/vnd.limcode.message+json') {
       try {
         const parsed = JSON.parse(source) as { parts?: unknown };
         if (Array.isArray(parsed.parts)) {
@@ -2131,7 +2126,7 @@ export class ClientDetailReader {
   private async resolveContentObjectId(
     kind: Exclude<
       ClientDetailKind,
-      'context-projection-detail' | 'file-change-diff' | 'turn-intent-preview' | 'model-request-purpose' | 'compression-presentation' | 'process-stdout' | 'process-stderr'
+      'message-content-item' | 'message-content-items' | 'context-projection-detail' | 'file-change-diff' | 'turn-intent-preview' | 'model-request-purpose' | 'compression-presentation' | 'process-stdout' | 'process-stderr'
     >,
     recordId: string,
     conversationId?: string | null
@@ -2363,27 +2358,6 @@ const LIVE_SNAPSHOT_WINDOW_ROOT_DOMAINS = new Set([
   'RuntimeDeliveryTimelineLink',
   'RuntimeDeliveryAnswerPresentation',
   'CollaborationSendTimelineLink'
-]);
-
-const SNAPSHOT_ON_STRUCTURAL_REMOVE_DOMAINS = new Set([
-  'Message',
-  'MessageTurnLink',
-  'ModelRequest',
-  'ModelContextProjection',
-  'ModelRequestMessageLink',
-  'ToolCall',
-  'ToolCallSourceLink',
-  'FileChangeSet',
-  'FileChangeSetMember',
-  'Process',
-  'ProcessOriginLink',
-  'ChildExecution',
-  'ChildExecutionParentLink',
-  'ChildExecutionTurnLink',
-  'ChildExecutionActiveTurnLink',
-  'AnswerBridge',
-  'RuntimeDelivery',
-  'CollaborationMessage'
 ]);
 
 /** Text links which are intentionally not SQLite foreign keys still need an explicit type. */
@@ -3119,7 +3093,7 @@ function buildDetailChunk(
     hasMore,
     responseBytes: 0
   };
-  response.responseBytes = wireBytes(response);
+  settleClientWireResponseBytes(response);
   if (response.responseBytes > CLIENT_DETAIL_MAX_RESPONSE_BYTES) {
     throw new Error('Detail chunk exceeds maxResponseBytes after wire encoding.');
   }
@@ -3130,7 +3104,7 @@ function boundProjectionRecords(projections: Record<string, PlainData>): Record<
   const visit = (value: PlainData, domain?: string): PlainData => {
     if (Array.isArray(value)) {
       return value.map((entry) => {
-        if (entry && typeof entry === 'object' && !Array.isArray(entry)) return boundRecord(entry, domain);
+        if (entry && typeof entry === 'object' && !Array.isArray(entry)) return boundPlainClientRecordSummary(entry, domain);
         return visit(entry);
       });
     }

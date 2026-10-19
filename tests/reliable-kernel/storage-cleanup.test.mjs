@@ -251,7 +251,7 @@ async function upgradeCompletion() {
   await fs.writeFile(path.join(directory, 'root-binding.epoch-5.json'), JSON.stringify(previousBinding));
   // The age gate reads only the completed journal and bindings, before opening historical SQLite.
   await fs.writeFile(path.join(directory, kernel.RUNTIME_EPOCH_MIGRATION_COMPLETION_FILE), JSON.stringify({
-    kind: 'limcode-runtime-epoch-migration-completion', attemptId: 'cleanup-grace', fromEpoch: 5, toEpoch: 6,
+    kind: 'limcode-runtime-epoch-migration-completion', attemptId: 'cleanup-grace', fromEpoch: 5, toEpoch: 7,
     previousBinding, nextBinding: database.binding, completedAt: new Date(clock - DAY).toISOString()
   }));
   return directory;

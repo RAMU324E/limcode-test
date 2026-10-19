@@ -1,4 +1,5 @@
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
+import { logicalMessageContentType, MESSAGE_CONTENT_TYPE, NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE } from './logicalMessageContent';
 import { CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE } from './deliverySettlementSteps';
 import { requirePhaseFId, requirePhaseFText } from './phaseFIdentity';
 import {
@@ -144,7 +145,7 @@ export class AcceptedAnswerTextPages {
           const length = Math.min(READ_BYTES, index.rawEnd + 1 - rawOffset);
           if (length <= 0) throw invalidJson();
           const range = await this.source.readChunk(metadata, rawOffset, length);
-          assertRange(range, metadata, rawOffset, length);
+          assertRange(range, Number(metadata.byte_length), rawOffset, length);
           checkCancelled(options.signal);
           for (let at = 0; at < range.chunk.length && decodedOffset < end; at += 1) {
             if ((at & 4095) === 0) checkCancelled(options.signal);
@@ -195,7 +196,7 @@ export class AcceptedAnswerTextPages {
         const start = Math.max(offset, span.outputStart);
         const stop = Math.min(end, span.outputStart + span.totalBytes);
         if (start < stop) {
-          const read = await readSelectedString(this.source, metadata, span, point.cursor,
+          const read = await readSelectedString(this.source, metadata, index.rawBytes, span, point.cursor,
             start - span.outputStart, stop - start, options.signal, iterator?.verifiedWindow());
           read.chunk.copy(output, start - offset);
           index.cursor = { span, cursor: read.cursor };
@@ -211,7 +212,7 @@ export class AcceptedAnswerTextPages {
           continue;
         }
         // Keep the scanner and one raw chunk for a run of small parts; there is no per-part list.
-        iterator ??= new MessageSpanIterator(this.source, metadata, span.partRawEnd,
+        iterator ??= new MessageSpanIterator(this.source, metadata, index.rawBytes, span.partRawEnd,
           span.outputStart + span.totalBytes, options.signal);
         const next = await iterator.next();
         if (!next) throw new Error('Accepted message text index conflicts with its verified source.');
@@ -225,15 +226,16 @@ export class AcceptedAnswerTextPages {
   private async messageIndex(metadata: ContentObjectMetadata, signal?: AbortSignal): Promise<MessageTextIndex> {
     const generation = this.generation;
     checkCancelled(signal);
-    if (metadata.content_type !== 'application/vnd.limcode.message+json') throw new TypeError('Accepted message text has an unexpected content type.');
-    const rawBytes = Number(metadata.byte_length);
-    if (!Number.isSafeInteger(rawBytes) || rawBytes < 0) throw new RangeError('Accepted text source exceeds safe byte addressing.');
+    if (logicalMessageContentType(metadata.content_type) !== MESSAGE_CONTENT_TYPE) throw new TypeError('Accepted message text has an unexpected content type.');
     const identity = JSON.stringify([metadata.id, metadata.content_type, metadata.sha256, String(metadata.byte_length), metadata.storage_key]);
     const old = this.messageIndexes.get(metadata.id);
     if (old?.identity !== identity) this.messageIndexes.delete(metadata.id);
-    const firstLength = Math.min(old?.identity === identity ? 1 : READ_BYTES, rawBytes);
-    const first = await this.source.readChunk(metadata, 0, firstLength || 1);
-    assertRange(first, metadata, 0, firstLength);
+    const firstLimit = old?.identity === identity ? 1 : READ_BYTES;
+    const first = await this.source.readChunk(metadata, 0, firstLimit);
+    const rawBytes = metadata.content_type === NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE
+      ? first.totalBytes : Number(metadata.byte_length);
+    if (!Number.isSafeInteger(rawBytes) || rawBytes < 0) throw new RangeError('Accepted text source exceeds safe byte addressing.');
+    assertRange(first, rawBytes, 0, Math.min(firstLimit, rawBytes));
     checkCancelled(signal);
     if (old?.identity === identity) {
       if (generation === this.generation) {
@@ -248,12 +250,12 @@ export class AcceptedAnswerTextPages {
       checkCancelled(signal);
       const count = Math.min(READ_BYTES, rawBytes - offset);
       const range = await this.source.readChunk(metadata, offset, count);
-      assertRange(range, metadata, offset, count);
+      assertRange(range, rawBytes, offset, count);
       checkCancelled(signal);
       scanner.push(range.chunk, offset, signal);
       offset += range.chunk.length;
     }
-    const index = scanner.finishMessage(identity);
+    const index = scanner.finishMessage(identity, rawBytes);
     checkCancelled(signal);
     if (generation === this.generation) {
       this.messageIndexes.delete(metadata.id); this.messageIndexes.set(metadata.id, index);
@@ -291,7 +293,7 @@ export class AcceptedAnswerTextPages {
     // Mandatory even for cached/empty results: preserve the existing root and physical file fences.
     const firstLength = Math.min(old?.identity === identity ? 1 : READ_BYTES, rawBytes);
     const first = await this.source.readChunk(metadata, 0, firstLength || 1);
-    assertRange(first, metadata, 0, firstLength);
+    assertRange(first, rawBytes, 0, firstLength);
     checkCancelled(options.signal);
     if (old?.identity === identity) {
       assertExpected(old.metadata, options.expected);
@@ -307,7 +309,7 @@ export class AcceptedAnswerTextPages {
       checkCancelled(options.signal);
       const count = Math.min(READ_BYTES, rawBytes - offset);
       const range = await this.source.readChunk(metadata, offset, count);
-      assertRange(range, metadata, offset, count);
+      assertRange(range, rawBytes, offset, count);
       checkCancelled(options.signal);
       scanner.push(range.chunk, offset, options.signal);
       offset += range.chunk.length;
@@ -392,10 +394,10 @@ class EnvelopeScanner {
     return bytes.length;
   }
 
-  public finishMessage(identity: string): MessageTextIndex {
+  public finishMessage(identity: string, rawBytes: number): MessageTextIndex {
     if (this.number) this.finishNumber();
     if (this.string || this.literal || this.frames.length || this.root !== 'done' || !this.message?.hasParts) throw invalidJson();
-    return this.message.finish(identity);
+    return this.message.finish(identity, rawBytes);
   }
 
   public finish(identity: string): TextIndex {
@@ -679,9 +681,9 @@ function assertExpected(actual: AcceptedAnswerEnvelopeMetadata, expected?: Parti
   }
 }
 function assertRange(
-  range: { chunk: Buffer; totalBytes: number }, metadata: ContentObjectMetadata, offset: number, count: number
+  range: { chunk: Buffer; totalBytes: number }, rawBytes: number, offset: number, count: number
 ): void {
-  if (range.totalBytes !== Number(metadata.byte_length) || range.chunk.length !== count || offset + count > range.totalBytes) {
+  if (range.totalBytes !== rawBytes || range.chunk.length !== count || offset + count > range.totalBytes) {
     throw new Error('Verified accepted text range conflicts with content identity.');
   }
 }
@@ -698,6 +700,7 @@ interface MessageSpan {
 interface MessageSeekPoint { span: MessageSpan; cursor: Checkpoint }
 interface MessageTextIndex {
   identity: string;
+  rawBytes: number;
   totalBytes: number;
   checkpoints: MessageSeekPoint[];
   cursor?: MessageSeekPoint;
@@ -778,8 +781,8 @@ class MessagePartsCollector {
     }
     this.onPart?.(span);
   }
-  public finish(identity: string): MessageTextIndex {
-    return { identity, totalBytes: this.outputBytes, checkpoints: this.points };
+  public finish(identity: string, rawBytes: number): MessageTextIndex {
+    return { identity, rawBytes, totalBytes: this.outputBytes, checkpoints: this.points };
   }
 }
 
@@ -798,6 +801,7 @@ class MessageSpanIterator {
   public constructor(
     private readonly source: Pick<ContentAddressedStore, 'readChunk'>,
     private readonly metadata: ContentObjectMetadata,
+    private readonly rawBytes: number,
     rawOffset: number,
     outputBytes: number,
     private readonly signal?: AbortSignal
@@ -810,7 +814,7 @@ class MessageSpanIterator {
   }
   public async next(): Promise<MessageSpan | undefined> {
     this.part = undefined;
-    const rawBytes = Number(this.metadata.byte_length);
+    const rawBytes = this.rawBytes;
     while (!this.part) {
       checkCancelled(this.signal);
       if (this.at === this.bytes.length) {
@@ -818,7 +822,7 @@ class MessageSpanIterator {
         if (this.rawOffset === rawBytes) return undefined;
         const count = Math.min(READ_BYTES, rawBytes - this.rawOffset);
         const range = await this.source.readChunk(this.metadata, this.rawOffset, count);
-        assertRange(range, this.metadata, this.rawOffset, count);
+        assertRange(range, rawBytes, this.rawOffset, count);
         checkCancelled(this.signal); this.bytes = range.chunk;
       }
       this.at += this.scanner.push(this.bytes.subarray(this.at), this.rawOffset + this.at,
@@ -831,6 +835,7 @@ class MessageSpanIterator {
 async function readSelectedString(
   source: Pick<ContentAddressedStore, 'readChunk'>,
   metadata: ContentObjectMetadata,
+  rawBytes: number,
   span: MessageSpan,
   checkpoint: Checkpoint,
   offset: number,
@@ -860,9 +865,9 @@ async function readSelectedString(
     // The iterator's buffer was obtained through this same verified reader during this demand.
     // Reusing it for tiny adjacent parts avoids one file open per part; it is never cached.
     const range = insideWindow
-      ? { chunk: verifiedWindow!.bytes.subarray(windowOffset, windowOffset + count), totalBytes: Number(metadata.byte_length) }
+      ? { chunk: verifiedWindow!.bytes.subarray(windowOffset, windowOffset + count), totalBytes: rawBytes }
       : await source.readChunk(metadata, rawOffset, count);
-    assertRange(range, metadata, rawOffset, count);
+    assertRange(range, rawBytes, rawOffset, count);
     checkCancelled(signal);
     for (let at = 0; at < range.chunk.length && decodedOffset < end; at += 1) {
       if ((at & 4095) === 0) checkCancelled(signal);

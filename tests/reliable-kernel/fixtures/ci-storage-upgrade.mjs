@@ -26,15 +26,22 @@ export async function createPublishedRuntime(previousEpoch, options = {}) {
   let runtime;
   try {
     runtime = await kernel.RuntimeDatabase.open(authority);
-    const store = kernel.ContentAddressedStore.loose(authority, binding);
+    const looseStore = kernel.ContentAddressedStore.loose(authority, binding);
+    const store = options.packedBody ? kernel.ContentAddressedStore.forDatabase(authority, runtime) : looseStore;
     const attachmentBytes = Buffer.from([0, 1, 2, 127, 128, 255]);
     const attachmentContent = options.attachment
-      ? await store.ingest(runtime, attachmentBytes, 'application/octet-stream') : undefined;
+      ? await looseStore.ingest(runtime, attachmentBytes, 'application/octet-stream') : undefined;
     const attachmentId = `${conversationId}_attachment`;
     const content = await store.ingest(runtime,
       JSON.stringify({ role: 'user', parts: [{ text: message }, ...(attachmentContent
         ? [{ inlineData: { attachmentId, name: 'preserved.bin', mimeType: 'application/octet-stream' } }] : [])] }),
       'application/vnd.limcode.message+json');
+    const looseMessage = options.packedBody ? {
+      text: `保留的loose消息 ${previousEpoch}`,
+      content: await looseStore.ingest(runtime,
+        JSON.stringify({ role: 'model', parts: [{ text: `保留的loose消息 ${previousEpoch}` }] }),
+        'application/vnd.limcode.message+json')
+    } : undefined;
     await runtime.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: conversationId, title, status: 'active',
@@ -57,7 +64,27 @@ export async function createPublishedRuntime(previousEpoch, options = {}) {
         id: `${conversationId}_member`, conversation_id: conversationId,
         message_id: `${conversationId}_message`, message_seq: 1n,
         created_at: '2026-09-01T00:00:00.000Z'
-      })
+      }),
+      ...(looseMessage ? [
+        kernel.DOMAIN_REPOSITORIES.domain('Message').insert({
+          id: `${conversationId}_loose_message`, created_at: '2026-09-01T00:00:00.000Z',
+          updated_at: '2026-09-01T00:00:00.000Z', deleted_at: null
+        }),
+        kernel.DOMAIN_REPOSITORIES.domain('MessageRevision').insert({
+          id: `${conversationId}_loose_revision`, message_id: `${conversationId}_loose_message`,
+          revision_seq: 1n, role: 'model', content_object_id: looseMessage.content.id,
+          created_at: '2026-09-01T00:00:00.000Z'
+        }),
+        kernel.DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').insert({
+          id: `${conversationId}_loose_current`, message_id: `${conversationId}_loose_message`,
+          revision_id: `${conversationId}_loose_revision`, updated_at: '2026-09-01T00:00:00.000Z'
+        }),
+        kernel.DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').insert({
+          id: `${conversationId}_loose_member`, conversation_id: conversationId,
+          message_id: `${conversationId}_loose_message`, message_seq: 2n,
+          created_at: '2026-09-01T00:00:00.000Z'
+        })
+      ] : [])
     ]);
     const contextRootId = options.contextHead ? `${conversationId}_selected_context` : undefined;
     if (contextRootId) {
@@ -114,6 +141,7 @@ export async function createPublishedRuntime(previousEpoch, options = {}) {
 
     const oldSchemas = previousEpoch === 3
       ? kernel.PREVIOUS_RUNTIME_DOMAIN_SCHEMAS
+      : previousEpoch === 6 ? kernel.EPOCH_6_RUNTIME_DOMAIN_SCHEMAS
       : previousEpoch === 5 ? kernel.EPOCH_5_RUNTIME_DOMAIN_SCHEMAS
       : options.missingDeliveryLink
         ? kernel.EPOCH_4_MISSING_DELIVERY_LINK_SCHEMAS
@@ -156,7 +184,7 @@ export async function createPublishedRuntime(previousEpoch, options = {}) {
     await fs.writeFile(settingsPath, 'keep-settings');
     await fs.writeFile(workspacePath, 'keep-workspace');
     return { scope, cleanupRoot, authority, paths: binding.paths, previous, conversationId, title, message,
-      contentId: content.id, contextRootId, settingsPath, workspacePath, legacyContinuation, legacyContinuations,
+      contentId: content.id, content, looseMessage, contextRootId, settingsPath, workspacePath, legacyContinuation, legacyContinuations,
       ...(attachmentContent ? { attachment: { id: attachmentId, content: attachmentContent, bytes: attachmentBytes } } : {}) };
   } catch (error) {
     await runtime?.close().catch(() => undefined);
