@@ -77,7 +77,8 @@ async function pageFor(t) {
   page.on('pageerror', error => errors.push(error.message));
   t.after(async () => { await page.close(); assert.deepEqual(errors, []); });
   await page.addInitScript(() => { window.acquireVsCodeApi = () => ({ postMessage() {}, getState() {}, setState() {} }); });
-  await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/settings-layout-fixture`, { waitUntil: 'networkidle' });
+  await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/settings-layout-fixture`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.locator('.llm-generation-settings').waitFor({ timeout: 30000 });
   return page;
 }
 async function shot(page, name) {
