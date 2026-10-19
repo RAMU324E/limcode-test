@@ -64,7 +64,7 @@ import {
 copyForeignRuntimeSqliteFiles,heldDatabaseFiles,locatedSnapshotBinding,openPackedCasSnapshot,type PackedCasSnapshotAccess
 } from './runtimeForeignHistory';
 import { readRuntimeHistorySettlementConsent,recordRuntimeHistorySettlementConsent,recordRuntimeHistorySettlementConsents } from './runtimeHistoryConvergence';
-import { readRuntimeHistoryPending,readRuntimeHistoryPendingRecord,readRuntimeHistoryResidualRecord,removeRuntimeHistoryPending,removeRuntimeHistoryResidual,writeRuntimeHistoryResidual,type RuntimeHistoryResidual } from './runtimeHistoryRegistry';
+import { readRuntimeHistoryPending,readRuntimeHistoryPendingRecord,readRuntimeHistoryResidual,readRuntimeHistoryResidualRecord,removeRuntimeHistoryPending,removeRuntimeHistoryResidual,writeRuntimeHistoryResidual,type RuntimeHistoryResidual } from './runtimeHistoryRegistry';
 import {
 assertRuntimeHostsOffline,isRuntimeHostsActiveError,withRuntimeDataRootAdmission,withRuntimeMaintenance,
 withRuntimeMaintenanceActivity
@@ -760,6 +760,7 @@ async function pickSources(
     const ledger = await readRuntimeDataSetMergeLedger(storagePaths);
     const damage = await readRuntimeDataSetMergeRecordDamage(storagePaths);
     const pendingHistory = await readRuntimeHistoryPending(storagePaths);
+    const residualHistory = await readRuntimeHistoryResidual(storagePaths);
     const explicit = options.requested === true;
     const picked: PickedSource[] = [];
     for (const candidate of inspection.candidates) {
@@ -792,6 +793,10 @@ async function pickSources(
         picked.push(source);
         continue;
       }
+      // Residuals wait for an explicit retry, including after an offline format upgrade.
+      const residual = residualHistory.get(candidate.id);
+      if (!source.requested && !source.pending && residual
+        && (!residual.identity || sameRuntimeDataSetIdentity(residual.identity, candidate))) continue;
       // Only a fingerprint cached for the exact current files is used here: computing one reads the
       // whole data set, which is done per source below, outside the admission.
       const fingerprint = record ? await cachedRuntimeDataSetFingerprint(candidate).catch(() => undefined) ?? 'uncached' : undefined;
