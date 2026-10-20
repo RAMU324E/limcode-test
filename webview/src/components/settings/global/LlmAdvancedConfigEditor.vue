@@ -549,7 +549,7 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
               <span class="stream-checkbox-enable">启用</span>
             </LcCheckbox>
           </div>
-          <LlmSettingHint text="包括鉴权、额度和参数错误；可能增加费用。" details="包括鉴权失败、额度不足、请求参数等供应商错误，仍按设定次数和间隔重试，可能产生额外费用。停止操作始终有效；本地错误不重发模型请求，已完成工具不重复执行，上下文超限仍走压缩修复。" />
+          <LlmSettingHint text="包括鉴权、额度和参数错误；忽略服务端等待。" details="包括鉴权失败、额度不足、请求参数等供应商错误，忽略服务端建议的等待时间，按本地设定次数和间隔重试；间隔为 0 时使用自动退避，可能产生额外费用。停止操作始终有效；本地错误不重发模型请求，已完成工具不重复执行，上下文超限仍走压缩修复。" />
         </div>
 
         <label class="global-settings-field retry-attempts-field">
@@ -570,7 +570,7 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
 
         <label class="global-settings-field">
           <span>重试间隔（秒）</span>
-          <LlmSettingHint text="0 使用自动退避。" details="正数为固定等待秒数；服务端 Retry-After 仍是最早重试时间，不会提前发送。" />
+          <LlmSettingHint text="0 使用自动退避。" details="正数为固定等待秒数。普通重试遵守服务端更长的等待要求；开启强制重试后忽略服务端等待，只使用本地间隔。" />
           <input
             class="token-number-input"
             aria-label="重试间隔（秒）"

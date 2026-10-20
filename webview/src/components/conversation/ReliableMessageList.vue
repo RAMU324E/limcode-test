@@ -22,7 +22,8 @@ import {
   hasVisibleStreamingTransientForRequestAttempt,
   hasVisibleStreamingTransientForTurn,
   createReliableRetryClock,
-  reliableRetryStreamingActivityLabel
+  reliableRetryStreamingActivityLabel,
+  reliableRetryDelaySourceLabel
 } from '@webview/domain/reliableTransientActivity';
 import { createReliableModelRequestRetryIndex, createTurnProjectionIndex, modelRequestRetryForTurn, projectReliableTurnTermination } from '@webview/domain/reliableConversationProjection';
 import { modelRequestStreamStats } from '@webview/reliability/modelRequestStreamStats';
@@ -900,11 +901,7 @@ function modelRequestRetryState(request: Record<string, unknown>, now: number): 
   const retryDelayMs = Math.max(0, reliableInteger(stats?.retryDelayMs));
   const retryNotBeforeAt = Math.max(0, reliableInteger(stats?.retryNotBeforeAt));
   const retryReason = reliableText(stats?.retryReason);
-  return {
-    retryAttempt: Math.max(0, attemptSeq - 1),
-    retryMaxAttempts: Math.max(attemptSeq - 1, reliableInteger(stats?.retryMaxAttempts)),
-    remainingDelayMs: retryNotBeforeAt > 0 ? Math.max(0, retryNotBeforeAt - now) : retryDelayMs,
-    reasonLabel: retryReason === 'compression_timeout'
+  const reasonLabel = retryReason === 'compression_timeout'
       ? '上下文压缩超时'
       : retryReason === 'stream_stalled' || retryReason === 'first_semantic_timeout'
         ? 'LLM 输出停滞'
@@ -912,7 +909,13 @@ function modelRequestRetryState(request: Record<string, unknown>, now: number): 
           ? 'LLM 服务限流'
           : retryReason === 'temporary_service_error'
             ? 'LLM 服务暂时不可用'
-            : 'LLM 连接异常'
+            : 'LLM 连接异常';
+  const delaySource = reliableRetryDelaySourceLabel(stats);
+  return {
+    retryAttempt: Math.max(0, attemptSeq - 1),
+    retryMaxAttempts: Math.max(attemptSeq - 1, reliableInteger(stats?.retryMaxAttempts)),
+    remainingDelayMs: retryNotBeforeAt > 0 ? Math.max(0, retryNotBeforeAt - now) : retryDelayMs,
+    reasonLabel: delaySource ? `${reasonLabel}；${delaySource}` : reasonLabel
   };
 }
 

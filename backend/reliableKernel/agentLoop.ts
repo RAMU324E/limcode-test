@@ -2853,8 +2853,8 @@ export class ReliableAgentLoop {
     const policy = frozenProviderRetryPolicy(frozen.document);
     const maxRetries = policy.enabled ? Math.min(policy.maxRetries, recovery.modelOutputRepair ? 2 : policy.maxRetries) : 0;
     if (recovery.failures <= maxRetries) {
-      // A server minimum/backoff persisted before sealing survives restart. Native recovery may
-      // change request identity for safety, but must not use that to evade Retry-After.
+      // The selected local/server wait persisted before sealing survives restart, including
+      // the explicit forced-retry choice to ignore the server minimum.
       const stats = asRecord(request.stream_stats_json);
       const notBefore = typeof stats?.retryNotBeforeAt === 'number' ? stats.retryNotBeforeAt : 0;
       while (Date.now() < notBefore) {
