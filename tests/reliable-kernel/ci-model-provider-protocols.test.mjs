@@ -145,6 +145,26 @@ test('Claude 网关拒绝 clear_at 后只给原目标记住尾巴模式', () => 
   assert.deepEqual(tail, [user('q'), model([{ text: 'a' }]), user('current')]);
 });
 
+test('Gemini 自定义网关复用渠道 Key 发送 x-api-key，Google 官方端点保持原认证头', async () => {
+  const gateway = settings('gemini', { apiKey: 'offline-gateway-key' });
+  const gatewayRequest = startRequest([user('auth')]);
+  const gatewayDryRun = await llm.dryRunLlmProvider(gatewayRequest, { settings: async () => gateway }, { includeApiKey: true });
+  assert.equal(gatewayDryRun.headers['x-goog-api-key'], 'offline-gateway-key');
+  assert.equal(gatewayDryRun.headers['x-api-key'], 'offline-gateway-key');
+
+  const official = settings('gemini', {
+    apiKey: 'offline-official-key',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta'
+  });
+  const officialDryRun = await llm.dryRunLlmProvider(gatewayRequest, { settings: async () => official }, { includeApiKey: true });
+  assert.equal(officialDryRun.headers['x-goog-api-key'], 'offline-official-key');
+  assert.equal(officialDryRun.headers['x-api-key'], undefined);
+
+  const overridden = settings('gemini', { apiKey: 'offline-channel-key', headers: { 'X-API-Key': 'explicit-gateway-key' } });
+  const overriddenDryRun = await llm.dryRunLlmProvider(gatewayRequest, { settings: async () => overridden }, { includeApiKey: true });
+  assert.equal(overriddenDryRun.headers['x-api-key'] ?? overriddenDryRun.headers['X-API-Key'], 'explicit-gateway-key');
+});
+
 test('Gemini 文本签名保留原 part，空尾签名不变成思考', async () => {
   const config = settings('gemini');
   const reply = await withFetch(() => sse([
