@@ -109,6 +109,7 @@ export async function createConfigurationUiGraph() {
       const f = { ...active, vue, pinia: isolated,
         client: store('useClientStateStore'), models: store('useModelProfileStore'), global: store('useGlobalSettingsStore'),
         conversation: store('useConversationSettingsStore'), prompts: store('useSystemPromptStore'), tools: store('useToolPolicyStore'), feed: store('useReliableKernelClientFeedStore'),
+        domain(name) { return load(path.join(sourceRoot, `domain/${name}.ts`)); },
         mount(name, props = {}) {
           const component = { ...load(componentFiles[name]).default, render() { return null; } };
           const app = renderer.createApp(component, props).use(isolated), root = node('root');

@@ -551,3 +551,18 @@ test('专业参数编辑挂载不写默认，数值清空不落为0，思考档�
   parameters.updateKnownValue(claudeThinking, 'none');
   assert.deepEqual(emitted.pop(), { ...saved, thinkingConfig: { thinkingLevel: 'none' } });
 });
+
+
+test('重试提示显示上次具体错误，不把等待输出说成正在连接', t => {
+  const f = graph.session(t);
+  const { reliableRetryFailureLabel, reliableRetryStreamingActivityLabel } = f.domain('reliableTransientActivity');
+  const lastFailureLabel = reliableRetryFailureLabel({ lastRetryFailure: {
+    error: { status: 504, code: 'upstream_timeout', message: 'gateway timeout' }
+  } });
+  assert.equal(lastFailureLabel, '上次失败：HTTP 504 · upstream_timeout · gateway timeout');
+  const input = { retryAttempt: 1, retryMaxAttempts: 10, hasVisibleOutput: false, lastFailureLabel };
+  assert.equal(reliableRetryStreamingActivityLabel(input),
+    '第 1/10 次自动恢复已启动，正在等待 LLM 输出；上次失败：HTTP 504 · upstream_timeout · gateway timeout');
+  assert.equal(reliableRetryStreamingActivityLabel({ ...input, hasVisibleOutput: true }), undefined);
+  assert.equal(reliableRetryFailureLabel(undefined), '');
+});

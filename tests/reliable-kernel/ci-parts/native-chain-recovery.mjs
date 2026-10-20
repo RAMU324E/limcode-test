@@ -350,6 +350,9 @@ test('a settled native effect survives rebase and a later running effect parks r
     const initialRequests = (await rows(app, 'ModelRequest', { turn_id: turn.turnId }))
       .sort((left, right) => Number(left.request_seq) - Number(right.request_seq));
     assert.equal(initialRequests[0].terminal_state, 'native_chain_rebased');
+    assert.equal(initialRequests[0].stream_stats_json.lastRetryFailure.error.reason, 'connection_interrupted');
+    assert.equal(initialRequests[0].stream_stats_json.lastRetryFailure.phase, 'after_output');
+    assert.equal(initialRequests[0].stream_stats_json.lastRetryFailure.attemptSeq, '1');
     assert.notEqual(requests[1].modelRequestId, requests[0].modelRequestId);
     const second = await drive(turn);
     assert.equal(second.terminalStatus, 'waiting');

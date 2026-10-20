@@ -311,6 +311,7 @@ test('真实 Gemini SDK 断流替换 durable Attempt，不执行失败流里的�
   const [request] = await fixture.rows('ModelRequest', { turn_id: turnId });
   assert.equal(request.terminal_state, 'completed');
   assert.equal(calls, 2);
+  assert.equal(request.stream_stats_json.lastRetryFailure.phase, 'after_output');
   assert.deepEqual(bodies[1], bodies[0]);
   assert.deepEqual((await fixture.app.modelProvider.completedEvent(request.id)).content,
     { role: 'model', parts: [{ text: 'recovered' }] });
@@ -318,6 +319,49 @@ test('真实 Gemini SDK 断流替换 durable Attempt，不执行失败流里的�
   assert.deepEqual((await fixture.rows('Attempt', { operation_id: operation.id })).map(attempt => attempt.status).sort(),
     ['completed', 'transient_failed']);
   assert.equal((await fixture.rows('ToolCall', { turn_id: turnId })).length, 0);
+});
+
+test('普通重试保留最近一次具体错误，成功、投影与重开后仍可追查', async () => {
+  let calls = 0;
+  const seenFailures = [];
+  const message = 'gateway timeout at https://relay.invalid/v1?key=url-secret '
+    + '{"api_key":"json-secret"} Bearer bearer-secret';
+  fixture.setFetch(async () => {
+    calls += 1;
+    const [request] = await fixture.rows('ModelRequest', { turn_id: input.turnId });
+    seenFailures.push(request.stream_stats_json.lastRetryFailure);
+    if (calls === 1) return Response.json({ error: { code: 'upstream_busy', message: 'service unavailable' } }, { status: 503 });
+    if (calls === 2) return Response.json({ error: { code: 'upstream_timeout', message } }, { status: 504 });
+    return sse([compatDelta({ content: 'recovered' }), compatDelta({}, 'stop')]);
+  });
+  await fixture.createConversation('retry-diagnostics');
+  const input = await fixture.input('retry-diagnostics', 'input', {
+    retryPolicy: { enabled: true, maxRetries: 2, retryDelayMs: 1 }
+  });
+  const created = await fixture.request('retry-diagnostics', input.turnId, 'diagnostics');
+  await fixture.app.modelProvider.dispatch(created.modelRequestId, fixture.provider('compatible'));
+  const [request] = await fixture.rows('ModelRequest', { id: created.modelRequestId });
+  assert.equal(calls, 3);
+  assert.equal(request.terminal_state, 'completed');
+  assert.equal(seenFailures[0], undefined);
+  assert.equal(seenFailures[1].error.status, 503);
+  const last = request.stream_stats_json.lastRetryFailure;
+  assert.equal(last.attemptSeq, '2');
+  assert.equal(last.error.status, 504);
+  assert.equal(last.error.code, 'upstream_timeout');
+  assert.equal(last.error.reason, 'temporary_service_error');
+  assert.equal(last.phase, 'before_output');
+  assert.ok(last.failedAt >= Date.parse(request.created_at));
+  assert.ok(last.elapsedMs >= 0);
+  assert.match(last.error.message, /gateway timeout/);
+  assert.doesNotMatch(JSON.stringify(last), /relay\.invalid|url-secret|json-secret|bearer-secret/);
+  assert.deepEqual(seenFailures[2], last);
+  assert.equal(request.stream_stats_json.failure, undefined, 'diagnostic must not become a repair-policy marker');
+  const { projectModelRequestSummary } = load('backend/reliableKernel/clientModelRequestSummary.js');
+  assert.deepEqual(projectModelRequestSummary({ ...request,
+    stream_stats_json: JSON.stringify(request.stream_stats_json) }).stream_stats_json.lastRetryFailure, last);
+  await fixture.restart();
+  assert.deepEqual((await fixture.rows('ModelRequest', { id: created.modelRequestId }))[0].stream_stats_json.lastRetryFailure, last);
 });
 
 test('伪思考进度不续命，持久重试等待经接手仍保持并可取消', async context => {
@@ -370,6 +414,10 @@ test('伪思考进度不续命，持久重试等待经接手仍保持并可取�
     assert.equal(retrying.stream_stats_json.attemptSeq, '2');
     assert.equal(retrying.stream_stats_json.retryDelayMs, 60_000);
     assert.equal(retrying.stream_stats_json.retryNotBeforeAt, epoch + 60_000);
+    const failure = retrying.stream_stats_json.lastRetryFailure;
+    assert.equal(failure.error.reason, 'first_semantic_timeout');
+    assert.equal(failure.phase, 'before_output');
+    assert.equal(failure.attemptSeq, '1');
     await first.quiesceAllActiveDispatches(new kernel.ExecutionHandoffError('fixture handoff'));
     await interrupted;
     const caller = new AbortController();
@@ -386,6 +434,8 @@ test('伪思考进度不续命，持久重试等待经接手仍保持并可取�
     assert.equal(calls, 1);
     assert.equal((await fixture.rows('ModelRequest', { id: created.modelRequestId }))[0].terminal_state,
       'cancelled-during-provider-retry-delay');
+    assert.deepEqual((await fixture.rows('ModelRequest', { id: created.modelRequestId }))[0]
+      .stream_stats_json.lastRetryFailure, failure);
   } finally {
     await first.quiesceAllActiveDispatches(new kernel.ExecutionHandoffError('fixture cleanup'));
     for (const timer of timers) clearTimeout(timer.handle);

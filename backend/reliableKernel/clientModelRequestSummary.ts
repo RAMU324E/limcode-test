@@ -22,7 +22,7 @@ const USAGE_FIELDS = [
 const STREAM_FIELDS = [
   'attemptSeq', 'socketGeneration', 'retryReason', 'retryMaxAttempts', 'retryDelayMs', 'retryNotBeforeAt',
   'providerStartedAt', 'firstOutputAt', 'completedAt', 'streamOutputDurationMs',
-  'lastStreamSeq', 'lastStreamEventAt', 'thinkingSelection', 'claudeThinkingBinding',
+  'lastStreamSeq', 'lastStreamEventAt', 'thinkingSelection', 'claudeThinkingBinding', 'lastRetryFailure',
   'nativeCapabilities', 'nativeInitialPromptTokenCount', 'nativeLatestResponseUsage'
 ];
 
