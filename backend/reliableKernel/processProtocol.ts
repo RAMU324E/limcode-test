@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import { decodeCanonicalBase64 } from '../capabilities/canonicalBase64';
 import { resolveWindowsPowerShell } from '../capabilities/windowsPowerShell';
 import { isPathBelow } from '../capabilities/filesystem/pathContainment';
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
+import { promisify } from 'node:util';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { RootBinding } from './contracts';
@@ -425,6 +426,87 @@ export function readProcessStartFingerprint(pidInput: string | number): string {
   }
 }
 
+const execFileAsync = promisify(execFile);
+const processIdentityFlights = new Map<string, Promise<string>>();
+
+/** Host-side probes must yield while the OS command runs; wrappers retain the synchronous API. */
+export function readProcessStartFingerprintAsync(pidInput: string | number): Promise<string> {
+  const pid = normalizePid(pidInput);
+  const active = processIdentityFlights.get(pid);
+  if (active) return active;
+  const flight = readProcessStartFingerprintNonblocking(pid).finally(() => {
+    if (processIdentityFlights.get(pid) === flight) processIdentityFlights.delete(pid);
+  });
+  processIdentityFlights.set(pid, flight);
+  return flight;
+}
+
+async function readProcessStartFingerprintNonblocking(pid: string): Promise<string> {
+  if (process.platform === 'win32') {
+    assertProcessReachable(pid);
+    const script = `$p = Get-Process -Id ${pid} -ErrorAction Stop; [Console]::Out.Write($p.StartTime.ToUniversalTime().Ticks.ToString())`;
+    const ticks = await runWindowsTicksProbeAsync(pid, script);
+    if (ticks === 'missing') throw processInspectionMissing(pid);
+    return `${WINDOWS_START_IDENTITY_PREFIX}${pid}:${ticks}`;
+  }
+  if (process.platform === 'darwin') {
+    assertProcessReachable(pid);
+    const { stdout } = await execFileAsync('/bin/ps', ['-p', pid, '-o', 'pid=,pgid=,lstart='], {
+      encoding: 'utf8', env: { ...process.env, LANG: 'C', LC_ALL: 'C', TZ: 'UTC' },
+      maxBuffer: 16 * 1024 * 1024, timeout: 3_000, windowsHide: true
+    }).catch((error: unknown) => {
+      if (typeof (error as NodeJS.ErrnoException).code === 'number') throw processInspectionMissing(pid, error);
+      throw error;
+    });
+    const row = parseDarwinProcessRows(stdout).find(entry => entry.pid === pid);
+    if (!row) throw processInspectionMissing(pid);
+    return row.startFingerprint;
+  }
+  return readProcessStartFingerprint(pid);
+}
+
+/** The simple identity script works in built-in Windows PowerShell; no shell-version probe is needed. */
+async function runWindowsTicksProbeAsync(pid: string, script: string): Promise<bigint | 'missing'> {
+  for (let attempt = 0; ; attempt += 1) {
+    const timeout = WINDOWS_START_PROBE_TIMEOUTS_MS[attempt]!;
+    let output: string;
+    try {
+      const result = await execFileAsync('powershell.exe', [
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script
+      ], { encoding: 'utf8', windowsHide: true, timeout });
+      output = result.stdout.trim();
+    } catch (error) {
+      const failure = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string; stderr?: string };
+      const timedOut = failure.killed === true && failure.signal === 'SIGTERM';
+      if (timedOut && attempt + 1 < WINDOWS_START_PROBE_TIMEOUTS_MS.length) continue;
+      throw Object.assign(new Error(
+        timedOut
+          ? `Cannot read start time for process ${pid}: PowerShell probe timed out ${attempt + 1} times (last budget ${timeout}ms).`
+          : `Cannot read start time for process ${pid}: ${firstLine(failure.stderr) ?? failure.message}`
+      ), { code: timedOut ? 'ETIMEDOUT' : typeof failure.code === 'string' ? failure.code : 'ENOENT', cause: error });
+    }
+    if (output === 'missing') return 'missing';
+    if (/^\d+$/.test(output)) return BigInt(output);
+    throw Object.assign(new Error(`Cannot read start time for process ${pid}: invalid probe output.`), { code: 'ENOENT' });
+  }
+}
+
+/** Darwin's wrapper inspection also starts ps; Windows and Linux use only local process/file checks. */
+export async function isWrapperProcessReachableAsync(wrapperPidInput: string, launchPathInput: string): Promise<boolean> {
+  if (process.platform !== 'darwin') return isWrapperProcessReachable(wrapperPidInput, launchPathInput);
+  const wrapperPid = requireDecimalString(wrapperPidInput, 'wrapperPid');
+  const launchPath = path.resolve(launchPathInput);
+  try {
+    assertProcessReachable(wrapperPid);
+    const { stdout } = await execFileAsync('/bin/ps', ['-ww', '-p', wrapperPid, '-o', 'command='], {
+      encoding: 'utf8', env: { ...process.env, LANG: 'C', LC_ALL: 'C', TZ: 'UTC' },
+      maxBuffer: 16 * 1024 * 1024, timeout: 3_000, windowsHide: true
+    });
+    const commandLine = stdout.trim();
+    return commandLine === launchPath || commandLine.endsWith(` ${launchPath}`);
+  } catch { return false; }
+}
+
 export function isWrapperProcessReachable(wrapperPidInput: string, launchPathInput: string): boolean {
   switch (process.platform) {
     case 'linux': return isLinuxWrapperProcessReachable(wrapperPidInput, launchPathInput);
@@ -481,10 +563,10 @@ export interface WindowsCreationTimeCheck {
  * but this check never manufactures a fingerprint: it can only prove that the pid was reused, and
  * only when the creation time differs from the recorded one by more than a generous tolerance.
  */
-export function checkWindowsStartIdentityByCreationTime(
+export async function checkWindowsStartIdentityByCreationTime(
   processId: number,
   recordedIdentity: string
-): WindowsCreationTimeCheck {
+): Promise<WindowsCreationTimeCheck> {
   const pid = BigInt(processId).toString();
   const prefix = `${WINDOWS_START_IDENTITY_PREFIX}${pid}:`;
   const recordedTicks = recordedIdentity.startsWith(prefix) ? recordedIdentity.slice(prefix.length) : '';
@@ -496,7 +578,7 @@ export function checkWindowsStartIdentityByCreationTime(
     `else { [Console]::Out.Write($c.CreationDate.ToUniversalTime().Ticks.ToString()) }`;
   let observed: bigint | 'missing';
   try {
-    observed = runWindowsTicksProbe(pid, script);
+    observed = await runWindowsTicksProbeAsync(pid, script);
   } catch (error) {
     return { verdict: 'inconclusive', detail: `CIM creation time unavailable: ${error instanceof Error ? error.message : String(error)}` };
   }

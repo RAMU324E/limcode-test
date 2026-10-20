@@ -892,9 +892,9 @@ export const RUNTIME_DATA_SET_MERGE_PREPARATION_STALE_MS = 60_000;
  * proven gone (classifyRecordedProcess: no such pid, or a pid now used by another process as its
  * start identity shows). A process whose state cannot be verified counts as there.
  */
-export function isRuntimeDataSetMergePreparationLive(preparation: RuntimeDataSetMergePreparation, now = Date.now()): boolean {
+export async function isRuntimeDataSetMergePreparationLive(preparation: RuntimeDataSetMergePreparation, now = Date.now()): Promise<boolean> {
   if (!(now - Date.parse(preparation.heartbeatAt) < RUNTIME_DATA_SET_MERGE_PREPARATION_STALE_MS)) return false;
-  return classifyRecordedProcess(preparation.processId, preparation.processStartIdentity) !== 'dead';
+  return (await classifyRecordedProcess(preparation.processId, preparation.processStartIdentity)) !== 'dead';
 }
 
 /** Removes preparations whose holder is gone (a crashed or closed window). Call inside configuration admission. */
@@ -903,7 +903,7 @@ export async function pruneRuntimeDataSetMergePreparations(paths: StoragePaths):
     const candidateId = (value as { candidateId?: unknown } | null)?.candidateId;
     const preparation = typeof candidateId === 'string' && fileName(candidateId) === name
       ? await readRuntimeDataSetMergePreparation(paths, candidateId).catch(() => undefined) : undefined;
-    if (!preparation || !isRuntimeDataSetMergePreparationLive(preparation)) await removeLedgerFile(paths, PREPARATIONS, name);
+    if (!preparation || !await isRuntimeDataSetMergePreparationLive(preparation)) await removeLedgerFile(paths, PREPARATIONS, name);
   }
 }
 
@@ -970,9 +970,9 @@ export async function removeRuntimeLargeMergeTargetBackupFile(paths: StoragePath
  * Whether the window that registered a target backup may still use it: heard from within a day, and
  * its process not proven gone (as isRuntimeDataSetMergePreparationLive).
  */
-export function isRuntimeLargeMergeTargetBackupLive(backup: RuntimeLargeMergeTargetBackup, now = Date.now()): boolean {
+export async function isRuntimeLargeMergeTargetBackupLive(backup: RuntimeLargeMergeTargetBackup, now = Date.now()): Promise<boolean> {
   if (!(now - Date.parse(backup.heartbeatAt) < RUNTIME_LARGE_MERGE_TARGET_BACKUP_STALE_MS)) return false;
-  return classifyRecordedProcess(backup.processId, backup.processStartIdentity) !== 'dead';
+  return (await classifyRecordedProcess(backup.processId, backup.processStartIdentity)) !== 'dead';
 }
 
 /** Absent, or a non-empty text. */

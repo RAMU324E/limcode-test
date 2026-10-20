@@ -896,7 +896,7 @@ async function readLedgerFacts(configurationRootPath: string): Promise<LedgerFac
         preparing.names.add(file.replace(/\.json$/, ''));
         continue;
       }
-      const live = isRuntimeLargeMergeTargetBackupLive(backup);
+      const live = (await isRuntimeLargeMergeTargetBackupLive(backup));
       // A used one whose window is gone is any merge's pre-merge backup now (only its registration is left).
       if (!live && backup.used) continue;
       preparing.paths.add(comparable(path.resolve(backup.backupPath)));

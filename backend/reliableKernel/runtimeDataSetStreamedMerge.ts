@@ -871,7 +871,7 @@ class PreparationClaims {
     return withRuntimeDataRootAdmission(this.paths.globalStoragePath, async () => {
       const current = await readRuntimeDataSetMergePreparation(this.paths, candidateId).catch(() => undefined);
       const mine = this.held.get(candidateId);
-      if (current && current.token !== mine?.token && isRuntimeDataSetMergePreparationLive(current)) return false;
+      if (current && current.token !== mine?.token && (await isRuntimeDataSetMergePreparationLive(current))) return false;
       const claim = mine ?? { token: randomUUID(), startedAt: new Date().toISOString() };
       await writeRuntimeDataSetMergePreparation(this.paths, {
         candidateId, token: claim.token, processId: process.pid, ...this.processIdentity(),

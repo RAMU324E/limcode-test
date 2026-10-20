@@ -304,14 +304,14 @@ export function createProtocolProcessClassifier(
   now: () => number = () => performance.now()
 ): RecordedProcessClassifier {
   const perProcess = new Map<string, { classify: RecordedProcessClassifier; unknownSince?: number }>();
-  return (processId, processStartIdentity) => {
+  return async (processId, processStartIdentity) => {
     const key = `${processId}\0${processStartIdentity ?? ''}`;
     let entry = perProcess.get(key);
     if (!entry || (entry.unknownSince !== undefined && now() - entry.unknownSince >= unknownRecheckMs)) {
       entry = { classify: createCachedProcessClassifier(probe) };
       perProcess.set(key, entry);
     }
-    const state = entry.classify(processId, processStartIdentity);
+    const state = await entry.classify(processId, processStartIdentity);
     if (state === 'unknown') entry.unknownSince ??= now();
     return state;
   };
@@ -1326,7 +1326,7 @@ export async function readExclusiveMaintenanceRequests(
     if (Date.parse(request.expiresAt) <= now) continue;
     const heartbeat = Date.parse(request.heartbeatAt);
     if (!Number.isFinite(heartbeat) || now - heartbeat > staleMs) continue;
-    if (classify(request.requesterProcessId, request.requesterProcessStartIdentity) !== 'alive') continue;
+    if ((await classify(request.requesterProcessId, request.requesterProcessStartIdentity)) !== 'alive') continue;
     requests.push(request);
   }
   return requests.sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.requestId.localeCompare(right.requestId));
@@ -1366,7 +1366,7 @@ async function sweepAbandonedRequests(paths: RuntimeRootPaths, classify: Recorde
     const file = path.join(requestsDirectory, name);
     const request = await readRequestFile(file);
     const abandoned = !request || request.phase === 'withdrawn' || Date.parse(request.expiresAt) <= Date.now()
-      || classify(request.requesterProcessId, request.requesterProcessStartIdentity) === 'dead';
+      || (await classify(request.requesterProcessId, request.requesterProcessStartIdentity)) === 'dead';
     if (abandoned) await removeWithRetry(file).catch(() => undefined);
     else present.add(request.requestId);
   }

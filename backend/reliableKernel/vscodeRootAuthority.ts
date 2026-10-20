@@ -388,7 +388,7 @@ export async function legacyWorkspaceRuntimeOwnerState(
   const record = value as Record<string, unknown> | null;
   if (!record || typeof record !== 'object' || !Number.isSafeInteger(record.pid) || (record.pid as number) <= 0
     || (record.processStartIdentity !== undefined && typeof record.processStartIdentity !== 'string')) return 'unknown';
-  const state = classifyRecordedProcess(record.pid as number, record.processStartIdentity as string | undefined);
+  const state = await classifyRecordedProcess(record.pid as number, record.processStartIdentity as string | undefined);
   return state === 'dead' ? 'absent' : state === 'alive' ? 'alive' : 'unknown';
 }
 

@@ -489,7 +489,7 @@ export class ConversationRuntimeOwnerManager {
       // Only a definitely dead or reused process identity may be isolated. Any live or unknown
       // state — including mismatched root identity, a record from this same process, or an
       // elapsed heartbeat — fails closed: none of those prove the recorded writer is fenced.
-      if (classifyRecordedProcess(record.processId, record.processStartIdentity) === 'dead') {
+      if ((await classifyRecordedProcess(record.processId, record.processStartIdentity)) === 'dead') {
         await this.isolateRecord(claimPath, record.ownerToken);
         continue;
       }

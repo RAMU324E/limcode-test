@@ -394,7 +394,7 @@ export async function listActiveRuntimeHosts(
       continue;
     }
     if (exceptHostBootId !== undefined && record.hostBootId === exceptHostBootId) continue;
-    const state = classify(record.processId, record.processStartIdentity);
+    const state = await classify(record.processId, record.processStartIdentity);
     if (state === 'dead') continue;
     active.push({
       hostBootId: record.hostBootId,
@@ -614,7 +614,7 @@ async function acquireMaintenanceClaim(
     if (record.claimToken !== observedToken) {
       // One platform identity probe per observed claim token; liveness re-checks below are cheap.
       observedToken = record.claimToken;
-      observed = inspectRecordedProcess(record.processId, record.processStartIdentity);
+      observed = await inspectRecordedProcess(record.processId, record.processStartIdentity);
     }
     if (observed!.state === 'dead') {
       await isolateMaintenanceRecord(claimPath, record.claimToken);
@@ -780,10 +780,10 @@ export async function withRuntimeClaimAtPath<T>(
  * regular file, never through a link, a FIFO or a file of a database this process holds). `records`
  * are the `*.json` entries with their text; malformed ones come back with state 'malformed'.
  */
-export function judgeRuntimeHostLivenessRecords(
+export async function judgeRuntimeHostLivenessRecords(
   records: ReadonlyArray<{ name: string; text: string }>,
   classify: RecordedProcessClassifier = classifyRecordedProcess
-): RuntimeHostActiveDescriptor[] {
+): Promise<RuntimeHostActiveDescriptor[]> {
   const active: RuntimeHostActiveDescriptor[] = [];
   for (const { name, text } of records) {
     let value: unknown;
@@ -791,7 +791,7 @@ export function judgeRuntimeHostLivenessRecords(
     catch { active.push(malformedDescriptor(name, undefined)); continue; }
     const record = parseHostLivenessRecord(value);
     if (!record) { active.push(malformedDescriptor(name, value)); continue; }
-    const state = classify(record.processId, record.processStartIdentity);
+    const state = await classify(record.processId, record.processStartIdentity);
     if (state === 'dead') continue;
     active.push({
       hostBootId: record.hostBootId,

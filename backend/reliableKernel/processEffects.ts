@@ -37,7 +37,7 @@ import {
   PROCESS_WRAPPER_MANIFEST_FILE,
   PROCESS_WRAPPER_PROTOCOL,
   PROCESS_WRAPPER_STOP_REQUEST_FILE,
-  isWrapperProcessReachable,
+  isWrapperProcessReachableAsync,
   listProcessSpoolChunks,
   parseStopRequest,
   parseWrapperBootstrapReceipt,
@@ -49,7 +49,7 @@ import {
   processChunkFileName,
   processSpoolPath,
   processSpoolRoot,
-  readProcessStartFingerprint,
+  readProcessStartFingerprintAsync,
   type ProcessStopRequest,
   type ProcessTerminationReason,
   type ProcessWrapperBootstrapReceipt,
@@ -857,7 +857,7 @@ export class ProcessControlPlane {
           : unknownStopObservation(errorMessage(error));
       }
 
-      if (!isWrapperProcessReachable(identity.wrapperPid, path.join(spoolPath, 'launch.json'))) {
+      if (!await isWrapperProcessReachableAsync(identity.wrapperPid, path.join(spoolPath, 'launch.json'))) {
         const terminal = await retryLocalExecution(() => this.waitForTerminalProcessEvidence(
           request.processId,
           PROCESS_STOP_RECEIPT_WAIT_MS
@@ -867,7 +867,7 @@ export class ProcessControlPlane {
           : unknownStopObservation('Recorded process wrapper is not reachable and no terminal receipt converged.');
       }
       try {
-        if (readProcessStartFingerprint(identity.childPid) !== identity.startFingerprint) {
+        if ((await readProcessStartFingerprintAsync(identity.childPid)) !== identity.startFingerprint) {
           return unknownStopObservation('Live process start fingerprint does not match.');
         }
       } catch (error) {
@@ -1695,7 +1695,7 @@ export class ProcessControlPlane {
       if (error instanceof LocalExecutionRecoveryExhaustedError) throw error;
       if (!isNotFound(error)) return { state: 'outcome_unknown', processId, reason: errorMessage(error) };
     }
-    if (!isWrapperProcessReachable(identity.wrapperPid, path.join(spoolPath, 'launch.json'))) {
+    if (!await isWrapperProcessReachableAsync(identity.wrapperPid, path.join(spoolPath, 'launch.json'))) {
       // The wrapper can atomically publish its receipt and exit between the first receipt read and
       // this liveness check. Re-read the terminal authority before classifying that normal race as
       // outcome_unknown.
@@ -1723,7 +1723,7 @@ export class ProcessControlPlane {
       };
     }
     try {
-      if (readProcessStartFingerprint(identity.childPid) !== identity.startFingerprint) {
+      if ((await readProcessStartFingerprintAsync(identity.childPid)) !== identity.startFingerprint) {
         return {
           state: 'outcome_unknown',
           processId,

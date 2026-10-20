@@ -311,7 +311,7 @@ async function withWorkspaceMutationClaim<T>(roots: FilePlanningRoot[], run: () 
         if (other.kind !== 'file-mutation-active' || other.ownerToken !== name) throw invalid();
         const overlap = other.roots.some(left => roots.some(right => mutationPathsOverlap(left.canonicalPath, right.canonicalPath)));
         if (!overlap) continue;
-        const state = classify(other.processId, other.processStartIdentity);
+        const state = await classify(other.processId, other.processStartIdentity);
         if (state === 'unknown') throw invalid();
         if (state === 'alive') return false;
         await isolateDeadClaimRecord(otherPath, 'owner.json', other.ownerToken, parseFileMutationClaim, invalid);
@@ -361,7 +361,7 @@ async function withMutationAdmission<T>(namespace: string, deadline: number, sig
       const owner = await readClaimRecord(claimPath, 'owner.json', parseFileMutationClaim, invalid);
       if (!owner) continue;
       if (owner.kind !== 'file-mutation-admission') throw invalid();
-      const state = classify(owner.processId, owner.processStartIdentity);
+      const state = await classify(owner.processId, owner.processStartIdentity);
       if (state === 'unknown') throw invalid();
       if (state === 'dead') {
         await isolateDeadClaimRecord(claimPath, 'owner.json', owner.ownerToken, parseFileMutationClaim, invalid);

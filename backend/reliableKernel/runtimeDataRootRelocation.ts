@@ -1069,11 +1069,11 @@ async function unfinishedRelocation(
   if (marker.state === 'held' || marker.state === 'published' || marker.state === 'finalized') return 'none';
   // An undo that was interrupted is always finished, whoever interrupted it (still behind the receiving check).
   if (marker.state === 'staging' || marker.state === 'undoing') {
-    if (ownerState(marker.owner) === 'dead') return 'undo';
+    if ((await ownerState(marker.owner)) === 'dead') return 'undo';
     return marker.state === 'undoing' ? 'undoing' : 'running';
   }
   // Complete, not confirmed: its owner may still switch the pointer.
-  if (ownerState(marker.owner) !== 'dead') return 'running';
+  if ((await ownerState(marker.owner)) !== 'dead') return 'running';
   if (marker.invalidatedAt) return 'none';
   if (marker.installation !== installation) return 'foreign';
   if (!isSamePath(path.resolve(marker.sourceRootPath), sourceRootPath)) return 'none';
@@ -3008,7 +3008,7 @@ function currentOwner(): RelocationOwner {
   return { processId: process.pid, ...(identity ? { processStartIdentity: identity } : {}) };
 }
 
-function ownerState(owner: RelocationOwner): 'alive' | 'dead' | 'unknown' {
+function ownerState(owner: RelocationOwner): Promise<'alive' | 'dead' | 'unknown'> {
   return classifyRecordedProcess(owner.processId, owner.processStartIdentity);
 }
 
@@ -3126,7 +3126,7 @@ export async function recoverInterruptedDataRootRelocation(input: {
     if (!marker || marker.relocationId !== input.relocationId) return nothingThere();
     if (marker.state === 'held') return 'held';
     if (marker.state === 'published' || marker.state === 'finalized') return 'orphaned';
-    if (ownerState(marker.owner) !== 'dead') return 'running';
+    if ((await ownerState(marker.owner)) !== 'dead') return 'running';
     if (marker.state === 'complete' && !await pathExists(journalPath(target, marker.relocationId))) return 'orphaned';
     const entries = await readJournal(target, marker.relocationId);
     if (hasDatabaseRestore(entries) && await targetOfflineProblem(target)) return 'blocked';
@@ -3170,11 +3170,11 @@ export async function settleDataRootRelocationBeforeOpen(
         return { undone: false };
       }
       if (marker.invalidatedAt) return { undone: false };
-      if (ownerState(marker.owner) !== 'dead') throw new DataRootUnavailableError(target, 'relocating');
+      if ((await ownerState(marker.owner)) !== 'dead') throw new DataRootUnavailableError(target, 'relocating');
       throw new DataRootUnavailableError(target, 'unpublished', marker.switchingAt ? switchingError(marker) : undefined);
     }
     if (marker.state !== 'staging' && marker.state !== 'undoing') return { undone: false };
-    if (ownerState(marker.owner) !== 'dead') throw new DataRootUnavailableError(target, marker.state === 'undoing' ? 'relocation-undoing' : 'relocating');
+    if ((await ownerState(marker.owner)) !== 'dead') throw new DataRootUnavailableError(target, marker.state === 'undoing' ? 'relocation-undoing' : 'relocating');
     const entries = await readJournal(target, marker.relocationId);
     if (hasDatabaseRestore(entries) && await targetOfflineProblem(target)) {
       throw new DataRootUnavailableError(target, 'relocating', new DataRootRelocationError('data-root-relocation-target-busy',
@@ -3210,7 +3210,7 @@ export async function undoUnpublishedDataRootRelocation(root: string): Promise<{
   return withRuntimeDataRootAdmission(target, async () => {
     const marker = await readMarker(target);
     if (!marker || marker.state !== 'complete' || marker.invalidatedAt) return {};
-    if (ownerState(marker.owner) !== 'dead') throw new DataRootUnavailableError(target, 'relocating');
+    if ((await ownerState(marker.owner)) !== 'dead') throw new DataRootUnavailableError(target, 'relocating');
     if (marker.switchingAt) throw switchingError(marker);
     if (!await pathExists(journalPath(target, marker.relocationId))) {
       throw new DataRootRelocationError('data-root-relocation-orphaned',
@@ -3239,9 +3239,9 @@ export async function undoUnpublishedDataRootRelocation(root: string): Promise<{
  */
 async function unfinishedRelocationOwner(root: string): Promise<'none' | 'running' | 'undoing' | 'dead' | 'unpublished'> {
   const marker = await readMarker(path.resolve(root));
-  if (marker?.state === 'complete' && !marker.invalidatedAt) return ownerState(marker.owner) === 'dead' ? 'unpublished' : 'running';
+  if (marker?.state === 'complete' && !marker.invalidatedAt) return (await ownerState(marker.owner)) === 'dead' ? 'unpublished' : 'running';
   if (!marker || (marker.state !== 'staging' && marker.state !== 'undoing')) return 'none';
-  if (ownerState(marker.owner) === 'dead') return 'dead';
+  if ((await ownerState(marker.owner)) === 'dead') return 'dead';
   return marker.state === 'undoing' ? 'undoing' : 'running';
 }
 
@@ -3334,7 +3334,7 @@ export async function dataRootMovedNoticeUnderWay(notice: DataRootMovedNotice): 
   const marker = await readMarker(path.resolve(notice.targetRootPath));
   return !!marker && marker.relocationId === notice.relocationId
     && (marker.state === 'staging' || marker.state === 'complete' || marker.state === 'undoing')
-    && ownerState(marker.owner) !== 'dead';
+    && (await ownerState(marker.owner)) !== 'dead';
 }
 
 function isCarriedWork(value: unknown): value is DataRootCarriedWork {
@@ -3438,7 +3438,7 @@ export async function clearDataRootMovedNotice(root: string, installationId: str
 }
 
 /** State of a recorded relocation's process (for the pointer's in-progress record). */
-export function dataRootRelocationOwnerState(owner: RelocationOwner): 'alive' | 'dead' | 'unknown' {
+export function dataRootRelocationOwnerState(owner: RelocationOwner): Promise<'alive' | 'dead' | 'unknown'> {
   return ownerState(owner);
 }
 
@@ -3453,7 +3453,7 @@ export async function sweepDataRootRelocationLeftovers(dataRootPath: string): Pr
   const now = Date.now();
   const abandoned = async (name: string, owned: RegExp, unowned: RegExp, file: string): Promise<boolean> => {
     const match = owned.exec(name);
-    if (match) return Number(match[1]) !== process.pid && classifyRecordedProcess(Number(match[1]), undefined) === 'dead';
+    if (match) return Number(match[1]) !== process.pid && (await classifyRecordedProcess(Number(match[1]), undefined)) === 'dead';
     if (!unowned.test(name)) return false;
     const info = await lstatOrUndefined(file);
     return !!info && now - info.mtimeMs > UNOWNED_LEFTOVER_AGE_MS;

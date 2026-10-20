@@ -89,7 +89,7 @@ import {
   type RuntimePerformanceMetricEvent,
   type RuntimePerformanceMetricsSink
 } from './runtimePerformanceMetrics';
-import { readProcessStartFingerprint } from './processProtocol';
+import { readProcessStartFingerprint, readProcessStartFingerprintAsync } from './processProtocol';
 import type { MergeModelAggregate } from './runtimeMergeAggregatePreflight';
 import type { RuntimeHistoryRepairInput, RuntimeHistoryRepairResult } from './runtimeHistoryRepairTransaction';
 import { HistoryPreparationAdmission, type HistoryPreparationOptions, type HistoryPreparationPermit } from './historyPreparationAdmission';
@@ -762,7 +762,7 @@ export class RuntimeDatabase {
     await this.validateBinding('host_liveness');
     const record = await readHostLiveness(this.hostLivenessPath(hostBootId));
     if (!record || !sameLivenessRoot(record, this.binding) || record.hostBootId !== hostBootId) return false;
-    return inspectRecordedProcess(record) !== 'dead';
+    return (await inspectRecordedProcess(record)) !== 'dead';
   }
 
   /**
@@ -792,7 +792,7 @@ export class RuntimeDatabase {
       this.rememberHostIdentity(key, 'dead', now);
       return false;
     }
-    const inspected = inspectRecordedProcess(record);
+    const inspected = await inspectRecordedProcess(record);
     if (inspected !== 'unknown') this.rememberHostIdentity(key, inspected, now);
     return inspected !== 'dead';
   }
@@ -1484,7 +1484,7 @@ function recordedProcessVanished(processId: number): boolean {
   }
 }
 
-function inspectRecordedProcess(record: RuntimeHostLivenessRecord): 'alive' | 'dead' | 'unknown' {
+async function inspectRecordedProcess(record: RuntimeHostLivenessRecord): Promise<'alive' | 'dead' | 'unknown'> {
   if (!Number.isSafeInteger(record.processId) || record.processId <= 0) return 'unknown';
   try {
     process.kill(record.processId, 0);
@@ -1495,7 +1495,7 @@ function inspectRecordedProcess(record: RuntimeHostLivenessRecord): 'alive' | 'd
     return 'unknown';
   }
   if (!record.processStartIdentity) return 'alive';
-  const currentIdentity = readProcessStartIdentity(record.processId);
+  const currentIdentity = await readProcessStartFingerprintAsync(record.processId).catch(() => undefined);
   if (currentIdentity === undefined) return 'unknown';
   return currentIdentity === record.processStartIdentity ? 'alive' : 'dead';
 }

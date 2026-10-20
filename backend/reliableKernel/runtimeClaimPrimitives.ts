@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { checkWindowsStartIdentityByCreationTime, readProcessStartFingerprint } from './processProtocol';
+import { checkWindowsStartIdentityByCreationTime, readProcessStartFingerprint, readProcessStartFingerprintAsync } from './processProtocol';
 
 export type RecordedProcessState = 'alive' | 'dead' | 'unknown';
 
@@ -15,21 +15,21 @@ const RETRYABLE_WINDOWS_RENAME_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
  * EPERM proceeds to that identity comparison, and every result that cannot be verified leaves the
  * owner unknown so callers fail closed.
  */
-export function classifyRecordedProcess(
+export async function classifyRecordedProcess(
   processId: number,
   processStartIdentity: string | undefined
-): RecordedProcessState {
-  return inspectRecordedProcess(processId, processStartIdentity).state;
+): Promise<RecordedProcessState> {
+  return (await inspectRecordedProcess(processId, processStartIdentity)).state;
 }
 
 export type RecordedProcessClassifier = (
   processId: number,
   processStartIdentity: string | undefined
-) => RecordedProcessState;
+) => RecordedProcessState | Promise<RecordedProcessState>;
 
 /**
- * For bounded polling loops over the same peers: the platform start-identity probe (a synchronous
- * PowerShell or ps spawn on Windows/macOS) runs at most once per (pid, identity). Afterwards a
+ * For bounded polling loops over the same peers: the platform start-identity probe (an asynchronous
+ * PowerShell or ps query on Windows/macOS) runs at most once per (pid, identity). Afterwards a
  * proven-alive process stays alive only while `kill(pid, 0)` still finds it; ESRCH proves it gone.
  * An EPERM from a proven-alive pid may be a reused pid, so it is fully re-verified once.
  */
@@ -37,7 +37,7 @@ export function createCachedProcessClassifier(
   classify: RecordedProcessClassifier = classifyRecordedProcess
 ): RecordedProcessClassifier {
   const cache = new Map<string, RecordedProcessState>();
-  return (processId, processStartIdentity) => {
+  return async (processId, processStartIdentity) => {
     const key = `${processId}\0${processStartIdentity ?? ''}`;
     const cached = cache.get(key);
     if (cached === 'dead' || cached === 'unknown') return cached;
@@ -52,7 +52,7 @@ export function createCachedProcessClassifier(
         }
       }
     }
-    const state = classify(processId, processStartIdentity);
+    const state = await classify(processId, processStartIdentity);
     cache.set(key, state);
     return state;
   };
@@ -64,10 +64,10 @@ export interface RecordedProcessInspection {
   reason?: string;
 }
 
-export function inspectRecordedProcess(
+export async function inspectRecordedProcess(
   processId: number,
   processStartIdentity: string | undefined
-): RecordedProcessInspection {
+): Promise<RecordedProcessInspection> {
   if (!Number.isSafeInteger(processId) || processId <= 0) {
     return { state: 'unknown', reason: `recorded process id ${String(processId)} is not a valid pid` };
   }
@@ -86,11 +86,11 @@ export function inspectRecordedProcess(
   if (processStartIdentity === undefined) return { state: 'alive' };
   let currentIdentity: string;
   try {
-    currentIdentity = readProcessStartFingerprint(processId);
+    currentIdentity = await readProcessStartFingerprintAsync(processId);
   } catch (error) {
     const primary = `process ${processId} exists but its start time could not be read: ${error instanceof Error ? error.message : String(error)}`;
     if (process.platform !== 'win32') return { state: 'unknown', reason: primary };
-    const fallback = checkWindowsStartIdentityByCreationTime(processId, processStartIdentity);
+    const fallback = await checkWindowsStartIdentityByCreationTime(processId, processStartIdentity);
     if (fallback.verdict === 'reused') return { state: 'dead' };
     if (fallback.verdict === 'missing' && processVanished(processId)) return { state: 'dead' };
     return { state: 'unknown', reason: `${primary}; ${fallback.detail}` };
