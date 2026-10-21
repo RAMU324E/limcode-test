@@ -14,8 +14,8 @@ import { canonicalLlmProviderKind, type LlmThinkingConfigRecord, type LlmProvide
 import { createHash } from 'node:crypto';
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import { LocalExecutionRecoveryExhaustedError, markRestoredTerminalFailure, retryLocalExecution } from './localExecutionRecovery';
-import { compressionExecutionMetadata, readProviderRequestFailure, safeProviderFailureMessage,
-  type CompressionRequestPurpose, type CompressionRecoveryDecision, type ProviderRequestFailureFact
+import { compressionExecutionMetadata, readProviderRequestFailure, readProviderRetryFailure, safeProviderFailureMessage,
+  type CompressionRequestPurpose, type CompressionRecoveryDecision, type ProviderRequestFailureFact, type ProviderRetryFailure
 } from '../../shared/compressionExecution';
 import { performance } from 'node:perf_hooks';
 import { normalizeLlmCompressionMaxDurationMinutes, type AttachmentCatalogEntry } from '../../shared/protocol';
@@ -584,6 +584,7 @@ interface StreamStats {
   compressionPurpose?: CompressionRequestPurpose;
   compressionDecision?: CompressionRecoveryDecision;
   failure?: ProviderRequestFailureFact;
+  lastRetryFailure?: ProviderRetryFailure;
   thinkingSelection?: string;
   attemptSeq: string;
   socketGeneration: string;
@@ -1566,6 +1567,8 @@ export class ModelProviderControlPlane {
       }
       const identity = await this.openSocketGeneration(modelRequestId, attemptSeq, stats);
       let lastObservedStreamSeq = 0n;
+      const attemptStartedAt = this.epochNow();
+      let receivedProviderOutput = false;
       let sawReplayUnsafeProviderEvent = false;
       let eventHandlerFailure: unknown;
       let failedPartialOutput: ProviderOutputStreamEvent | undefined;
@@ -1664,6 +1667,7 @@ export class ModelProviderControlPlane {
               const observedSeq = decimalBigInt(streamSeq, 'Provider compression progress streamSeq');
               if (observedSeq <= lastObservedStreamSeq) return;
               lastObservedStreamSeq = observedSeq;
+              receivedProviderOutput = true;
               progressWaiter.observeProgress();
               await this.persistStreamActivityIfDue(
                 modelRequestId,
@@ -1695,6 +1699,7 @@ export class ModelProviderControlPlane {
               }
             }
             if (semanticProgress) {
+              receivedProviderOutput = true;
               sawReplayUnsafeProviderEvent = true;
               progressWaiter.observeProgress();
             }
@@ -1803,11 +1808,19 @@ export class ModelProviderControlPlane {
         );
         throw error;
       }
-      if (nativeRequest && options.nativeReplayUnsafe?.() === true) {
+      const failedAt = this.epochNow();
+      const nativeReplayUnsafe = nativeRequest && options.nativeReplayUnsafe?.() === true;
+      const lastRetryFailure: ProviderRetryFailure = {
+        attemptSeq: identity.attemptSeq.toString(), failedAt,
+        elapsedMs: Math.max(0, failedAt - attemptStartedAt),
+        phase: receivedProviderOutput || nativeReplayUnsafe ? 'after_output' : 'before_output',
+        error: providerFailureFact(error)
+      };
+      if (nativeReplayUnsafe) {
         // Retrying would re-send the frozen input after tools were admitted or items committed:
         // the model would re-issue executed calls under new identities. Keep the request open and
         // unfailed; the caller closes its settled results into Context and rebases the Turn.
-        await this.recordNativeRebaseFailure(modelRequestId, identity, error,
+        await this.recordNativeRebaseFailure(modelRequestId, identity, error, lastRetryFailure,
           retryPolicy?.retryDelayMs ?? 0, requirePriorNativeFailures(priorNativeFailures), retryPolicy?.maxRetries ?? 0,
           retryPolicy?.enabled === true && retryPolicy.forceAllErrors === true);
         throw new NativeChainReplayUnsafeError(error);
@@ -1860,7 +1873,8 @@ export class ModelProviderControlPlane {
         error.retryOptions.retryAfterMs ?? 0,
         error,
         maxRetries,
-        retryPolicy?.enabled === true && retryPolicy.forceAllErrors === true
+        retryPolicy?.enabled === true && retryPolicy.forceAllErrors === true,
+        lastRetryFailure
       );
       if (retryAttempt === null) {
         return this.finishResolvedDispatch(modelRequestId, identity, options, lastObservedStreamSeq);
@@ -2511,7 +2525,8 @@ export class ModelProviderControlPlane {
     providerDelayMs: number,
     failure: ProviderTransientError,
     effectiveMaxRetries: number,
-    forceLocalDelay: boolean
+    forceLocalDelay: boolean,
+    lastRetryFailure: ProviderRetryFailure
   ): Promise<{ attemptSeq: bigint; delayMs: number; retryNotBeforeAt: number } | null> {
     if (!Number.isSafeInteger(maxRetries) || maxRetries <= 0 || maxRetries > 10) {
       throw new Error('Provider retry policy must allow between 1 and 10 retries.');
@@ -2546,6 +2561,7 @@ export class ModelProviderControlPlane {
         retryProviderDelayMs: forceLocalDelay ? 0 : providerDelayMs,
         retryForced: forceLocalDelay,
         retryNotBeforeAt,
+        lastRetryFailure,
         ...(currentStats.failure?.code === 'PROVIDER_MODEL_OUTPUT_INVALID'
           ? { failure: currentStats.failure }
           : (failure as Error & { code?: string }).code === 'PROVIDER_MODEL_OUTPUT_INVALID'
@@ -2766,7 +2782,7 @@ export class ModelProviderControlPlane {
 
   /** The rebase closes tools locally; this fact lets the Turn keep a budget across new requests/Hosts. */
   private async recordNativeRebaseFailure(
-    modelRequestId: string, identity: StreamIdentity, error: ProviderTransientError,
+    modelRequestId: string, identity: StreamIdentity, error: ProviderTransientError, lastRetryFailure: ProviderRetryFailure,
     configuredDelayMs: number, priorFailures: number, configuredMaxRetries: number, forceLocalDelay: boolean
   ): Promise<void> {
     const ordinal = Number(identity.attemptSeq) + priorFailures;
@@ -2786,7 +2802,7 @@ export class ModelProviderControlPlane {
           }),
           DOMAIN_REPOSITORIES.domain('ModelStreamFence').assertNone({ model_request_id: modelRequestId }),
           DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
-            stream_stats_json: { ...stats, failure: {
+            stream_stats_json: { ...stats, lastRetryFailure, failure: {
               ...providerFailureFact(error),
               ...(stats.failure?.code === 'PROVIDER_MODEL_OUTPUT_INVALID'
                 || (error as Error & { code?: string }).code === 'PROVIDER_MODEL_OUTPUT_INVALID'
@@ -4083,6 +4099,7 @@ function parseStreamStats(value: unknown): StreamStats {
     retryReason: value.retryReason as ProviderTransientReason | null,
     ...compressionExecutionMetadata(value),
     ...(value.failure === undefined ? {} : { failure: readProviderRequestFailure(value.failure) }),
+    ...(value.lastRetryFailure === undefined ? {} : { lastRetryFailure: readProviderRetryFailure(value.lastRetryFailure) }),
     ...(optionalBoundedInteger(value.retryMaxAttempts, 'retryMaxAttempts', 1, 10) !== undefined
       ? { retryMaxAttempts: optionalBoundedInteger(value.retryMaxAttempts, 'retryMaxAttempts', 1, 10) }
       : {}),

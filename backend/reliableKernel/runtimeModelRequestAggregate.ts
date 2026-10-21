@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import { compressionExecutionMetadata, readProviderRequestFailure } from '../../shared/compressionExecution';
+import { compressionExecutionMetadata, readProviderRequestFailure, readProviderRetryFailure } from '../../shared/compressionExecution';
 import { parseNativeResponseMetrics } from './nativeResponseMetrics';
 import { DOMAIN_REPOSITORIES } from './repositories';
 import { requireRuntimeId } from './runtimeSqlRows';
@@ -78,6 +78,7 @@ export function decodeModelStreamIdentity(value: unknown): {
     'compressionPurpose',
     'compressionDecision',
     'failure',
+    'lastRetryFailure',
     'claudeThinkingBinding'
   ]);
   if (
@@ -97,6 +98,7 @@ export function decodeModelStreamIdentity(value: unknown): {
   ) throw new TypeError('ModelRequest.stream_stats_json has an invalid shape.');
   compressionExecutionMetadata(record);
   if (record.failure !== undefined) readProviderRequestFailure(record.failure);
+  if (record.lastRetryFailure !== undefined) readProviderRetryFailure(record.lastRetryFailure);
   assertOptionalBoundedInteger(record.retryMaxAttempts, 'retryMaxAttempts', 1, 10);
   assertOptionalBoundedInteger(record.retryDelayMs, 'retryDelayMs', 0, Number.MAX_SAFE_INTEGER);
   assertOptionalBoundedInteger(record.retryConfiguredDelayMs, 'retryConfiguredDelayMs', 0, Number.MAX_SAFE_INTEGER);

@@ -15,6 +15,14 @@ export interface ProviderRequestFailureFact {
   /** Effective remaining request retry limit; the ModelRequest's overall Attempt allowance stays frozen. */
   retryMaxAttempts?: number;
 }
+/** Latest failed attempt only; diagnostic metadata never participates in retry policy. */
+export interface ProviderRetryFailure {
+  attemptSeq: string;
+  failedAt: number;
+  elapsedMs: number;
+  phase: 'before_output' | 'after_output';
+  error: ProviderRequestFailureFact;
+}
 export interface CompressionAttemptFailure {
   methodKind: ExecutedCompressionMethod;
   message: string;
@@ -44,7 +52,7 @@ export function safeProviderFailureMessage(value: unknown): string {
     .replace(/https?:\/\/[^\s<>"']+/gi, '[endpoint]')
     .replace(/\bBearer\s+[^\s,"';]+/gi, 'Bearer [redacted]')
     .replace(/\bsk-[A-Za-z0-9_-]+/g, '[redacted]')
-    .replace(/((?:api[_-]?key|access[_-]?token|authorization|password|secret)\s*[=:]\s*["']?)[^\s,"';}]+/gi, '$1[redacted]')
+    .replace(/((?:api[_-]?key|access[_-]?token|authorization|password|secret)["']?\s*[=:]\s*["']?)[^\s,"';}]+/gi, '$1[redacted]')
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ' ')
     .slice(0, 768) || 'Provider request failed';
 }
@@ -63,6 +71,19 @@ export function readProviderRequestFailure(value: unknown): ProviderRequestFailu
     ...optionalStatus(raw.status),
     ...(raw.retryMaxAttempts === undefined ? {} : { retryMaxAttempts: Number(raw.retryMaxAttempts) })
   };
+}
+
+export function readProviderRetryFailure(value: unknown): ProviderRetryFailure {
+  const raw = object(value, 'retry failure');
+  exactKeys(raw, ['attemptSeq', 'failedAt', 'elapsedMs', 'phase', 'error']);
+  if (typeof raw.attemptSeq !== 'string' || !/^[1-9]\d{0,15}$/.test(raw.attemptSeq)
+    || !Number.isSafeInteger(raw.failedAt) || Number(raw.failedAt) <= 0
+    || !Number.isSafeInteger(raw.elapsedMs) || Number(raw.elapsedMs) < 0
+    || (raw.phase !== 'before_output' && raw.phase !== 'after_output')) {
+    throw new TypeError('Invalid retry failure metadata.');
+  }
+  return { attemptSeq: raw.attemptSeq, failedAt: Number(raw.failedAt), elapsedMs: Number(raw.elapsedMs),
+    phase: raw.phase, error: readProviderRequestFailure(raw.error) };
 }
 
 export function readCompressionFailures(value: unknown): CompressionAttemptFailure[] {

@@ -23,7 +23,8 @@ import {
   hasVisibleStreamingTransientForTurn,
   createReliableRetryClock,
   reliableRetryStreamingActivityLabel,
-  reliableRetryDelaySourceLabel
+  reliableRetryDelaySourceLabel,
+  reliableRetryFailureLabel
 } from '@webview/domain/reliableTransientActivity';
 import { createReliableModelRequestRetryIndex, createTurnProjectionIndex, modelRequestRetryForTurn, projectReliableTurnTermination } from '@webview/domain/reliableConversationProjection';
 import { modelRequestStreamStats } from '@webview/reliability/modelRequestStreamStats';
@@ -522,16 +523,19 @@ const activityLabel = computed(() => {
   // Keep the durable retry identity while the exact Attempt is waiting for output. Once its
   // transient renders model-owned content, the content itself replaces this activity row.
   if (latest.status === 'retrying') {
+    const reasonLabel = [retry.reasonLabel, reliableRetryFailureLabel(modelRequestStreamStats(latest))]
+      .filter(Boolean).join('；');
     const delaySeconds = Math.max(0, Math.ceil(retry.remainingDelayMs / 1_000));
     return delaySeconds > 0
-      ? `${retry.reasonLabel}，${delaySeconds} 秒后自动恢复（第 ${retry.retryAttempt}/${retry.retryMaxAttempts} 次）`
-      : `${retry.reasonLabel}，正在启动第 ${retry.retryAttempt}/${retry.retryMaxAttempts} 次自动恢复`;
+      ? `${reasonLabel}，${delaySeconds} 秒后自动恢复（第 ${retry.retryAttempt}/${retry.retryMaxAttempts} 次）`
+      : `${reasonLabel}，正在启动第 ${retry.retryAttempt}/${retry.retryMaxAttempts} 次自动恢复`;
   }
   if (latest.status === 'streaming' && retry.retryAttempt > 0) {
     const modelRequestId = reliableText(latest.id);
     return reliableRetryStreamingActivityLabel({
       retryAttempt: retry.retryAttempt,
       retryMaxAttempts: retry.retryMaxAttempts,
+      lastFailureLabel: reliableRetryFailureLabel(modelRequestStreamStats(latest)),
       hasVisibleOutput: Boolean(modelRequestId) && hasVisibleStreamingTransientForRequestAttempt(
         feed.transientModelRequests,
         modelRequestId,

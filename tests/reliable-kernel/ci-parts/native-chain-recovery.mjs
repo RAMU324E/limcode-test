@@ -352,6 +352,9 @@ test('a settled native effect survives rebase and a later running effect parks r
     assert.equal(initialRequests[0].terminal_state, 'native_chain_rebased');
     assert.equal(initialRequests[0].stream_stats_json.retryDelayMs, 1, 'native recovery also ignores the server wait when forced');
     assert.equal(initialRequests[0].stream_stats_json.retryForced, true);
+    assert.equal(initialRequests[0].stream_stats_json.lastRetryFailure.error.reason, 'connection_interrupted');
+    assert.equal(initialRequests[0].stream_stats_json.lastRetryFailure.phase, 'after_output');
+    assert.equal(initialRequests[0].stream_stats_json.lastRetryFailure.attemptSeq, '1');
     assert.notEqual(requests[1].modelRequestId, requests[0].modelRequestId);
     const second = await drive(turn);
     assert.equal(second.terminalStatus, 'waiting');

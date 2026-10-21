@@ -57,10 +57,11 @@ export function reliableRetryStreamingActivityLabel(input: {
   retryAttempt: number;
   retryMaxAttempts: number;
   hasVisibleOutput: boolean;
+  lastFailureLabel?: string;
 }): string | undefined {
   const identity = `第 ${input.retryAttempt}/${input.retryMaxAttempts} 次自动恢复`;
   if (input.hasVisibleOutput) return undefined;
-  return `${identity}已启动，正在连接并等待 LLM 输出`;
+  return `${identity}已启动，正在等待 LLM 输出${input.lastFailureLabel ? `；${input.lastFailureLabel}` : ''}`;
 }
 
 
@@ -76,6 +77,16 @@ export function reliableRetryDelaySourceLabel(stats: Record<string, unknown> | u
   return `按本地设置（${local}）`;
 }
 
+
+/** Display the last failed attempt without presenting it as the current attempt's error. */
+export function reliableRetryFailureLabel(stats: Record<string, unknown> | undefined): string {
+  const last = stats?.lastRetryFailure as { error?: { status?: number; code?: string; message?: string } } | undefined;
+  const error = last?.error;
+  if (!error) return '';
+  const detail = [error.status ? `HTTP ${error.status}` : '', error.code, error.message?.slice(0, 240)]
+    .filter(Boolean).join(' · ');
+  return detail ? `上次失败：${detail}` : '';
+}
 
 export interface ReliableRetryClockScheduler {
   now(): number;

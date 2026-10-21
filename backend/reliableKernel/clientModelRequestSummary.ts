@@ -23,7 +23,7 @@ const STREAM_FIELDS = [
   'attemptSeq', 'socketGeneration', 'retryReason', 'retryMaxAttempts', 'retryDelayMs', 'retryNotBeforeAt',
   'retryConfiguredDelayMs', 'retryProviderDelayMs', 'retryForced',
   'providerStartedAt', 'firstOutputAt', 'completedAt', 'streamOutputDurationMs',
-  'lastStreamSeq', 'lastStreamEventAt', 'thinkingSelection', 'claudeThinkingBinding',
+  'lastStreamSeq', 'lastStreamEventAt', 'thinkingSelection', 'claudeThinkingBinding', 'lastRetryFailure',
   'nativeCapabilities', 'nativeInitialPromptTokenCount', 'nativeLatestResponseUsage'
 ];
 
