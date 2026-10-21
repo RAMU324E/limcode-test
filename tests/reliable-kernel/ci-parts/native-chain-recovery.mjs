@@ -319,7 +319,7 @@ function registerCases(test) {
 const restart=true,attachment=true;
 test('a settled native effect survives rebase and a later running effect parks re-drives without duplicate dispatch', { timeout: 30000 }, async () => {
   await withNativeKernel({
-    retryPolicy,
+    retryPolicy: { ...retryPolicy, forceAllErrors: true },
     async script({ round, request, emit, responseId, app }) {
       assert.equal(request.attemptSeq, '1', 'native recovery never re-sends the frozen input as a second Attempt');
       if (round === 0) {
@@ -327,7 +327,7 @@ test('a settled native effect survives rebase and a later running effect parks r
         await emitCall(emit, responseId, 'call-A', 0, { async: true });
         await waitFor(async () => (await rows(app, 'ToolModelResult')).length === 1, 'call-A settled');
         await delay(30);
-        throw new kernel.ProviderTransientError('connection_interrupted', 'fixture reset after the first tool settled', true);
+        throw new kernel.ProviderTransientError('connection_interrupted', 'fixture reset after the first tool settled', true, { retryAfterMs: 300_000 });
       }
       assert.deepEqual(nativeToolPairs(request).get('call-A'), { calls: 1, results: 1 },
         'every carrier keeps the already executed result once');
@@ -350,6 +350,8 @@ test('a settled native effect survives rebase and a later running effect parks r
     const initialRequests = (await rows(app, 'ModelRequest', { turn_id: turn.turnId }))
       .sort((left, right) => Number(left.request_seq) - Number(right.request_seq));
     assert.equal(initialRequests[0].terminal_state, 'native_chain_rebased');
+    assert.equal(initialRequests[0].stream_stats_json.retryDelayMs, 1, 'native recovery also ignores the server wait when forced');
+    assert.equal(initialRequests[0].stream_stats_json.retryForced, true);
     assert.notEqual(requests[1].modelRequestId, requests[0].modelRequestId);
     const second = await drive(turn);
     assert.equal(second.terminalStatus, 'waiting');

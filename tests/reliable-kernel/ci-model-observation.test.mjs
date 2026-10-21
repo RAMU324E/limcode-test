@@ -320,6 +320,52 @@ test('真实 Gemini SDK 断流替换 durable Attempt，不执行失败流里的�
   assert.equal((await fixture.rows('ToolCall', { turn_id: turnId })).length, 0);
 });
 
+test('重试等待来源按冻结策略持久化，强制重试只采用本地间隔或自动退避', async () => {
+  for (const [label, forceAllErrors, configuredDelay, expectedDelay] of [
+    ['normal', false, 3000, 300_000], ['forced', true, 3000, 3000], ['automatic', true, 0, 0]
+  ]) {
+    const cid = `retry-source-${label}`;
+    await fixture.createConversation(cid);
+    const input = await fixture.input(cid, 'input', {
+      retryPolicy: { enabled: true, maxRetries: 1, retryDelayMs: configuredDelay, forceAllErrors }
+    });
+    const created = await fixture.request(cid, input.turnId, label);
+    let epoch = Date.now();
+    const control = new kernel.ModelProviderControlPlane(fixture.app.database, fixture.app.contentStore,
+      { epochNow: () => epoch, retryDelaysMs: [0] });
+    let scheduled, committedStats;
+    const unsubscribe = fixture.app.database.onCommit(commit => {
+      const change = commit.changes.find(change => change.domain === 'ModelRequest'
+        && change.id === created.modelRequestId && change.record?.status === 'retrying');
+      if (change) committedStats = change.record.stream_stats_json;
+    });
+    let calls = 0;
+    const adapter = { providerId: 'compatible', async sendFullRequest(_request, controls) {
+      if (++calls === 1) throw new kernel.ProviderTransientError('temporary_service_error', 'try later', true,
+        { retryAfterMs: 300_000 });
+      await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [{ text: 'ok' }] } });
+    } };
+    try { await control.dispatch(created.modelRequestId, adapter, { onTransientTerminal(observation) {
+      if (!observation.event.content.retrying) return;
+      scheduled = observation.event.content;
+      epoch = scheduled.retryNotBeforeAt; // Advance the test clock; never sleep for the configured wait.
+    } }); } finally { unsubscribe(); }
+    assert.equal(scheduled.retryDelayMs, expectedDelay);
+    assert.equal(committedStats.retryConfiguredDelayMs, configuredDelay);
+    assert.equal(committedStats.retryProviderDelayMs, forceAllErrors ? 0 : 300_000);
+    assert.equal(committedStats.retryForced, forceAllErrors);
+    const { projectModelRequestSummary } = load('backend/reliableKernel/clientModelRequestSummary.js');
+    const projected = projectModelRequestSummary({ id: created.modelRequestId, stream_stats_json: JSON.stringify(committedStats) });
+    assert.equal(projected.stream_stats_json.retryConfiguredDelayMs, configuredDelay);
+    assert.equal(projected.stream_stats_json.retryProviderDelayMs, forceAllErrors ? 0 : 300_000);
+    assert.equal(projected.stream_stats_json.retryForced, forceAllErrors);
+    assert.equal(calls, 2);
+    const row = (await fixture.rows('ModelRequest', { id: created.modelRequestId }))[0];
+    assert.equal(row.terminal_state, 'completed');
+    assert.equal(row.stream_stats_json.retryConfiguredDelayMs, undefined, 'wait labels retire when the next attempt starts');
+  }
+});
+
 test('伪思考进度不续命，持久重试等待经接手仍保持并可取消', async context => {
   await fixture.createConversation('watchdog-handoff');
   const input = await fixture.input('watchdog-handoff', 'input', {
@@ -369,6 +415,9 @@ test('伪思考进度不续命，持久重试等待经接手仍保持并可取�
     assert.equal(retrying.status, 'retrying');
     assert.equal(retrying.stream_stats_json.attemptSeq, '2');
     assert.equal(retrying.stream_stats_json.retryDelayMs, 60_000);
+    assert.equal(retrying.stream_stats_json.retryConfiguredDelayMs, 60_000);
+    assert.equal(retrying.stream_stats_json.retryProviderDelayMs, 0);
+    assert.equal(retrying.stream_stats_json.retryForced, false);
     assert.equal(retrying.stream_stats_json.retryNotBeforeAt, epoch + 60_000);
     await first.quiesceAllActiveDispatches(new kernel.ExecutionHandoffError('fixture handoff'));
     await interrupted;

@@ -60,6 +60,9 @@ export function decodeModelStreamIdentity(value: unknown): {
     'retryReason',
     'retryMaxAttempts',
     'retryDelayMs',
+    'retryConfiguredDelayMs',
+    'retryProviderDelayMs',
+    'retryForced',
     'retryNotBeforeAt',
     'providerStartedAt',
     'firstOutputAt',
@@ -96,6 +99,11 @@ export function decodeModelStreamIdentity(value: unknown): {
   if (record.failure !== undefined) readProviderRequestFailure(record.failure);
   assertOptionalBoundedInteger(record.retryMaxAttempts, 'retryMaxAttempts', 1, 10);
   assertOptionalBoundedInteger(record.retryDelayMs, 'retryDelayMs', 0, Number.MAX_SAFE_INTEGER);
+  assertOptionalBoundedInteger(record.retryConfiguredDelayMs, 'retryConfiguredDelayMs', 0, Number.MAX_SAFE_INTEGER);
+  assertOptionalBoundedInteger(record.retryProviderDelayMs, 'retryProviderDelayMs', 0, Number.MAX_SAFE_INTEGER);
+  if (record.retryForced !== undefined && typeof record.retryForced !== 'boolean') {
+    throw new TypeError('ModelRequest.stream_stats_json.retryForced must be boolean.');
+  }
   assertOptionalBoundedInteger(record.retryNotBeforeAt, 'retryNotBeforeAt', 1, Number.MAX_SAFE_INTEGER);
   const attemptSeq = decimalRuntimeInteger(record.attemptSeq, 'stream_stats.attemptSeq');
   const retryMaxAttempts = typeof record.retryMaxAttempts === 'number'

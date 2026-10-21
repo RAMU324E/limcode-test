@@ -590,6 +590,9 @@ interface StreamStats {
   retryReason: ProviderTransientReason | null;
   retryMaxAttempts?: number;
   retryDelayMs?: number;
+  retryConfiguredDelayMs?: number;
+  retryProviderDelayMs?: number;
+  retryForced?: boolean;
   retryNotBeforeAt?: number;
   providerStartedAt?: number;
   firstOutputAt?: number;
@@ -1805,7 +1808,8 @@ export class ModelProviderControlPlane {
         // the model would re-issue executed calls under new identities. Keep the request open and
         // unfailed; the caller closes its settled results into Context and rebases the Turn.
         await this.recordNativeRebaseFailure(modelRequestId, identity, error,
-          retryPolicy?.retryDelayMs ?? 0, requirePriorNativeFailures(priorNativeFailures), retryPolicy?.maxRetries ?? 0);
+          retryPolicy?.retryDelayMs ?? 0, requirePriorNativeFailures(priorNativeFailures), retryPolicy?.maxRetries ?? 0,
+          retryPolicy?.enabled === true && retryPolicy.forceAllErrors === true);
         throw new NativeChainReplayUnsafeError(error);
       }
       if (sawReplayUnsafeProviderEvent && !error.retryAfterOutput) {
@@ -1855,7 +1859,8 @@ export class ModelProviderControlPlane {
         retryPolicy?.retryDelayMs ?? 0,
         error.retryOptions.retryAfterMs ?? 0,
         error,
-        maxRetries
+        maxRetries,
+        retryPolicy?.enabled === true && retryPolicy.forceAllErrors === true
       );
       if (retryAttempt === null) {
         return this.finishResolvedDispatch(modelRequestId, identity, options, lastObservedStreamSeq);
@@ -2453,6 +2458,9 @@ export class ModelProviderControlPlane {
       const nextStats: StreamStats = { ...currentStats, socketGeneration: socketGeneration.toString() };
       delete nextStats.retryNotBeforeAt;
       delete nextStats.retryDelayMs;
+      delete nextStats.retryConfiguredDelayMs;
+      delete nextStats.retryProviderDelayMs;
+      delete nextStats.retryForced;
       delete nextStats.lastStreamSeq;
       delete nextStats.lastStreamEventAt;
       const now = this.timestamp();
@@ -2502,7 +2510,8 @@ export class ModelProviderControlPlane {
     configuredDelayMs: number,
     providerDelayMs: number,
     failure: ProviderTransientError,
-    effectiveMaxRetries: number
+    effectiveMaxRetries: number,
+    forceLocalDelay: boolean
   ): Promise<{ attemptSeq: bigint; delayMs: number; retryNotBeforeAt: number } | null> {
     if (!Number.isSafeInteger(maxRetries) || maxRetries <= 0 || maxRetries > 10) {
       throw new Error('Provider retry policy must allow between 1 and 10 retries.');
@@ -2511,7 +2520,7 @@ export class ModelProviderControlPlane {
     if (retryOrdinal > maxRetries) throw new Error('Provider transient retry budget is exhausted.');
     const nextAttemptSeq = failed.attemptSeq + 1n;
     const attemptId = stableId('model_request_attempt', modelRequestId, nextAttemptSeq.toString());
-    const delayMs = Math.max(providerDelayMs, configuredDelayMs > 0
+    const delayMs = Math.max(forceLocalDelay ? 0 : providerDelayMs, configuredDelayMs > 0
       ? configuredDelayMs
       : retryDelayMs(retryOrdinal, this.retryDelaysMs, `${modelRequestId}:${retryOrdinal}`));
     const retryNotBeforeAt = this.epochNow() + delayMs;
@@ -2533,6 +2542,9 @@ export class ModelProviderControlPlane {
         retryReason: reason,
         retryMaxAttempts: maxRetries,
         retryDelayMs: delayMs,
+        retryConfiguredDelayMs: configuredDelayMs,
+        retryProviderDelayMs: forceLocalDelay ? 0 : providerDelayMs,
+        retryForced: forceLocalDelay,
         retryNotBeforeAt,
         ...(currentStats.failure?.code === 'PROVIDER_MODEL_OUTPUT_INVALID'
           ? { failure: currentStats.failure }
@@ -2755,10 +2767,11 @@ export class ModelProviderControlPlane {
   /** The rebase closes tools locally; this fact lets the Turn keep a budget across new requests/Hosts. */
   private async recordNativeRebaseFailure(
     modelRequestId: string, identity: StreamIdentity, error: ProviderTransientError,
-    configuredDelayMs: number, priorFailures: number, configuredMaxRetries: number
+    configuredDelayMs: number, priorFailures: number, configuredMaxRetries: number, forceLocalDelay: boolean
   ): Promise<void> {
     const ordinal = Number(identity.attemptSeq) + priorFailures;
-    const delayMs = Math.max(error.retryOptions.retryAfterMs ?? 0, configuredDelayMs > 0 ? configuredDelayMs
+    const providerDelayMs = forceLocalDelay ? 0 : error.retryOptions.retryAfterMs ?? 0;
+    const delayMs = Math.max(providerDelayMs, configuredDelayMs > 0 ? configuredDelayMs
       : retryDelayMs(ordinal, this.retryDelaysMs, `${modelRequestId}:${ordinal}`));
     const retryNotBeforeAt = this.epochNow() + delayMs;
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -2780,7 +2793,8 @@ export class ModelProviderControlPlane {
                 ? { code: 'PROVIDER_MODEL_OUTPUT_INVALID',
                     retryMaxAttempts: Math.min(configuredMaxRetries, Math.max(0, 2 - priorFailures)) } : {})
             }, retryDelayMs: delayMs,
-              retryNotBeforeAt }, updated_at: this.timestamp()
+              retryConfiguredDelayMs: configuredDelayMs, retryProviderDelayMs: providerDelayMs,
+              retryForced: forceLocalDelay, retryNotBeforeAt }, updated_at: this.timestamp()
           })
         ]);
         return;
@@ -4075,6 +4089,11 @@ function parseStreamStats(value: unknown): StreamStats {
     ...(optionalBoundedInteger(value.retryDelayMs, 'retryDelayMs', 0, Number.MAX_SAFE_INTEGER) !== undefined
       ? { retryDelayMs: optionalBoundedInteger(value.retryDelayMs, 'retryDelayMs', 0, Number.MAX_SAFE_INTEGER) }
       : {}),
+    ...(optionalBoundedInteger(value.retryConfiguredDelayMs, 'retryConfiguredDelayMs', 0, Number.MAX_SAFE_INTEGER) !== undefined
+      ? { retryConfiguredDelayMs: optionalBoundedInteger(value.retryConfiguredDelayMs, 'retryConfiguredDelayMs', 0, Number.MAX_SAFE_INTEGER) } : {}),
+    ...(optionalBoundedInteger(value.retryProviderDelayMs, 'retryProviderDelayMs', 0, Number.MAX_SAFE_INTEGER) !== undefined
+      ? { retryProviderDelayMs: optionalBoundedInteger(value.retryProviderDelayMs, 'retryProviderDelayMs', 0, Number.MAX_SAFE_INTEGER) } : {}),
+    ...(typeof value.retryForced === 'boolean' ? { retryForced: value.retryForced } : {}),
     ...(optionalBoundedInteger(value.retryNotBeforeAt, 'retryNotBeforeAt', 1, Number.MAX_SAFE_INTEGER) !== undefined
       ? { retryNotBeforeAt: optionalBoundedInteger(value.retryNotBeforeAt, 'retryNotBeforeAt', 1, Number.MAX_SAFE_INTEGER) }
       : {}),
@@ -4184,7 +4203,10 @@ function sameStats(left: StreamStats, right: StreamStats): boolean {
     && left.retryReason === right.retryReason
     && left.retryMaxAttempts === right.retryMaxAttempts
     && left.retryDelayMs === right.retryDelayMs
-    && left.retryNotBeforeAt === right.retryNotBeforeAt;
+    && left.retryNotBeforeAt === right.retryNotBeforeAt
+    && left.retryConfiguredDelayMs === right.retryConfiguredDelayMs
+    && left.retryProviderDelayMs === right.retryProviderDelayMs
+    && left.retryForced === right.retryForced;
 }
 
 function parsePlainJson(bytes: Buffer, label: string): PlainJsonValue {

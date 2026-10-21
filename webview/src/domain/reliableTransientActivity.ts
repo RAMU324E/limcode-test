@@ -64,6 +64,19 @@ export function reliableRetryStreamingActivityLabel(input: {
 }
 
 
+/** Explain the persisted retry decision; editable channel settings may have changed since dispatch. */
+export function reliableRetryDelaySourceLabel(stats: Record<string, unknown> | undefined): string {
+  if (!stats || typeof stats.retryConfiguredDelayMs !== 'number') return '';
+  const local = stats.retryConfiguredDelayMs > 0 ? `${stats.retryConfiguredDelayMs / 1_000} 秒` : '自动退避';
+  if (stats.retryForced === true) return `强制重试，按本地设置（${local}），忽略服务端等待`;
+  const provider = typeof stats.retryProviderDelayMs === 'number' ? stats.retryProviderDelayMs : 0;
+  if (provider > 0 && provider === stats.retryDelayMs && provider > stats.retryConfiguredDelayMs) {
+    return `服务端要求至少等待 ${provider / 1_000} 秒（本地设置：${local}）`;
+  }
+  return `按本地设置（${local}）`;
+}
+
+
 export interface ReliableRetryClockScheduler {
   now(): number;
   schedule(callback: () => void, delayMs: number): unknown;

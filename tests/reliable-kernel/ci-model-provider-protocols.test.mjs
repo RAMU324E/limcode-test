@@ -299,17 +299,36 @@ test('真正 429 限流保留 Retry-After 的最早时间和替换部分输出�
   assert.equal(error.retryAfterOutput, true);
 });
 
-test('额度错误默认永久，显式强制重试沿用原错和等待且总开关有效', async () => {
+test('额度错误默认永久，显式强制重试保留原错并忽略服务端等待且总开关有效', async () => {
   const raw = { status: 429, code: 'insufficient_quota', headers: { 'retry-after': '2' } };
   const normal = await providerFailure('quota exhausted', raw);
   assert.equal(normal instanceof kernel.ProviderTransientError, false);
   const policy = { enabled: true, maxRetries: 2, forceAllErrors: true };
   const forced = await providerFailure('quota exhausted', raw, policy);
   assert.ok(forced instanceof kernel.ProviderTransientError);
-  assert.equal(forced.retryOptions.retryAfterMs, 2000);
+  assert.equal(forced.retryOptions.retryAfterMs, undefined);
   assert.equal(forced.message, 'quota exhausted');
   assert.equal((await providerFailure('quota exhausted', raw, { ...policy, enabled: false })).constructor,
     normal.constructor);
+});
+
+test('强制重试忽略秒、毫秒和 Gemini 等待提示，包括超过普通自动等待上限的提示', async () => {
+  const policy = { enabled: true, maxRetries: 2, forceAllErrors: true };
+  for (const raw of [
+    { status: 503, headers: { 'Retry-After': '300' } },
+    { status: 503, headers: { 'retry-after-ms': '300000' } },
+    { status: 429, details: [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '300s' }] },
+    { status: 503, headers: { 'Retry-After': '601' } }
+  ]) {
+    const forced = await providerFailure('service unavailable', raw, policy);
+    assert.ok(forced instanceof kernel.ProviderTransientError);
+    assert.equal(forced.retryOptions.retryAfterMs, undefined);
+  }
+  const normal = await providerFailure('service unavailable', { status: 503, headers: { 'Retry-After': '300' } });
+  assert.equal(normal.retryOptions.retryAfterMs, 300_000);
+  const tooLong = await providerFailure('service unavailable', { status: 503, headers: { 'Retry-After': '601' } });
+  assert.equal(tooLong instanceof kernel.ProviderTransientError, false);
+  assert.match(tooLong.message, /超过自动等待上限/);
 });
 
 const SKILL = load('backend/world/modules/skill/skillLookup.js').renderLoadedSkill({

@@ -30,7 +30,7 @@ export interface FrozenTurnAuthority {
 }
 
 export interface FrozenProviderRetryPolicy {
-  /** Explicit opt-in; absent means ordinary error classification. */
+  /** Explicit opt-in: retry provider errors with local timing, ignoring server delay hints. */
   forceAllErrors?: boolean;
   enabled: boolean;
   /** Number of retries after the original Provider attempt. */

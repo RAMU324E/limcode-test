@@ -3104,7 +3104,7 @@ function classifyProviderFailure(
     });
   };
   const transient = (reason: ConstructorParameters<typeof ProviderTransientError>[0], maxRetries?: number): Error => {
-    const retryAfterMs = providerRetryAfterMs(raw);
+    const retryAfterMs = forceAllErrors ? undefined : providerRetryAfterMs(raw);
     if (retryAfterMs !== undefined && retryAfterMs > MAX_PROVIDER_RETRY_AFTER_MS) {
       return permanent(`${message}（服务要求至少等待 ${Math.ceil(retryAfterMs / 1_000)} 秒，超过自动等待上限；请在服务限流解除后继续。）`, false);
     }
