@@ -16,6 +16,24 @@ const BINDING_ERROR = { status: 400, rawBody: { error: { message:
   + 'Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to "drop_block".' } } };
 afterEach(() => adaptation.resetProviderRequestAdaptations());
 
+test('获取模型列表时各渠道均使用已配置的代理', async t => {
+  const requests = [];
+  t.mock.method(globalThis, 'fetch', async () => assert.fail('模型列表请求绕过了已配置的代理'));
+  t.mock.method(load('backend/capabilities/proxyFetch.js'), 'createProxyFetch', proxy => {
+    assert.equal(proxy, 'http://proxy.invalid:7890');
+    return async url => {
+      requests.push(String(url));
+      return Response.json({ data: [{ id: 'proxy-model' }], has_more: false,
+        models: [{ name: 'models/proxy-model', displayName: 'Proxy model', supportedGenerationMethods: ['generateContent'] }] });
+    };
+  });
+  for (const provider of ['openai-compatible', 'openai-responses', 'gemini', 'claude']) {
+    const models = await llm.listLlmProviderModels(settings(provider), { proxy: async () => 'http://proxy.invalid:7890' });
+    assert.ok(models.some(model => model.id === 'proxy-model'), provider);
+  }
+  assert.equal(requests.length, 4);
+});
+
 test('Claude 保留自身思考签名、剔除外来思考，改写工具 id 后结果仍配对', () => {
   const contents = [user('read'), model([
     { text: 'own', thought: true, thoughtSignature: 'claude:own-signature' },

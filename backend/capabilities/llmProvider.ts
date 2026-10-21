@@ -1965,14 +1965,16 @@ export async function listLlmProviderModels(config: LlmProviderConfigRecord, opt
 
   const unified = await importUnifiedLlmProvider();
   const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
+  const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
+  const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
   if (settings.provider === 'claude') {
-    const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
-    return discoverAnthropicModels(settings, proxy ? createProxyFetch(proxy) : fetch, headers);
+    return discoverAnthropicModels(settings, proxyFetch ?? fetch, headers);
   }
   const result = await unified.listAvailableModels({
     provider: settings.provider,
     apiKey: settings.apiKey,
     baseUrl: settings.baseUrl,
+    ...(proxyFetch ? { fetch: proxyFetch } : {}),
     ...(headers ? { headers } : {}),
     outputFormat: 'unified'
   });

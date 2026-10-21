@@ -39,10 +39,11 @@ environments.workEnvironmentEnabledForConversation = () => true;
 feed.projections = { activeConversationWindow: { conversationId: 'self' } };
 feed.sessionId = 'feed'; feed.synchronizeCollaborationHistoryScope('self', true);
 feed.collaborationHistoryNextBeforeCursor = { kind: 'message' };
+feed.collaborationHistoryHasMoreBefore = true;
 feed.collaborationHistoryLoadedPages = 1;
 const posted = [];
 window.fixture = { client, settings, feed, mode, posted, hold: false, pages: 0, errors: false,
-  resetHistory() { feed.synchronizeCollaborationHistoryScope('self', true); feed.collaborationHistoryNextBeforeCursor = { kind: 'message' }; feed.collaborationHistoryLoadedPages = 1; this.pages = 0; },
+  resetHistory() { feed.synchronizeCollaborationHistoryScope('self', true); feed.collaborationHistoryNextBeforeCursor = { kind: 'message' }; feed.collaborationHistoryHasMoreBefore = true; feed.collaborationHistoryLoadedPages = 1; this.pages = 0; },
   messagePage(records, sequence, scannedRows = 4096) {
     const rows = records.CollaborationMessage ?? [];
     const newest = rows.reduce((value, row) => !value || BigInt(row.message_seq) > BigInt(value.message_seq) ? row : value, null);
@@ -99,8 +100,8 @@ async function pageFor(t, width = 360) {
   t.after(async () => { await page.close(); assert.deepEqual(errors, []); });
   await page.addInitScript(() => { window.acquireVsCodeApi = () => ({ getState() {}, setState() {},
     postMessage(message) { window.fixture?.handle(structuredClone(message)); } }); });
-  await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/composer-fixture`, { waitUntil: 'networkidle' });
-  await page.waitForFunction(() => !!window.fixture || !!window.fixtureError);
+  await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/composer-fixture`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForFunction(() => !!window.fixture || !!window.fixtureError, null, { timeout: 30000 });
   assert.equal(await page.evaluate(() => window.fixtureError), undefined);
   return page;
 }
