@@ -145,6 +145,88 @@ test('Claude 网关拒绝 clear_at 后只给原目标记住尾巴模式', () => 
   assert.deepEqual(tail, [user('q'), model([{ text: 'a' }]), user('current')]);
 });
 
+for (const stream of [true, false]) {
+  test(`Gemini ${stream ? '流式' : '非流式'}斜杠模型保留路径分隔符并编码段内字符`, async () => {
+    const config = settings('gemini', { stream, model: 'vendor/gemini model' });
+    await withFetch((entry, init) => {
+      assert.equal(init.method, 'POST');
+      assert.equal(entry.url, `https://provider.invalid/v1beta/models/vendor/gemini%20model:${stream
+        ? 'streamGenerateContent?alt=sse' : 'generateContent'}`);
+      const chunk = geminiChunk([{ text: 'hello' }], 'STOP');
+      return stream ? sse([chunk]) : Response.json(chunk);
+    }, async calls => {
+      const events = await send(config);
+      assert.equal(calls.length, 1);
+      assert.equal(events.some(event => event.type === 'llm:error'), false);
+      assert.ok(events.some(event => event.type === 'llm:done'));
+      assert.equal(config.model, 'vendor/gemini model');
+    });
+  });
+
+  for (const modelId of ['gemini-model', 'vendor/gemini-model']) {
+    test(`Gemini HTTP 405 提示基于实际状态与${stream ? '流式' : '非流式'}动作（${modelId}）`, async () => {
+      const config = settings('gemini', { stream, model: modelId });
+      const body = { detail: 'Method Not Allowed' };
+      await withFetch(() => Response.json(body, { status: 405, headers: { Allow: 'GET' } }), async calls => {
+        const events = await send(config);
+        assert.equal(calls.length, 1); // 不自动改协议、编码或端点重发。
+        const failure = events.find(event => event.type === 'llm:error').payload;
+        assert.match(failure.message, /Method Not Allowed/);
+        assert.match(failure.message, /Gemini HTTP 405/);
+        assert.ok(failure.message.includes(`POST models/<model>:${stream ? 'streamGenerateContent' : 'generateContent'}`));
+        assert.match(failure.message, /Base URL.*API 版本前缀.*POST 路由/);
+        assert.match(failure.message, /仅凭 405 不能确定具体原因/);
+        assert.equal(failure.message.includes('模型 ID 含有 /'), modelId.includes('/'));
+        assert.equal(failure.rawError.status, 405);
+        assert.deepEqual(failure.rawError.rawBody, body);
+        assert.equal(JSON.stringify(failure.rawError).includes('Gemini HTTP 405'), false);
+        assert.equal(JSON.stringify(failure).includes('offline-placeholder'), false);
+        const normal = await providerFailure(failure.message, failure.rawError);
+        assert.equal(normal.status, 405);
+        assert.equal(normal instanceof kernel.ProviderTransientError, false);
+        const forced = await providerFailure(failure.message, failure.rawError,
+          { enabled: true, maxRetries: 2, forceAllErrors: true });
+        assert.equal(forced.status, 405);
+        assert.ok(forced instanceof kernel.ProviderTransientError);
+        assert.equal(forced.reason, 'temporary_service_error');
+      });
+    });
+  }
+}
+
+test('可靠 adapter 的不同会话请求共用 Gemini 405 诊断且不改变失败分类', async () => {
+  const config = settings('gemini', { model: 'vendor/gemini-model' });
+  const capability = llm.createLlmProviderCapability({ settings: async () => config });
+  try {
+    await withFetch(() => Response.json({ detail: 'Method Not Allowed' }, { status: 405 }), async calls => {
+      for (const conversationId of ['main-conversation', 'child-conversation']) {
+        const request = { ...fullRequest(config), conversationId, modelRequestId: `request-${conversationId}` };
+        await assert.rejects(
+          new kernel.LlmCapabilityFullRequestAdapter(config.id, capability).sendFullRequest(request, accepted),
+          error => {
+            assert.equal(error.status, 405);
+            assert.equal(error instanceof kernel.ProviderTransientError, false);
+            assert.match(error.message, /Method Not Allowed\nGemini HTTP 405/);
+            assert.match(error.message, /完整模型路径/);
+            return true;
+          }
+        );
+      }
+      assert.equal(calls.length, 2);
+    });
+  } finally { capability.dispose(); }
+});
+
+for (const [provider, status] of [['gemini', 404], ['gemini', 500], ['openai-compatible', 405]]) {
+  test(`${provider} HTTP ${status} 不追加 Gemini 405 诊断`, async () => {
+    await withFetch(() => Response.json({ detail: 'Method Not Allowed' }, { status }), async calls => {
+      const events = await send(settings(provider, { model: 'vendor/gemini-model' }));
+      assert.equal(calls.length, 1);
+      assert.equal(events.find(event => event.type === 'llm:error').payload.message.includes('Gemini HTTP 405'), false);
+    });
+  });
+}
+
 test('Gemini 文本签名保留原 part，空尾签名不变成思考', async () => {
   const config = settings('gemini');
   const reply = await withFetch(() => sse([
