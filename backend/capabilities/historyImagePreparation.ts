@@ -3,12 +3,14 @@ import { isInlineDataPart, type ContentPart, type InlineDataPart } from '../../s
 
 // Immutable attachment IDs already identify the source. Cache only derived model inputs, never rewrite attachments.
 const resizedImages = new Map<string, InlineDataPart>();
+const preparingImages = new Map<string, Promise<ContentPart>>();
 const CACHE_BYTES = 64 * 1024 * 1024;
 let cachedBytes = 0;
 
 export interface HistoryImagePreparation {
   settings: HistoryImageSettings;
   currentAttachmentIds: ReadonlySet<string>;
+  currentImages: WeakSet<InlineDataPart>;
   bytes: number;
 }
 
@@ -16,7 +18,8 @@ export function createHistoryImagePreparation(
   settings?: HistoryImageSettings,
   currentAttachmentIds: readonly string[] = []
 ): HistoryImagePreparation {
-  return { settings: normalizeHistoryImageSettings(settings), currentAttachmentIds: new Set(currentAttachmentIds), bytes: 0 };
+  return { settings: normalizeHistoryImageSettings(settings), currentAttachmentIds: new Set(currentAttachmentIds),
+    currentImages: new WeakSet(), bytes: 0 };
 }
 
 export async function prepareHistoryImage(
@@ -25,27 +28,37 @@ export async function prepareHistoryImage(
   preparation: HistoryImagePreparation
 ): Promise<ContentPart> {
   if (!source.inlineData.mimeType.startsWith('image/')) return resolve();
-  const { maxDimension, maxMB } = preparation.settings;
+  const { resizeEnabled, limitEnabled, maxDimension, maxMB } = preparation.settings;
   const id = source.inlineData.attachmentId;
-  const resize = maxDimension > 0 && !(id && preparation.currentAttachmentIds.has(id));
+  const current = !!id && preparation.currentAttachmentIds.has(id);
+  const resize = resizeEnabled && maxDimension > 0 && !current;
   const key = resize && id ? `${id}:${maxDimension}` : undefined;
   let result: ContentPart | undefined = key ? resizedImages.get(key) : undefined;
   if (!result) {
-    result = await resolve();
-    if (resize && isInlineDataPart(result) && result.inlineData.data
-      && ['image/png', 'image/jpeg', 'image/webp'].includes(result.inlineData.mimeType)) {
-      result = await resizeImage(result, maxDimension);
-      if (key && isInlineDataPart(result)) remember(key, result);
+    let pending = key ? preparingImages.get(key) : undefined;
+    if (!pending) {
+      pending = (async () => {
+        let prepared = await resolve();
+        if (resize && isInlineDataPart(prepared) && prepared.inlineData.data
+          && ['image/png', 'image/jpeg', 'image/webp'].includes(prepared.inlineData.mimeType)) {
+          prepared = await resizeImage(prepared, maxDimension);
+          if (key && isInlineDataPart(prepared)) remember(key, prepared);
+        }
+        return prepared;
+      })();
+      if (key) {
+        const imageKey = key;
+        pending = pending.finally(() => preparingImages.delete(imageKey));
+        preparingImages.set(key, pending);
+      }
     }
+    result = await pending;
   }
-  if (isInlineDataPart(result)) {
+  if (limitEnabled && maxMB > 0 && isInlineDataPart(result)) {
+    // Resolver results need not repeat the source attachment ID.
+    if (current) preparation.currentImages.add(result);
     // Base64 is ASCII: length is its exact wire byte count. No request serialization or hashing.
     preparation.bytes += result.inlineData.data?.length ?? 0;
-    if (maxMB > 0 && preparation.bytes > maxMB * 1_000_000) {
-      throw Object.assign(new Error(
-        `本次发送的图片超过 ${maxMB} MB 上限。请降低“历史图片长边”、提高“图片发送上限”，或压缩历史后重发。原始图片仍保留。`
-      ), { code: 'image_budget_exceeded' });
-    }
   }
   return result;
 }

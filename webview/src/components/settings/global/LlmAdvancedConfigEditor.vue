@@ -220,9 +220,9 @@ function updateRetryDelaySeconds(event: Event): void {
 
 const historyImages = computed(() => normalizeHistoryImageSettings(props.config.historyImages));
 
-function updateHistoryImages(field: keyof HistoryImageSettings, event: Event): void {
+function updateHistoryImages(field: keyof HistoryImageSettings, value: number | boolean | undefined): void {
   emit('update-field', { historyImages: normalizeHistoryImageSettings({
-    ...historyImages.value, [field]: numericInputValue(event)
+    ...historyImages.value, [field]: value
   }) });
 }
 
@@ -417,21 +417,40 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
           <span class="stream-checkbox-text">read 可返回图片和 PDF；关闭后只读文本。</span>
         </div>
 
-        <label class="global-settings-field">
+        <div class="global-settings-field">
           <span>历史图片长边（像素）</span>
-          <LlmSettingHint text="默认 1024；0 发送原图。" details="只缩小发送给模型的历史图片，保留原始附件。当前回合用户上传的图片保持原始分辨率。缩图可能影响小字和细节辨识。" />
+          <LcCheckbox :model-value="historyImages.resizeEnabled" size="sm" aria-label="缩小历史图片"
+            @update:model-value="updateHistoryImages('resizeEnabled', $event)">
+            <span class="stream-checkbox-enable">缩小历史图片</span>
+          </LcCheckbox>
+          <LlmSettingHint text="默认开启，长边 1024；0 发送原图。" details="只缩小发送给模型的历史图片，保留原始附件。当前回合用户上传的图片保持原始分辨率。缩图可能影响小字和细节辨识；关闭后保留填写的长边。" />
           <input class="token-number-input" aria-label="历史图片长边（像素）" type="number"
             min="0" max="8192" step="1" :value="historyImages.maxDimension"
-            @change="updateHistoryImages('maxDimension', $event)" />
-        </label>
+            :disabled="!historyImages.resizeEnabled"
+            @change="updateHistoryImages('maxDimension', numericInputValue($event))" />
+        </div>
 
-        <label class="global-settings-field">
+        <div class="global-settings-field">
           <span>图片发送上限（MB）</span>
-          <LlmSettingHint text="默认 16 MB；0 不限。" details="限制本次请求中编码后的图片总量，包含当前图片；超限会提示调整，不会删除图片。上限不包含文字、PDF 和工具定义，实际接口总量限制仍以渠道为准。修改对后续回合生效。" />
+          <LcCheckbox :model-value="historyImages.limitEnabled" size="sm" aria-label="限制图片发送体积"
+            @update:model-value="updateHistoryImages('limitEnabled', $event)">
+            <span class="stream-checkbox-enable">限制图片发送体积</span>
+          </LcCheckbox>
+          <LlmSettingHint text="默认开启，上限 16 MB；0 不限。" details="限制本次请求中编码后的图片总量，包含当前图片。上限不包含文字、PDF 和工具定义，实际接口总量限制仍以渠道为准；关闭后保留填写的上限。修改对后续回合生效。" />
           <input class="token-number-input" aria-label="图片发送上限（MB）" type="number"
             min="0" max="200" step="1" :value="historyImages.maxMB"
-            @change="updateHistoryImages('maxMB', $event)" />
-        </label>
+            :disabled="!historyImages.limitEnabled"
+            @change="updateHistoryImages('maxMB', numericInputValue($event))" />
+        </div>
+
+        <div class="global-settings-field">
+          <span>历史图片超限处理</span>
+          <LcCheckbox :model-value="historyImages.omitOldestEnabled" size="sm" aria-label="超限时省略最旧历史图片"
+            @update:model-value="updateHistoryImages('omitOldestEnabled', $event)">
+            <span class="stream-checkbox-enable">超限时省略最旧历史图片</span>
+          </LcCheckbox>
+          <LlmSettingHint text="默认开启，仅在图片发送上限生效时触发。" details="从最旧历史开始省略图片，直到满足本次发送上限；保留文字、工具结果和图片未发送提示，本地原图与预览不变。当前回合上传的图片不省略；仅当前图片就超限时仍提示调整。关闭此项后，超限会提示调整。" />
+        </div>
 
         <label v-if="config.provider === 'openai-responses'" class="global-settings-field openai-responses-transport-field">
           <span>连接模式</span>

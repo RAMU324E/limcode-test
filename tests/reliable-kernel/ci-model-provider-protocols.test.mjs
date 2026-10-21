@@ -668,7 +668,8 @@ test('可靠请求只采用 AuthoritySnapshot 冻结的前置提示词', async (
 test('图片策略和当前输入附件由冻结请求投影，不采用后来编辑的设置', async () => {
   const config = settings();
   const request = fullRequest(config);
-  request.authoritySnapshot.model.historyImages = { maxDimension: 0, maxMB: 3 };
+  const historyImages = { resizeEnabled: false, limitEnabled: false, omitOldestEnabled: true, maxDimension: 2048, maxMB: 3 };
+  request.authoritySnapshot.model.historyImages = historyImages;
   request.settingsSnapshot = { historyImages: { maxDimension: 2048, maxMB: 20 } };
   request.requestAddenda = { currentTurnInputs: [{ messageId: 'input', messageRevisionId: 'revision',
     contentObjectId: 'content', reinject: false, contentType: 'application/vnd.limcode.message+json',
@@ -677,7 +678,7 @@ test('图片策略和当前输入附件由冻结请求投影，不采用后来�
   await new kernel.LlmCapabilityFullRequestAdapter(config.id, fakeCapability((input, emit) => {
     captured = input; emit({ type: 'llm:done', payload: { requestId: input.id } });
   })).sendFullRequest(request, accepted);
-  assert.deepEqual(captured.settingsSnapshot.historyImages, { maxDimension: 0, maxMB: 3 });
+  assert.deepEqual(captured.settingsSnapshot.historyImages, historyImages);
   assert.deepEqual(captured.currentTurnImageAttachmentIds, ['current-image']);
 });
 

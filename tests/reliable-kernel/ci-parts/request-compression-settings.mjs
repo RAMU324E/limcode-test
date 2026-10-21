@@ -123,16 +123,16 @@ function registerCases(test) {
 
 test('图片策略保存后按模型配置冻结，修改设置不改变旧请求重放', async () => {
   await fixture(async ({ app, save, provider, input, requests }) => {
-    const modelConfig = { ...provider, id: 'image-model-config', modelId: provider.model,
-      historyImages: { maxDimension: 0, maxMB: 3 } };
+    const historyImages = { resizeEnabled: false, limitEnabled: true, omitOldestEnabled: false, maxDimension: 2048, maxMB: 3 };
+    const modelConfig = { ...provider, id: 'image-model-config', modelId: provider.model, historyImages };
     const config = { ...provider, historyImages: { maxDimension: 512, maxMB: 8 }, modelConfigs: [modelConfig] };
     await save('llmProviderConfigs', { configs: [config] });
     assert.equal((await app.agentLoop.runInput(input('image-settings'))).terminalStatus, 'completed');
-    assert.deepEqual(requests[0].authoritySnapshot.model.historyImages, { maxDimension: 0, maxMB: 3 });
+    assert.deepEqual(requests[0].authoritySnapshot.model.historyImages, historyImages);
     await save('llmProviderConfigs', { configs: [{ ...config, modelConfigs: [{ ...modelConfig,
       historyImages: { maxDimension: 2048, maxMB: 20 } }] }] });
     const replay = await app.modelProvider.replay(requests[0].modelRequestId);
-    assert.deepEqual(replay.authoritySnapshot.model.historyImages, { maxDimension: 0, maxMB: 3 });
+    assert.deepEqual(replay.authoritySnapshot.model.historyImages, historyImages);
   }, { async send(request, controls) {
     await controls.onEvent({ kind: 'completed', streamSeq: '1', content: {
       role: 'model', parts: [{ text: '完成。' }]
