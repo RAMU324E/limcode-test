@@ -423,7 +423,9 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
             @update:model-value="updateHistoryImages('resizeEnabled', $event)">
             <span class="stream-checkbox-enable">缩小历史图片</span>
           </LcCheckbox>
-          <LlmSettingHint text="默认开启，长边 1024；0 发送原图。" details="只缩小发送给模型的历史图片，保留原始附件。当前回合用户上传的图片保持原始分辨率。缩图可能影响小字和细节辨识；关闭后保留填写的长边。" />
+          <LlmSettingHint
+            :text="!historyImages.resizeEnabled ? '已关闭缩图，历史图片按原图发送。' : historyImages.maxDimension === 0 ? '当前设置：发送原图。' : `当前长边：${historyImages.maxDimension} 像素，可修改；0 发送原图。`"
+            details="只缩小发送给模型的历史图片，保留原始附件。当前回合用户上传的图片保持原始分辨率。缩图可能影响小字和细节辨识；关闭后保留填写的长边。" />
           <input class="token-number-input" aria-label="历史图片长边（像素）" type="number"
             min="0" max="8192" step="1" :value="historyImages.maxDimension"
             :disabled="!historyImages.resizeEnabled"
@@ -436,7 +438,9 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
             @update:model-value="updateHistoryImages('limitEnabled', $event)">
             <span class="stream-checkbox-enable">限制图片发送体积</span>
           </LcCheckbox>
-          <LlmSettingHint text="默认开启，上限 16 MB；0 不限。" details="限制本次请求中编码后的图片总量，包含当前图片。上限不包含文字、PDF 和工具定义，实际接口总量限制仍以渠道为准；关闭后保留填写的上限。修改对后续回合生效。" />
+          <LlmSettingHint
+            :text="!historyImages.limitEnabled ? '已关闭图片发送体积限制。' : historyImages.maxMB === 0 ? '当前设置：不限图片发送体积。' : `当前上限：${historyImages.maxMB} MB，可修改；0 不限。`"
+            details="限制本次请求中编码后的图片总量，包含当前图片。上限不包含文字、PDF 和工具定义，实际接口总量限制仍以渠道为准；关闭后保留填写的上限。修改对后续回合生效。" />
           <input class="token-number-input" aria-label="图片发送上限（MB）" type="number"
             min="0" max="200" step="1" :value="historyImages.maxMB"
             :disabled="!historyImages.limitEnabled"
@@ -449,7 +453,7 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
             @update:model-value="updateHistoryImages('omitOldestEnabled', $event)">
             <span class="stream-checkbox-enable">超限时省略最旧历史图片</span>
           </LcCheckbox>
-          <LlmSettingHint text="默认开启，仅在图片发送上限生效时触发。" details="从最旧历史开始省略图片，直到满足本次发送上限；保留文字、工具结果和图片未发送提示，本地原图与预览不变。当前回合上传的图片不省略；仅当前图片就超限时仍提示调整。关闭此项后，超限会提示调整。" />
+          <LlmSettingHint text="仅在图片发送上限生效时触发。" details="从最旧历史开始省略图片，直到满足本次发送上限；保留文字、工具结果和图片未发送提示，本地原图与预览不变。当前回合上传的图片不省略；仅当前图片就超限时仍提示调整。关闭此项后，超限会提示调整。" />
         </div>
 
         <label v-if="config.provider === 'openai-responses'" class="global-settings-field openai-responses-transport-field">
