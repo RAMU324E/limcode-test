@@ -76,13 +76,36 @@ async function pageFor(t) {
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   t.after(async () => { await page.close(); assert.deepEqual(errors, []); });
-  await page.addInitScript(() => { window.acquireVsCodeApi = () => ({ postMessage() {}, getState() {}, setState() {} }); });
+  await page.addInitScript(() => {
+    window.fixtureMessages = [];
+    window.acquireVsCodeApi = () => ({ postMessage(message) { window.fixtureMessages.push(structuredClone(message)); }, getState() {}, setState() {} });
+  });
   await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/settings-layout-fixture`, { waitUntil: 'networkidle' });
   return page;
 }
 async function shot(page, name) {
   if (screenshotDir) await page.screenshot({ path: path.join(screenshotDir, name + '.png'), animations: 'disabled' });
 }
+
+test('图片发送设置支持原图和不限，模型复制及保存传输保留确切值', async t => {
+  const p = await pageFor(t);
+  const dimension = p.getByRole('spinbutton', { name: '历史图片长边（像素）' });
+  const budget = p.getByRole('spinbutton', { name: '图片发送上限（MB）' });
+  assert.equal(await dimension.inputValue(), '1024');
+  assert.equal(await budget.inputValue(), '16');
+  await dimension.fill('0'); await dimension.press('Tab');
+  await budget.fill('0'); await budget.press('Tab');
+  assert.deepEqual(await p.evaluate(() => window.fixture.settings.activeLlmProviderConfig.historyImages),
+    { maxDimension: 0, maxMB: 0 });
+  await p.evaluate(() => {
+    window.fixture.settings.createModelConfigForActiveConfig('gpt-6-astra');
+    window.fixture.settings.saveLlmProviderConfigs();
+  });
+  await p.waitForFunction(() => window.fixtureMessages.some(message => message.type === 'settings.global.update'));
+  const saved = await p.evaluate(() => window.fixtureMessages.find(message => message.type === 'settings.global.update').payload.settings.configs[0]);
+  assert.deepEqual(saved.historyImages, { maxDimension: 0, maxMB: 0 });
+  assert.deepEqual(saved.modelConfigs[0].historyImages, { maxDimension: 0, maxMB: 0 });
+});
 
 test('settings fields align at wide and narrow widths; full model identity is available on hover and focus', async t => {
   const p = await pageFor(t);

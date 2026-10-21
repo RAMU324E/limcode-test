@@ -37,6 +37,7 @@ function modelConfigAsProviderConfig(modelConfig: LlmProviderModelConfigRecord):
     retryMaxAttempts: modelConfig.retryMaxAttempts,
     retryDelaySeconds: modelConfig.retryDelaySeconds,
     enableMultimodalTools: modelConfig.enableMultimodalTools,
+    historyImages: modelConfig.historyImages,
     contextWindowTokens: modelConfig.contextWindowTokens,
     systemPromptPrefix: modelConfig.systemPromptPrefix,
     promptCache: modelConfig.promptCache,

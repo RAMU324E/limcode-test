@@ -166,6 +166,7 @@ export function applyFrozenModelProviderConfig(
       openaiResponsesTransport: modelConfig.openaiResponsesTransport,
       stream: modelConfig.stream,
       enableMultimodalTools: modelConfig.enableMultimodalTools,
+      historyImages: modelConfig.historyImages,
       ...(modelConfig.contextWindowTokens === undefined
         ? { contextWindowTokens: undefined }
         : { contextWindowTokens: modelConfig.contextWindowTokens }),

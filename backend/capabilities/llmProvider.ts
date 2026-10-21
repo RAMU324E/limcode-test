@@ -1,3 +1,4 @@
+import { normalizeHistoryImageSettings } from '../../shared/historyImages';
 import { nativeSessionCapabilities } from '../../shared/nativeSessionCapabilities';
 import { discoverAnthropicModels } from './modelCapabilityDiscovery';
 import { resolveSummaryOutputBudget } from '../../shared/summaryOutputBudget';
@@ -651,7 +652,7 @@ async function runLlmAttempt(
   const unifiedRequest = await (async () => {
     try {
       const preparedRequest = await retryProviderInputRead(
-        () => prepareLlmStartRequestMultimodal(request, options, nativeCapabilities), { signal });
+        () => prepareLlmStartRequestMultimodal(request, options, nativeCapabilities, settings.historyImages), { signal });
       return toUnifiedRequest(preparedRequest, effectiveRequestGenerationConfig(request, settings),
         settings.provider, nativeCapabilities, turnReminderLayoutFor(request, settings));
     } catch (error) {
@@ -1745,7 +1746,7 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     throw new Error('当前 unified-llm-provider 版本不支持 provider.dryRun，请更新依赖。');
   }
 
-  const preparedRequest = await prepareLlmStartRequestMultimodal(request, options, nativeCapabilities);
+  const preparedRequest = await prepareLlmStartRequestMultimodal(request, options, nativeCapabilities, runtimeSettings.historyImages);
   const webSocketMode = isOpenAIResponsesWebSocketMode(runtimeSettings);
   const result = await dryRun.call(provider, toUnifiedRequest(
     preparedRequest,
@@ -5505,6 +5506,7 @@ function normalizeSettings(settings: LlmProviderConfigRecord | undefined): LlmPr
     retryMaxAttempts,
     retryDelaySeconds: normalizeRetryDelaySeconds(settings?.retryDelaySeconds),
     enableMultimodalTools: settings?.enableMultimodalTools !== false,
+    historyImages: normalizeHistoryImageSettings(settings?.historyImages),
     ...(contextWindowTokens ? { contextWindowTokens } : {}),
     systemPromptPrefix: typeof settings?.systemPromptPrefix === 'string' ? settings.systemPromptPrefix : '',
     ...(headers ? { headers } : {}),
@@ -5683,6 +5685,7 @@ function snapshotFromSettings(settings: LlmProviderConfigRecord, compressionConf
     retryMaxAttempts: normalizeRetryMaxAttempts(settings.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     retryDelaySeconds: normalizeRetryDelaySeconds(settings.retryDelaySeconds),
     enableMultimodalTools: settings.enableMultimodalTools !== false,
+    historyImages: normalizeHistoryImageSettings(settings.historyImages),
     ...(settings.contextWindowTokens ? { contextWindowTokens: settings.contextWindowTokens } : {}),
     ...(settings.systemPromptPrefix.trim() ? { systemPromptPrefix: settings.systemPromptPrefix } : {}),
     ...(settings.generationConfig ? { generationConfig: settings.generationConfig } : {}),

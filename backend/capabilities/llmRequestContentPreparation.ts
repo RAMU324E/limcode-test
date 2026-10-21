@@ -20,6 +20,8 @@ import type {
 import { decodeCanonicalBase64 } from './canonicalBase64';
 import { errorSearchText, isRecord, stringifyJson } from './llmStreamEventProjection';
 import type { OpenAIResponsesNativeCapabilities } from '../../shared/openAIResponsesNative';
+import type { HistoryImageSettings } from '../../shared/historyImages';
+import { createHistoryImagePreparation, prepareHistoryImage, type HistoryImagePreparation } from './historyImagePreparation';
 /** llmProvider.LlmProviderOptions 中本模块需要的子集；结构性兼容，避免回依赖 llmProvider。 */
 export interface LlmMultimodalPreparationOptions {
   resolveAttachment?: (input: { attachmentId?: string; sourcePath?: string; mimeType?: string; name?: string }) => Promise<InlineDataPart | undefined>;
@@ -44,14 +46,17 @@ interface TrackedFunctionCall {
 export async function prepareLlmStartRequestMultimodal(
   request: LlmStartRequest,
   options: LlmMultimodalPreparationOptions,
-  nativeCapabilities?: OpenAIResponsesNativeCapabilities
+  nativeCapabilities?: OpenAIResponsesNativeCapabilities,
+  imageSettings?: HistoryImageSettings
 ): Promise<LlmStartRequest> {
   const preparation = createMultimodalPreparationContext();
+  const images = createHistoryImagePreparation(request.settingsSnapshot?.historyImages ?? imageSettings,
+    request.currentTurnImageAttachmentIds);
   const [contents, systemInstruction] = await Promise.all([
     Promise.all(request.contents.map((content) =>
-      prepareLlmContentMultimodal(content, options, false, 'ordinary', preparation))),
+      prepareLlmContentMultimodal(content, options, false, 'ordinary', preparation, images))),
     request.systemInstruction
-      ? prepareLlmContentMultimodal(request.systemInstruction, options, false, 'ordinary', preparation)
+      ? prepareLlmContentMultimodal(request.systemInstruction, options, false, 'ordinary', preparation, images)
       : Promise.resolve(undefined)
   ]);
   const normalized = assertCanonicalProviderToolContext(contents, nativeAsyncAdmission(request, nativeCapabilities));
@@ -245,10 +250,11 @@ async function prepareLlmContentMultimodal(
   options: LlmMultimodalPreparationOptions,
   toolResponse: boolean,
   mode: MultimodalPreparationMode = 'ordinary',
-  preparation: MultimodalPreparationContext = createMultimodalPreparationContext()
+  preparation: MultimodalPreparationContext = createMultimodalPreparationContext(),
+  images?: HistoryImagePreparation
 ): Promise<MessageContent> {
   const parts = await Promise.all(content.parts.map((part) =>
-    prepareLlmPartMultimodal(part, options, toolResponse, mode, preparation)));
+    prepareLlmPartMultimodal(part, options, toolResponse, mode, preparation, images)));
   return { ...content, parts: parts.flat() };
 }
 
@@ -257,14 +263,19 @@ async function prepareLlmPartMultimodal(
   options: LlmMultimodalPreparationOptions,
   toolResponse: boolean,
   mode: MultimodalPreparationMode,
-  preparation: MultimodalPreparationContext
+  preparation: MultimodalPreparationContext,
+  images?: HistoryImagePreparation
 ): Promise<ContentPart[]> {
+  const prepare = (inlinePart: InlineDataPart, response: boolean): Promise<ContentPart> => {
+    const resolve = () => prepareInlineDataForLlm(inlinePart, options, response, mode, preparation);
+    return images ? prepareHistoryImage(inlinePart, resolve, images) : resolve();
+  };
   if (isInlineDataPart(part)) {
-    return [await prepareInlineDataForLlm(part, options, toolResponse, mode, preparation)];
+    return [await prepare(part, toolResponse)];
   }
   if (isFunctionResponsePart(part) && part.functionResponse.parts?.length) {
     const prepared = await Promise.all(part.functionResponse.parts.map((inlinePart) =>
-      prepareInlineDataForLlm(inlinePart, options, true, mode, preparation)));
+      prepare(inlinePart, true)));
     const inlineParts = prepared.filter(isInlineDataPart).filter((inlinePart) => isSupportedToolResponseInlineData(inlinePart));
     const placeholders = prepared.filter(isTextPart).map((textPart) => textPart.text).filter(Boolean);
     return [{

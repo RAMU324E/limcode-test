@@ -1,3 +1,4 @@
+import { normalizeHistoryImageSettings } from '../../../shared/historyImages';
 import { normalizeModelCapabilitySnapshot } from '../../../shared/modelCapabilities';
 import * as vscode from 'vscode';
 import type {
@@ -149,6 +150,7 @@ export function createDefaultLlmProviderConfig(input: { name?: string } = {}): L
     retryMaxAttempts: DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     retryDelaySeconds: DEFAULT_LLM_RETRY_DELAY_SECONDS,
     enableMultimodalTools: true,
+    historyImages: normalizeHistoryImageSettings(),
     contextWindowTokens: DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
     systemPromptPrefix: '',
     promptCache: createDefaultLlmPromptCacheConfig('openai-compatible'),
@@ -191,6 +193,7 @@ export function normalizeLlmProviderConfig(input: Partial<LlmProviderConfigRecor
     retryMaxAttempts: finiteRetryMaxAttempts(input?.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     retryDelaySeconds: finiteRetryDelaySeconds(input?.retryDelaySeconds) ?? DEFAULT_LLM_RETRY_DELAY_SECONDS,
     enableMultimodalTools: typeof input?.enableMultimodalTools === 'boolean' ? input.enableMultimodalTools : true,
+    historyImages: normalizeHistoryImageSettings(input?.historyImages),
     contextWindowTokens,
     systemPromptPrefix: normalizeSystemPromptPrefix(input?.systemPromptPrefix),
     promptCache,
@@ -306,6 +309,7 @@ function normalizeModelConfigs(
       retryMaxAttempts: finiteRetryMaxAttempts(item.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
       retryDelaySeconds: finiteRetryDelaySeconds(item.retryDelaySeconds) ?? DEFAULT_LLM_RETRY_DELAY_SECONDS,
       enableMultimodalTools: typeof item.enableMultimodalTools === 'boolean' ? item.enableMultimodalTools : true,
+      historyImages: normalizeHistoryImageSettings(item.historyImages),
       contextWindowTokens: finitePositiveInteger(item.contextWindowTokens) ?? providerDefaultContextWindow(provider),
       systemPromptPrefix: normalizeSystemPromptPrefix(item.systemPromptPrefix),
       promptCache,

@@ -665,6 +665,22 @@ test('可靠请求只采用 AuthoritySnapshot 冻结的前置提示词', async (
   assert.equal(captured.settingsSnapshot.systemPromptPrefix, '本次冻结的模型要求');
 });
 
+test('图片策略和当前输入附件由冻结请求投影，不采用后来编辑的设置', async () => {
+  const config = settings();
+  const request = fullRequest(config);
+  request.authoritySnapshot.model.historyImages = { maxDimension: 0, maxMB: 3 };
+  request.settingsSnapshot = { historyImages: { maxDimension: 2048, maxMB: 20 } };
+  request.requestAddenda = { currentTurnInputs: [{ messageId: 'input', messageRevisionId: 'revision',
+    contentObjectId: 'content', reinject: false, contentType: 'application/vnd.limcode.message+json',
+    content: JSON.stringify({ role: 'user', parts: [{ inlineData: { attachmentId: 'current-image', mimeType: 'image/png' } }] }) }] };
+  let captured;
+  await new kernel.LlmCapabilityFullRequestAdapter(config.id, fakeCapability((input, emit) => {
+    captured = input; emit({ type: 'llm:done', payload: { requestId: input.id } });
+  })).sendFullRequest(request, accepted);
+  assert.deepEqual(captured.settingsSnapshot.historyImages, { maxDimension: 0, maxMB: 3 });
+  assert.deepEqual(captured.currentTurnImageAttachmentIds, ['current-image']);
+});
+
 test('运行规则按固定顺序原样注入，用户文件里的占位符保持原文', () => {
   const { composeRuntimeContextRuleParts } = load('backend/reliableKernel/runtimeContextRendering.js');
   assert.deepEqual(composeRuntimeContextRuleParts([
