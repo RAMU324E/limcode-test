@@ -527,6 +527,40 @@ test('历史：持续刷新合并在途读取，页面导航和关闭拒绝迟�
   assert.equal(h.posted.length, 3); assert.equal(h.timers.size, 0);
 });
 
+test('历史：分支独立平级显示，真正的子Agent仍随所属对话折叠和分页', async () => {
+  const tree = await ui.server.ssrLoadModule(`${process.cwd()}/shared/conversationHistoryTree.ts`);
+  const collapse = await ui.load('sidebar/collapseIntent.ts');
+  const entry = (id, updatedAt) => ({ id, title: id, status: 'final', messageCount: 1, createdAt: 1, updatedAt, previewState: 'ready', preview: id });
+  const origin = (conversationId, sourceConversationId, originKind) => ({ id: `origin-${conversationId}`, conversationId, sourceConversationId, originKind, createdAt: 1 });
+  const forkOrigin = origin('fork', 'source', 'user');
+  const forest = tree.buildConversationHistoryForest([
+    entry('source', 1), entry('source-child', 4), entry('fork', 6), entry('fork-child', 5), entry('child-fork', 8)
+  ], [forkOrigin, origin('source-child', 'source', 'agent'), origin('fork-child', 'fork', 'agent'), origin('child-fork', 'source-child', 'user')]);
+  assert.deepEqual(forest.map(node => node.entry.id), ['child-fork', 'fork', 'source']);
+  assert.equal(forest[1].originLink, forkOrigin, '保留分支来源记录');
+  assert.deepEqual(forest[1].children.map(node => node.entry.id), ['fork-child']);
+  assert.deepEqual(forest[2].children.map(node => node.entry.id), ['source-child']);
+  const visible = collapse.flattenVisibleHistoryNodes({ forest, expandedIds: new Set(), maxVisualDepth: 8 });
+  assert.deepEqual(visible.map(node => [node.entry.id, node.depth]), [['child-fork', 0], ['fork', 0], ['source', 0]]);
+  assert.deepEqual(tree.packConversationHistoryForestIntoPages(forest, 2).map(page => page.map(node => node.entry.id)),
+    [['child-fork'], ['fork', 'fork-child'], ['source', 'source-child']]);
+});
+
+test('历史：读取分支页不夹带来源对话，读取真正子Agent仍携带父对话', t => {
+  const f = projectionDatabase(t), now = '2000-01-01T00:00:00Z';
+  for (const id of ['source', 'fork', 'child']) f.conversation(id);
+  f.db.prepare('UPDATE conversation SET updated_at=? WHERE id=?').run('2000-02-01T00:00:00Z', 'fork');
+  f.db.prepare('UPDATE conversation SET updated_at=? WHERE id=?').run('2000-03-01T00:00:00Z', 'child');
+  for (const [id, source, toolCall] of [['fork', 'source', null], ['child', 'fork', 'spawn']]) {
+    f.insert('conversation_origin_link', { id: `origin-${id}`, conversation_id: id, source_conversation_id: source,
+      source_turn_id: null, source_tool_call_id: toolCall, source_message_revision_id: null, created_at: now });
+  }
+  const read = pageIndex => projection.executeConversationHistoryProjection(f.db, { scopeKind: 'all', pageIndex, limit: 1 });
+  assert.deepEqual(read(0).conversations.map(row => row.id), ['child', 'fork']);
+  assert.deepEqual(read(1).conversations.map(row => row.id), ['fork']);
+  assert.deepEqual(read(2).conversations.map(row => row.id), ['source']);
+});
+
 test('历史：用户折叠保留运行子任务汇总，主动展开恢复自动展开资格', async () => {
   const tree = await ui.server.ssrLoadModule(`${process.cwd()}/shared/conversationHistoryTree.ts`);
   const collapse = await ui.load('sidebar/collapseIntent.ts');

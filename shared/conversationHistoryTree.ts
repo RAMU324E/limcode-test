@@ -31,7 +31,7 @@ export interface ConversationHistoryDescendantAgentSummary {
 }
 
 /**
- * 将独立的对话条目与来源 Link 组合成只读树投影。
+ * 将独立的对话条目与来源 Link 组合成只读树投影，仅子 Agent 挂在父对话下。
  *
  * 来源 Link 仍然是独立关系数据；这里只在展示/分页边界临时解释它。缺失父项、
  * 自引用以及循环关系都会回落为根节点，避免一条损坏关系隐藏整段历史记录。
@@ -48,6 +48,7 @@ export function buildConversationHistoryForest(
   const originLinkByConversationId = selectConversationOriginLinks(originLinks);
   const parentByChildId = new Map<string, string>();
   for (const [conversationId, link] of originLinkByConversationId) {
+    if (link.originKind !== 'agent') continue;
     const parentConversationId = link.sourceConversationId;
     if (!parentConversationId || parentConversationId === conversationId) continue;
     if (!entryById.has(conversationId) || !entryById.has(parentConversationId)) continue;
