@@ -1,4 +1,5 @@
 import { CLIENT_STRUCTURAL_REMOVAL_DOMAINS, clientRemovalAffectsSession } from './clientChangeScope';
+import { AGENT_MESSAGE_MAX_TEXT_BYTES } from './collaborationOutputBudget';
 import { needsSingleResponseMeasurement } from './singleResponseMeasurement';
 import { AcceptedAnswerTextPages } from './acceptedAnswerTextPages';
 import { CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE } from './deliverySettlementSteps';
@@ -2041,7 +2042,7 @@ export class ClientDetailReader {
         throw new Error('Collaboration message preview requires exact source, payload and destination links.');
       }
       const metadata = await this.requireExisting('ContentObject', String(payloads[0]!.content_object_id)) as ContentObjectMetadata;
-      if (metadata.content_type !== 'text/vnd.limcode.collaboration-message' || BigInt(metadata.byte_length) > 64000n) {
+      if (metadata.content_type !== 'text/vnd.limcode.collaboration-message' || BigInt(metadata.byte_length) > BigInt(AGENT_MESSAGE_MAX_TEXT_BYTES)) {
         throw new Error('Collaboration message preview payload violates its content contract.');
       }
       const text = (await this.contentStore.read(metadata)).toString('utf8');

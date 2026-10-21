@@ -1,4 +1,5 @@
 import { singleResponseMeasurementReader } from './singleResponseMeasurement';
+import { AGENT_MESSAGE_MAX_TEXT_BYTES } from './collaborationOutputBudget';
 import { canonicalAnswerPresentations } from './answerPresentation';
 import { readTimelineWindow, canonicalDeliveryTimelineLinks, type TimelineWindow } from './clientTimelineHistory';
 import { normalizeCollaborationHistoryCursor, normalizeCollaborationHistoryDirection } from './collaborationHistoryCursor';
@@ -596,7 +597,7 @@ export function projectCollaborationMessageRecord(
   `).all(messageId) as Array<Record<string, unknown>>;
   if (payloads.length !== 1) throw new Error(`CollaborationMessage ${messageId} requires exactly one payload.`);
   const metadata = DOMAIN_REPOSITORIES.codec('ContentObject').decode(payloads[0]);
-  if (metadata.content_type !== 'text/vnd.limcode.collaboration-message' || typeof metadata.byte_length !== 'bigint' || metadata.byte_length > 64_000n) {
+  if (metadata.content_type !== 'text/vnd.limcode.collaboration-message' || typeof metadata.byte_length !== 'bigint' || metadata.byte_length > BigInt(AGENT_MESSAGE_MAX_TEXT_BYTES)) {
     throw new Error(`CollaborationMessage ${messageId} payload violates its content contract.`);
   }
   const normalized = content.readVerifiedBytes(metadata).toString('utf8').replace(/\s+/g, ' ').trim();

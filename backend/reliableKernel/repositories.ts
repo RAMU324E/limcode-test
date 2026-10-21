@@ -207,6 +207,8 @@ export interface RepositoryListRead {
   keyset?: RepositoryKeysetCursor;
   /** Fixed mailbox membership predicate, valid only for CollaborationMessage. */
   collaborationConversationId?: string;
+  /** Tool calls of the indexed Turns belonging to one Conversation. */
+  toolConversationId?: string;
   /**
    * Fixed inbound collaboration backlog predicate, valid only for RuntimeDelivery: deliveries of
    * collaboration messages other than completion replies.
@@ -635,6 +637,10 @@ export class DomainRepository {
       if (this.schema.key !== 'CollaborationMessage') throw new TypeError('Mailbox scope is only valid for CollaborationMessage.');
       requireId(options.collaborationConversationId);
     }
+    if (options.toolConversationId !== undefined) {
+      if (this.schema.key !== 'ToolCall') throw new TypeError('Tool conversation scope is only valid for ToolCall.');
+      requireId(options.toolConversationId);
+    }
     this.requireCollaborationBacklogScope(options.collaborationBacklog);
     if (options.collaborationRootConversationId !== undefined) {
       if (this.schema.key !== 'ChildExecution') throw new TypeError('Collaboration roster scope is only valid for ChildExecution.');
@@ -653,6 +659,7 @@ export class DomainRepository {
       ...(options.afterId ? { afterId: options.afterId } : {}),
       ...(options.keyset ? { keyset: { ...options.keyset } } : {}),
       ...(options.collaborationConversationId ? { collaborationConversationId: options.collaborationConversationId } : {}),
+      ...(options.toolConversationId ? { toolConversationId: options.toolConversationId } : {}),
       ...(options.collaborationBacklog ? { collaborationBacklog: true as const } : {}),
       ...(options.collaborationRootConversationId ? { collaborationRootConversationId: options.collaborationRootConversationId } : {}),
       ...(options.collaborationProjectScope ? { collaborationProjectScope: { ...options.collaborationProjectScope } } : {}),
