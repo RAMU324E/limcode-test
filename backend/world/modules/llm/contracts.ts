@@ -25,6 +25,8 @@ export interface LlmStartRequest {
   invocationId?: string;
   systemInstruction?: MessageContent;
   contents: MessageContent[];
+  /** Current user attachments retain original resolution; process-local, never sent as API fields. */
+  currentTurnImageAttachmentIds?: readonly string[];
   /** End of the preceding actual input in this content projection; process-local, never sent as an API field. */
   readBreakpointBeforeContentIndex?: number;
   tools: ToolSchema[];

@@ -816,6 +816,7 @@ export interface LlmProviderModelConfigRecord {
   /** 每次重试前固定等待的秒数；0 表示沿用自动指数退避。 */
   retryDelaySeconds: number;
   enableMultimodalTools: boolean;
+  historyImages?: import('./historyImages').HistoryImageSettings;
   contextWindowTokens?: number;
   /** 不添加标题，直接放在本次请求最终系统提示词的最前面；空字符串表示不注入。 */
   systemPromptPrefix: string;
@@ -853,6 +854,7 @@ export interface LlmProviderConfigRecord {
   /** 每次重试前固定等待的秒数；0 表示沿用自动指数退避。 */
   retryDelaySeconds: number;
   enableMultimodalTools: boolean;
+  historyImages?: import('./historyImages').HistoryImageSettings;
   contextWindowTokens?: number;
   /** 不添加标题，直接放在本次请求最终系统提示词的最前面；空字符串表示不注入。 */
   systemPromptPrefix: string;
@@ -904,6 +906,7 @@ export interface LlmInvocationSettingsSnapshotRecord {
   retryMaxAttempts?: number;
   retryDelaySeconds?: number;
   enableMultimodalTools?: boolean;
+  historyImages?: import('./historyImages').HistoryImageSettings;
   contextWindowTokens?: number;
   /** 本次调用已经冻结的渠道或模型前置系统提示词。 */
   systemPromptPrefix?: string;

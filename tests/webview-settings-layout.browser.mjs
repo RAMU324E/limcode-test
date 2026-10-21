@@ -76,7 +76,10 @@ async function pageFor(t) {
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   t.after(async () => { await page.close(); assert.deepEqual(errors, []); });
-  await page.addInitScript(() => { window.acquireVsCodeApi = () => ({ postMessage() {}, getState() {}, setState() {} }); });
+  await page.addInitScript(() => {
+    window.fixtureMessages = [];
+    window.acquireVsCodeApi = () => ({ postMessage(message) { window.fixtureMessages.push(structuredClone(message)); }, getState() {}, setState() {} });
+  });
   await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/settings-layout-fixture`, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.locator('.llm-generation-settings').waitFor({ timeout: 30000 });
   return page;
@@ -84,6 +87,44 @@ async function pageFor(t) {
 async function shot(page, name) {
   if (screenshotDir) await page.screenshot({ path: path.join(screenshotDir, name + '.png'), animations: 'disabled' });
 }
+
+test('图片发送开关独立并默认开启，关闭保留数字与选择，模型复制及保存保留确切值', async t => {
+  const p = await pageFor(t);
+  const dimension = p.getByRole('spinbutton', { name: '历史图片长边（像素）' });
+  const budget = p.getByRole('spinbutton', { name: '图片发送上限（MB）' });
+  assert.equal(await dimension.inputValue(), '1024');
+  assert.equal(await budget.inputValue(), '16');
+  const resize = p.getByRole('checkbox', { name: '缩小历史图片', exact: true });
+  const limit = p.getByRole('checkbox', { name: '限制图片发送体积', exact: true });
+  const omit = p.getByRole('checkbox', { name: '超限时省略最旧历史图片', exact: true });
+  for (const toggle of [resize, limit, omit]) assert.equal(await toggle.isChecked(), true);
+  await dimension.fill('2048'); await dimension.press('Tab');
+  await budget.fill('8'); await budget.press('Tab');
+  await resize.click();
+  assert.equal(await dimension.isDisabled(), true);
+  assert.equal(await limit.isChecked(), true);
+  assert.equal(await omit.isChecked(), true);
+  await limit.click();
+  assert.equal(await budget.isDisabled(), true);
+  assert.equal(await omit.isChecked(), true);
+  await omit.click();
+  const expected = { resizeEnabled: false, limitEnabled: false, omitOldestEnabled: false, maxDimension: 2048, maxMB: 8 };
+  assert.deepEqual(await p.evaluate(() => window.fixture.settings.activeLlmProviderConfig.historyImages),
+    expected);
+  await resize.click(); await limit.click();
+  assert.equal(await dimension.inputValue(), '2048');
+  assert.equal(await budget.inputValue(), '8');
+  assert.equal(await omit.isChecked(), false);
+  await resize.click(); await limit.click();
+  await p.evaluate(() => {
+    window.fixture.settings.createModelConfigForActiveConfig('gpt-6-astra');
+    window.fixture.settings.saveLlmProviderConfigs();
+  });
+  await p.waitForFunction(() => window.fixtureMessages.some(message => message.type === 'settings.global.update'));
+  const saved = await p.evaluate(() => window.fixtureMessages.find(message => message.type === 'settings.global.update').payload.settings.configs[0]);
+  assert.deepEqual(saved.historyImages, expected);
+  assert.deepEqual(saved.modelConfigs[0].historyImages, expected);
+});
 
 test('settings fields align at wide and narrow widths; full model identity is available on hover and focus', async t => {
   const p = await pageFor(t);

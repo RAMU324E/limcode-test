@@ -1,3 +1,4 @@
+import { normalizeHistoryImageSettings } from '@shared/historyImages';
 import { normalizeModelCapabilitySnapshot } from '@shared/modelCapabilities';
 import { describeOpenAICompatibleThinkingProbe, OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS } from '@shared/openAICompatibleThinkingProbe';
 import { defineStore } from 'pinia';
@@ -245,6 +246,7 @@ function createDefaultProviderConfig(name = '新渠道配置', provider: LlmProv
     retryMaxAttempts: DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     retryDelaySeconds: DEFAULT_LLM_RETRY_DELAY_SECONDS,
     enableMultimodalTools: true,
+    historyImages: normalizeHistoryImageSettings(),
     contextWindowTokens: providerDefaultContextWindow(provider),
     systemPromptPrefix: '',
     promptCache: providerDefaultPromptCache(provider),
@@ -271,6 +273,7 @@ function createModelConfigFromProviderConfig(config: LlmProviderConfigRecord, mo
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     retryDelaySeconds: normalizeRetryDelaySeconds(config.retryDelaySeconds) ?? DEFAULT_LLM_RETRY_DELAY_SECONDS,
     enableMultimodalTools: config.enableMultimodalTools !== false,
+    historyImages: normalizeHistoryImageSettings(config.historyImages),
     contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) ?? providerDefaultContextWindow(config.provider),
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: normalizePromptCacheForUi(config.promptCache, config.provider),
@@ -326,6 +329,7 @@ function normalizeProviderConfigForUi(config: LlmProviderConfigRecord): LlmProvi
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     retryDelaySeconds: normalizeRetryDelaySeconds(config.retryDelaySeconds) ?? DEFAULT_LLM_RETRY_DELAY_SECONDS,
     enableMultimodalTools: config.enableMultimodalTools !== false,
+    historyImages: normalizeHistoryImageSettings(config.historyImages),
     contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) ?? providerDefaultContextWindow(provider),
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: normalizePromptCacheForUi(config.promptCache, provider),
@@ -383,6 +387,7 @@ function normalizeModelConfigForUi(config: LlmProviderModelConfigRecord, modelId
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     retryDelaySeconds: normalizeRetryDelaySeconds(config.retryDelaySeconds) ?? DEFAULT_LLM_RETRY_DELAY_SECONDS,
     enableMultimodalTools: config.enableMultimodalTools !== false,
+    historyImages: normalizeHistoryImageSettings(config.historyImages),
     contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) ?? providerDefaultContextWindow(provider),
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: normalizePromptCacheForUi(config.promptCache, provider),
@@ -767,6 +772,7 @@ function toPlainProviderConfig(config: LlmProviderConfigRecord): LlmProviderConf
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     retryDelaySeconds: normalizeRetryDelaySeconds(config.retryDelaySeconds) ?? DEFAULT_LLM_RETRY_DELAY_SECONDS,
     enableMultimodalTools: config.enableMultimodalTools !== false,
+    historyImages: normalizeHistoryImageSettings(config.historyImages),
     ...(normalizeTokenCount(config.contextWindowTokens) ? { contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) } : {}),
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: sanitizePromptCache(config.promptCache, config.provider),
@@ -796,6 +802,7 @@ function toPlainModelConfig(config: LlmProviderModelConfigRecord, provider: LlmP
     retryMaxAttempts: normalizeRetryMaxAttempts(config.retryMaxAttempts) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
     retryDelaySeconds: normalizeRetryDelaySeconds(config.retryDelaySeconds) ?? DEFAULT_LLM_RETRY_DELAY_SECONDS,
     enableMultimodalTools: config.enableMultimodalTools !== false,
+    historyImages: normalizeHistoryImageSettings(config.historyImages),
     ...(normalizeTokenCount(config.contextWindowTokens) ? { contextWindowTokens: normalizeTokenCount(config.contextWindowTokens) ?? providerDefaultContextWindow(provider) } : { contextWindowTokens: providerDefaultContextWindow(provider) }),
     systemPromptPrefix: normalizeSystemPromptPrefix(config.systemPromptPrefix),
     promptCache: sanitizePromptCache(config.promptCache, provider),

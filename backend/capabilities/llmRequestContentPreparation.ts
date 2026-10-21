@@ -20,6 +20,8 @@ import type {
 import { decodeCanonicalBase64 } from './canonicalBase64';
 import { errorSearchText, isRecord, stringifyJson } from './llmStreamEventProjection';
 import type { OpenAIResponsesNativeCapabilities } from '../../shared/openAIResponsesNative';
+import type { HistoryImageSettings } from '../../shared/historyImages';
+import { createHistoryImagePreparation, prepareHistoryImage, type HistoryImagePreparation } from './historyImagePreparation';
 /** llmProvider.LlmProviderOptions 中本模块需要的子集；结构性兼容，避免回依赖 llmProvider。 */
 export interface LlmMultimodalPreparationOptions {
   resolveAttachment?: (input: { attachmentId?: string; sourcePath?: string; mimeType?: string; name?: string }) => Promise<InlineDataPart | undefined>;
@@ -44,22 +46,61 @@ interface TrackedFunctionCall {
 export async function prepareLlmStartRequestMultimodal(
   request: LlmStartRequest,
   options: LlmMultimodalPreparationOptions,
-  nativeCapabilities?: OpenAIResponsesNativeCapabilities
+  nativeCapabilities?: OpenAIResponsesNativeCapabilities,
+  imageSettings?: HistoryImageSettings
 ): Promise<LlmStartRequest> {
   const preparation = createMultimodalPreparationContext();
+  const images = createHistoryImagePreparation(request.settingsSnapshot?.historyImages ?? imageSettings,
+    request.currentTurnImageAttachmentIds);
   const [contents, systemInstruction] = await Promise.all([
     Promise.all(request.contents.map((content) =>
-      prepareLlmContentMultimodal(content, options, false, 'ordinary', preparation))),
+      prepareLlmContentMultimodal(content, options, false, 'ordinary', preparation, images))),
     request.systemInstruction
-      ? prepareLlmContentMultimodal(request.systemInstruction, options, false, 'ordinary', preparation)
+      ? prepareLlmContentMultimodal(request.systemInstruction, options, false, 'ordinary', preparation, images)
       : Promise.resolve(undefined)
   ]);
+  enforceHistoryImageBudget(contents, images);
   const normalized = assertCanonicalProviderToolContext(contents, nativeAsyncAdmission(request, nativeCapabilities));
   return {
     ...request,
     contents: normalized,
     ...(systemInstruction ? { systemInstruction } : {})
   };
+}
+
+function enforceHistoryImageBudget(contents: MessageContent[], images: HistoryImagePreparation): void {
+  const { limitEnabled, omitOldestEnabled, maxMB } = images.settings;
+  if (!limitEnabled || maxMB === 0 || images.bytes <= maxMB * 1_000_000) return;
+  const omit = (part: InlineDataPart): ContentPart => {
+    if (images.bytes <= maxMB * 1_000_000 || !part.inlineData.mimeType.startsWith('image/')
+      || images.currentImages.has(part)) return part;
+    images.bytes -= part.inlineData.data?.length ?? 0;
+    return { text: `[历史图片本次未发送: ${mediaReferenceLabel(part)}; 图片发送体积超限，已从最旧历史开始省略。原始附件仍保留；需要查看时请重新读取或上传。]` };
+  };
+  if (omitOldestEnabled) {
+    // Prepared contents are chronological. Walk only outgoing part descriptors after overflow;
+    // asynchronous attachment/resize completion order must not decide which history is omitted.
+    for (const content of contents) {
+      if (images.bytes <= maxMB * 1_000_000) break;
+      content.parts = content.parts.map(part => {
+        if (isInlineDataPart(part)) return omit(part);
+        if (!isFunctionResponsePart(part) || !part.functionResponse.parts?.length) return part;
+        const prepared = part.functionResponse.parts.map(omit);
+        const placeholders = prepared.filter(isTextPart).map(part => part.text);
+        if (!placeholders.length) return part;
+        return { ...part, functionResponse: {
+          ...part.functionResponse,
+          parts: prepared.filter(isInlineDataPart),
+          response: withAttachmentPlaceholders(part.functionResponse.response, placeholders)
+        } };
+      });
+    }
+  }
+  if (images.bytes > maxMB * 1_000_000) {
+    throw Object.assign(new Error(
+      `本次发送的图片超过 ${maxMB} MB 上限。${omitOldestEnabled ? '可省略的历史图片已全部省略，当前回合或系统图片仍超过上限。' : '可启用“超限时省略最旧历史图片”。'}请压缩图片、提高或关闭“图片发送上限”。原始图片仍保留。`
+    ), { code: 'image_budget_exceeded' });
+  }
 }
 
 /**
@@ -245,10 +286,11 @@ async function prepareLlmContentMultimodal(
   options: LlmMultimodalPreparationOptions,
   toolResponse: boolean,
   mode: MultimodalPreparationMode = 'ordinary',
-  preparation: MultimodalPreparationContext = createMultimodalPreparationContext()
+  preparation: MultimodalPreparationContext = createMultimodalPreparationContext(),
+  images?: HistoryImagePreparation
 ): Promise<MessageContent> {
   const parts = await Promise.all(content.parts.map((part) =>
-    prepareLlmPartMultimodal(part, options, toolResponse, mode, preparation)));
+    prepareLlmPartMultimodal(part, options, toolResponse, mode, preparation, images)));
   return { ...content, parts: parts.flat() };
 }
 
@@ -257,14 +299,19 @@ async function prepareLlmPartMultimodal(
   options: LlmMultimodalPreparationOptions,
   toolResponse: boolean,
   mode: MultimodalPreparationMode,
-  preparation: MultimodalPreparationContext
+  preparation: MultimodalPreparationContext,
+  images?: HistoryImagePreparation
 ): Promise<ContentPart[]> {
+  const prepare = (inlinePart: InlineDataPart, response: boolean): Promise<ContentPart> => {
+    const resolve = () => prepareInlineDataForLlm(inlinePart, options, response, mode, preparation);
+    return images ? prepareHistoryImage(inlinePart, resolve, images) : resolve();
+  };
   if (isInlineDataPart(part)) {
-    return [await prepareInlineDataForLlm(part, options, toolResponse, mode, preparation)];
+    return [await prepare(part, toolResponse)];
   }
   if (isFunctionResponsePart(part) && part.functionResponse.parts?.length) {
     const prepared = await Promise.all(part.functionResponse.parts.map((inlinePart) =>
-      prepareInlineDataForLlm(inlinePart, options, true, mode, preparation)));
+      prepare(inlinePart, true)));
     const inlineParts = prepared.filter(isInlineDataPart).filter((inlinePart) => isSupportedToolResponseInlineData(inlinePart));
     const placeholders = prepared.filter(isTextPart).map((textPart) => textPart.text).filter(Boolean);
     return [{
@@ -272,7 +319,7 @@ async function prepareLlmPartMultimodal(
       functionResponse: {
         ...part.functionResponse,
         response: placeholders.length > 0 ? withAttachmentPlaceholders(part.functionResponse.response, placeholders) : part.functionResponse.response,
-        ...(inlineParts.length > 0 ? { parts: inlineParts } : {})
+        parts: inlineParts
       }
     }];
   }

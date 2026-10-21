@@ -121,6 +121,25 @@ async function fixture(run, hooks = {}) {
 
 function registerCases(test) {
 
+test('图片策略保存后按模型配置冻结，修改设置不改变旧请求重放', async () => {
+  await fixture(async ({ app, save, provider, input, requests }) => {
+    const historyImages = { resizeEnabled: false, limitEnabled: true, omitOldestEnabled: false, maxDimension: 2048, maxMB: 3 };
+    const modelConfig = { ...provider, id: 'image-model-config', modelId: provider.model, historyImages };
+    const config = { ...provider, historyImages: { maxDimension: 512, maxMB: 8 }, modelConfigs: [modelConfig] };
+    await save('llmProviderConfigs', { configs: [config] });
+    assert.equal((await app.agentLoop.runInput(input('image-settings'))).terminalStatus, 'completed');
+    assert.deepEqual(requests[0].authoritySnapshot.model.historyImages, historyImages);
+    await save('llmProviderConfigs', { configs: [{ ...config, modelConfigs: [{ ...modelConfig,
+      historyImages: { maxDimension: 2048, maxMB: 20 } }] }] });
+    const replay = await app.modelProvider.replay(requests[0].modelRequestId);
+    assert.deepEqual(replay.authoritySnapshot.model.historyImages, historyImages);
+  }, { async send(request, controls) {
+    await controls.onEvent({ kind: 'completed', streamSeq: '1', content: {
+      role: 'model', parts: [{ text: '完成。' }]
+    } });
+  } });
+});
+
 test('保存压缩设置后同一任务的下一次模型请求采用新值，旧请求及整轮配置保持不变', async () => {
   await fixture(async ({ app, frozen, input, requests, list, oldConfig }) => {
     const result = await app.agentLoop.runInput(input('live-tool-round'));

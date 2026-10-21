@@ -1,3 +1,4 @@
+import { normalizeHistoryImageSettings } from '../../shared/historyImages';
 import { canonicalModelProfile, loadScopedModelProfiles } from './scopedModelProfiles';
 import { hasThinkingBodyConflict } from '../../shared/sessionThinkingBody';
 import { applySessionThinkingOverride, resolveSavedSessionThinkingOverride } from '../../shared/sessionThinking';
@@ -525,6 +526,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         baseUrl: provider.baseUrl,
         openaiResponsesTransport: provider.openaiResponsesTransport,
         enableMultimodalTools,
+        historyImages: normalizeHistoryImageSettings((selectedModelConfig ?? provider).historyImages),
         systemPromptPrefix,
         maxOutputTokens,
         capabilities: clonePlain(primaryCapabilities),

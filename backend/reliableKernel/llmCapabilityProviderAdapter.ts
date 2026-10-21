@@ -1,3 +1,4 @@
+import { normalizeHistoryImageSettings } from '../../shared/historyImages';
 import { nativeSessionCapabilities } from '../../shared/nativeSessionCapabilities';
 import { providerRequestToolDefinitions } from './frozenToolDefinitions';
 import type { ReliableAgentToolDefinition } from './agentLoop';
@@ -1099,6 +1100,11 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
     id: request.modelRequestId,
     conversationId: requireText(request.conversationId, 'Provider request conversationId'),
     contents: projectedContents,
+    currentTurnImageAttachmentIds: currentTurnInputs.flatMap(input => {
+      const content = decodeFrozenCurrentTurnInput(input.content, input.contentType);
+      return (content?.parts ?? []).flatMap(part =>
+        'inlineData' in part && part.inlineData.attachmentId ? [part.inlineData.attachmentId] : []);
+    }),
     ...(readBoundary === undefined ? {} : {
       readBreakpointBeforeContentIndex: readBoundary + historyInsertions.reduce((count, insertion) =>
         count + (insertion.beforeIndex <= readBoundary! ? insertion.inputs.length + Number(insertion.reminder !== undefined) : 0), 0)
@@ -1114,6 +1120,7 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
       provider,
       modelId: request.modelId,
       systemPromptPrefix,
+      historyImages: normalizeHistoryImageSettings(authorityModel.historyImages),
       ...(turnScopedReminders ? { claudeTurnScopedReminders: true } : {}),
       // The complete generation config is frozen per ordinary request, not re-read on retry.
       ...(asRecord(authorityModel.generationConfig)
