@@ -475,7 +475,7 @@ export async function startLlmProvider(
     const headers = headersForProviderContext(
       settings,
       request.contents,
-      mergeHeaders(await resolveMaybe(options.headers), settings.headers)
+      mergeHeaders(await resolveMaybe(options.headers), geminiGatewayAuthenticationHeaders(settings), settings.headers)
     );
     const requestBody = withoutNativeServerSideCompaction(
       requestBodyWithOpenAIPromptCacheKey(settings, request.conversationId),
@@ -1714,7 +1714,7 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
   const headers = headersForProviderContext(
     runtimeSettings,
     request.contents,
-    mergeHeaders(await resolveMaybe(options.headers), runtimeSettings.headers)
+    mergeHeaders(await resolveMaybe(options.headers), geminiGatewayAuthenticationHeaders(runtimeSettings), runtimeSettings.headers)
   );
   const requestBody = withoutNativeServerSideCompaction(
     requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId),
@@ -1896,7 +1896,7 @@ async function dryRunProviderNativeCompact(
   const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
   const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
   const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, runtimeSettings.provider);
-  const headers = mergeHeaders(await resolveMaybe(options.headers), runtimeSettings.headers);
+  const headers = mergeHeaders(await resolveMaybe(options.headers), geminiGatewayAuthenticationHeaders(runtimeSettings), runtimeSettings.headers);
   const requestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
   const provider = installPlainTextToolResultCompactEncoding(unified.createLLMFromConfig({
     provider: runtimeSettings.provider,
@@ -1964,7 +1964,7 @@ export async function listLlmProviderModels(config: LlmProviderConfigRecord, opt
   const settings = normalizeSettings(config);
 
   const unified = await importUnifiedLlmProvider();
-  const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
+  const headers = mergeHeaders(await resolveMaybe(options.headers), geminiGatewayAuthenticationHeaders(settings), settings.headers);
   const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
   const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
   if (settings.provider === 'claude') {
@@ -2317,7 +2317,7 @@ async function compactWithProviderNative(
     };
     return response;
   };
-  const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
+  const headers = mergeHeaders(await resolveMaybe(options.headers), geminiGatewayAuthenticationHeaders(settings), settings.headers);
   const requestBody = requestBodyWithOpenAIPromptCacheKey(settings, request.conversationId);
   logCompressionDebug('provider.compact.openaiResponses.settings', {
     ...compactRequestDebugInfo(request),
@@ -2559,7 +2559,7 @@ async function buildAnthropicCompactionRequest(
   const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
   const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
   const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, settings.provider);
-  const configuredHeaders = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
+  const configuredHeaders = mergeHeaders(await resolveMaybe(options.headers), geminiGatewayAuthenticationHeaders(settings), settings.headers);
   const requestBody = request.nativeRequestBody ?? settings.requestBody;
   const provider = installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
     provider: libraryProviderKind(settings),
@@ -3821,7 +3821,7 @@ async function resolveSummaryProvider(
   const headers = headersForProviderContext(
     runtimeSettings,
     request.contents,
-    mergeHeaders(await resolveMaybe(options.headers), settings.headers)
+    mergeHeaders(await resolveMaybe(options.headers), geminiGatewayAuthenticationHeaders(settings), settings.headers)
   );
   const configuredRequestBody = requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId);
   const requestBody = summaryRequestBody(configuredRequestBody, reasoningPlan);
@@ -5945,6 +5945,24 @@ function normalizeHeaders(headers: unknown): LlmProviderHeadersRecord | undefine
     result[key] = String(rawValue).trim();
   }
   return Object.keys(result).length > 0 ? result : undefined;
+}
+
+/**
+ * Google Gemini accepts `x-goog-api-key`, which unified-llm-provider adds itself. Many OpenAI-style
+ * Gemini gateways authenticate the same secret as `x-api-key` instead. Send that compatibility
+ * header only to non-Google endpoints; an explicit channel header still wins during merge.
+ */
+function geminiGatewayAuthenticationHeaders(settings: LlmProviderConfigRecord): LlmProviderHeadersRecord | undefined {
+  const apiKey = settings.apiKey?.trim();
+  if (settings.provider !== 'gemini' || !apiKey) return undefined;
+  try {
+    const hostname = new URL(settings.baseUrl).hostname.toLowerCase();
+    if (hostname === 'googleapis.com' || hostname.endsWith('.googleapis.com')
+      || hostname === 'googleapis.cn' || hostname.endsWith('.googleapis.cn')) return undefined;
+  } catch {
+    // normalizeSettings reports malformed URLs at the request boundary; treat an unknown host as a gateway here.
+  }
+  return { 'x-api-key': apiKey };
 }
 
 function mergeHeaders(...records: Array<Record<string, string> | undefined>): LlmProviderHeadersRecord | undefined {
