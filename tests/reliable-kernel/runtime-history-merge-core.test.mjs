@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import test, { before, after } from 'node:test';
 import { openFullRuntime } from './runtime-dataset-merge-full-runtime.mjs';
+import { createPublishedRuntime } from './fixtures/ci-storage-upgrade.mjs';
 import {
   compiled, load, kernel, Database, NOW, MESSAGE_TYPE, repo, schemas, conversation, terminatedTurn,
   identity, loosePath, createHome, read, raw, insert, insertMessage, content, seed, packedMessage,
@@ -194,6 +195,47 @@ test('冲突、待投递与有归属工作局部剔除，无归属工作整份�
   const automatic = await merge(home, [source], { requested: false });
   assert.equal(automatic.merged.length, 0);
   assert.equal((await ledger(home, source)).updatedAt, record.updatedAt);
+});
+
+for (const [state, key] of [['partial', 'a'], ['blocked', 'b']]) test(`旧库格式升级后${state}残留不自动重扫，手动与重新登记重试仍可用`, async t => {
+  const scopeKey = `folder-${key.repeat(64)}`;
+  const fixture = await createPublishedRuntime(6, { configurationRoot: home.root, workspaceScope: scopeKey });
+  const source = { id: `workspace:${scopeKey}` };
+  const code = 'runtime-data-set-merge-conflict';
+  const excluded = [{ conversationId: fixture.conversationId, title: fixture.title, code, count: 1 }];
+  await mergeLedger.writeRuntimeDataSetMergeLedgerRecord(home.paths, {
+    candidateId: source.id, source: { ...identity(fixture.previous), rootGeneration: fixture.previous.rootGeneration,
+      pointerRevision: fixture.previous.pointerRevision, contentDigest: 'before-format-upgrade' },
+    target: identity(home.database.binding), state,
+    ...(state === 'partial' ? { excluded, mergedAt: NOW, insertedRows: 0, reusedRows: 1, insertedConversations: 0 }
+      : { code, message: '已有冲突' })
+  });
+  const residual = { id: source.id, sourceKind: 'local', location: { kind: 'local', candidateId: source.id },
+    identity: identity(fixture.previous), code, message: '已有冲突', checkedAt: NOW };
+  await histories.writeRuntimeHistoryResidual(home.paths, residual);
+  const upgraded = await load('runtimeDataSetUpgrade.js').upgradeRuntimeDataSet(home.paths, {
+    candidateId: source.id, expectedDataSetId: fixture.previous.dataSetId, expectedRootInstanceId: fixture.previous.rootInstanceId
+  });
+  assert.equal(upgraded.previousEpoch, 6);
+  const before = await ledger(home, source);
+  const options = { sizeLimits: { transactionRows: 1 } };
+  const fingerprint = mergeLedger.runtimeDataSetFingerprint;
+  const probe = t.mock.method(mergeLedger, 'runtimeDataSetFingerprint', fingerprint);
+  let started = 0;
+  const automatic = await merge(home, [source], { ...options, requested: false, onWorkStart() { started++; } });
+  clean(automatic);
+  assert.deepEqual([automatic.pendingSources, automatic.merged.length, started], [0, 0, 0]);
+  assert.deepEqual(await ledger(home, source), before);
+  assert.deepEqual((await histories.readRuntimeHistoryResidual(home.paths)).get(source.id), residual);
+  assert.equal(probe.mock.callCount(), 0, 'skip before reading or hashing historical content');
+  probe.mock.restore();
+
+  const manual = await merge(home, [source], options);
+  assert.equal(manual.deferred[0]?.code, 'runtime-data-set-merge-awaiting-exclusive');
+  await histories.requeueRuntimeHistoryResidual(home.paths, source.id, { id: source.id, sourceKind: 'local',
+    location: residual.location, identity: residual.identity, reason: '用户重新核验', registeredAt: NOW });
+  const queued = await merge(home, [source], { ...options, requested: false });
+  assert.equal(queued.deferred[0]?.code, 'runtime-data-set-merge-awaiting-exclusive');
 });
 
 test('来源坏正文局部剔除，目标已有坏正文保持原字节', async () => {
