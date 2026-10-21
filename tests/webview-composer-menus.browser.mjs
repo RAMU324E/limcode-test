@@ -38,11 +38,11 @@ environments.environmentSelectionForConversation = () => ({ allowed, error: '工
 environments.workEnvironmentEnabledForConversation = () => true;
 feed.projections = { activeConversationWindow: { conversationId: 'self' } };
 feed.sessionId = 'feed'; feed.synchronizeCollaborationHistoryScope('self', true);
-feed.collaborationHistoryNextBeforeCursor = { kind: 'message' };
+feed.collaborationHistoryNextBeforeCursor = { kind: 'message' }; feed.collaborationHistoryHasMoreBefore = true;
 feed.collaborationHistoryLoadedPages = 1;
 const posted = [];
 window.fixture = { client, settings, feed, mode, posted, hold: false, pages: 0, errors: false,
-  resetHistory() { feed.synchronizeCollaborationHistoryScope('self', true); feed.collaborationHistoryNextBeforeCursor = { kind: 'message' }; feed.collaborationHistoryLoadedPages = 1; this.pages = 0; },
+  resetHistory() { feed.synchronizeCollaborationHistoryScope('self', true); feed.collaborationHistoryNextBeforeCursor = { kind: 'message' }; feed.collaborationHistoryHasMoreBefore = true; feed.collaborationHistoryLoadedPages = 1; this.pages = 0; },
   messagePage(records, sequence, scannedRows = 4096) {
     const rows = records.CollaborationMessage ?? [];
     const newest = rows.reduce((value, row) => !value || BigInt(row.message_seq) > BigInt(value.message_seq) ? row : value, null);
