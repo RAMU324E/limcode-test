@@ -2972,6 +2972,7 @@ function readContextChain(
   count: number
 ): Array<Record<string, unknown>> {
   if (count <= 0) throw new Error('Context chain with a start node requires a positive segment count.');
+  // Start with this bounded chain; reordering these joins can scan every stored segment.
   const rows = prepareCached(database, `
     WITH RECURSIVE chain(id, parent_node_id, segment_id, created_at, depth) AS (
       SELECT id, parent_node_id, segment_id, created_at, 1
@@ -2999,8 +3000,8 @@ function readContextChain(
            content.created_at AS content_created_at,
            chain.depth AS depth
       FROM chain
-      JOIN context_segment AS segment ON segment.id = chain.segment_id
-      JOIN content_object AS content ON content.id = segment.content_object_id
+      CROSS JOIN context_segment AS segment ON segment.id = chain.segment_id
+      CROSS JOIN content_object AS content ON content.id = segment.content_object_id
      ORDER BY chain.depth DESC
   `).all({ startNodeId, segmentCount: BigInt(count) }) as Array<Record<string, unknown>>;
   if (rows.length !== count) throw new Error(`Context chain expected ${count} nodes, found ${rows.length}.`);
