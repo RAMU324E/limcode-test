@@ -80,7 +80,8 @@ async function pageFor(t) {
     window.fixtureMessages = [];
     window.acquireVsCodeApi = () => ({ postMessage(message) { window.fixtureMessages.push(structuredClone(message)); }, getState() {}, setState() {} });
   });
-  await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/settings-layout-fixture`, { waitUntil: 'networkidle' });
+  await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/settings-layout-fixture`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.locator('.llm-generation-settings').waitFor({ timeout: 30000 });
   return page;
 }
 async function shot(page, name) {
