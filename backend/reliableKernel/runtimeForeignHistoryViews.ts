@@ -121,7 +121,7 @@ export async function liveRuntimeHistoryViews(configurationRootPath: string, id:
       live += 1;
       continue;
     }
-    const state = inspectRecordedProcess(record.processId, record.processStartIdentity).state;
+    const state = (await inspectRecordedProcess(record.processId, record.processStartIdentity)).state;
     if (state === 'dead') await fs.rm(file, { force: true }).catch(() => undefined);
     else live += 1;
   }

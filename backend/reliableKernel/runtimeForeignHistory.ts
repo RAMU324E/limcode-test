@@ -1558,7 +1558,7 @@ async function assertForeignHostsGone(directory: string, container: string, held
       throw await readProblem(error, container, 'foreign-history-hosts-unreadable', '无法确认没有 LimCode 窗口在使用它。');
     }
   }
-  const active = judgeRuntimeHostLivenessRecords(records);
+  const active = await judgeRuntimeHostLivenessRecords(records);
   const malformed = active.filter((host) => host.state === 'malformed');
   if (malformed.length > 0) {
     throw new ForeignRuntimeHistoryRejection('failed', 'foreign-history-host-record',

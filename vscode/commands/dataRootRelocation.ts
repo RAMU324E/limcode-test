@@ -81,7 +81,7 @@ export async function relocateDataRoot(context: vscode.ExtensionContext, startup
   }
   const ask: Ask = (prompt) => askInSettingsPage(host, clientId, prompt);
   const status = await loadCommittedGlobalStatus(context);
-  if (status.pendingRelocation && ownerOf(status.pendingRelocation) !== 'dead') {
+  if (status.pendingRelocation && (await ownerOf(status.pendingRelocation)) !== 'dead') {
     if (!isOwnPending(status.pendingRelocation) || relocationRunning) {
       // Another window's relocation that failed and whose undo did not finish moves nothing: say so.
       if (!relocationRunning && await relocationPhase(status.pendingRelocation) === 'unfinished') {
@@ -1053,7 +1053,7 @@ export async function beforeDataRootOpen(context: vscode.ExtensionContext): Prom
   const status = await loadCommittedGlobalStatus(context);
   const pending = status.pendingRelocation;
   if (!pending) return undefined;
-  const owner = ownerOf(pending);
+  const owner = await ownerOf(pending);
   if (owner === 'dead') {
     await settleInterruptedRelocation(context, pending);
     return undefined;
@@ -1195,7 +1195,7 @@ function previousDataRoot(status: LimCodeGlobalStatus, current: string): string 
   return previous && sameFsPath(previous.toPath, current) && !sameFsPath(previous.fromPath, current) ? previous.fromPath : undefined;
 }
 
-function ownerOf(pending: PendingDataRootRelocation): 'alive' | 'dead' | 'unknown' {
+function ownerOf(pending: PendingDataRootRelocation): Promise<'alive' | 'dead' | 'unknown'> {
   return dataRootRelocationOwnerState({
     processId: pending.processId, ...(pending.processStartIdentity ? { processStartIdentity: pending.processStartIdentity } : {})
   });

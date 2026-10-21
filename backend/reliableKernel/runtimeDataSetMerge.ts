@@ -3996,7 +3996,7 @@ async function pruneTargetBackups(target: TargetContext, keep: readonly string[]
   const registered = await readRuntimeLargeMergeTargetBackups({ globalStoragePath: target.configurationRootPath })
     .catch(() => [] as Array<{ backup?: RuntimeLargeMergeTargetBackup }>);
   for (const { backup } of registered) {
-    if (backup && path.resolve(path.dirname(backup.backupPath)) === path.resolve(backups) && isRuntimeLargeMergeTargetBackupLive(backup)) {
+    if (backup && path.resolve(path.dirname(backup.backupPath)) === path.resolve(backups) && (await isRuntimeLargeMergeTargetBackupLive(backup))) {
       held.add(backup.name);
     }
   }
@@ -4016,7 +4016,7 @@ async function pruneTargetBackups(target: TargetContext, keep: readonly string[]
 async function pruneMergePreparations(paths: { globalStoragePath: string }): Promise<void> {
   await pruneRuntimeDataSetMergePreparations(paths);
   for (const { file, backup } of await readRuntimeLargeMergeTargetBackups(paths)) {
-    if (backup && isRuntimeLargeMergeTargetBackupLive(backup)) continue;
+    if (backup && (await isRuntimeLargeMergeTargetBackupLive(backup))) continue;
     if (backup && !backup.used && !await removeRegisteredTargetBackup(backup).then(() => true, () => false)) continue;
     await removeRuntimeLargeMergeTargetBackupFile(paths, file);
   }
