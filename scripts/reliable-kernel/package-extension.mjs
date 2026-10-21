@@ -2,6 +2,7 @@ import childProcess from 'node:child_process';
 import path from 'node:path';
 import process from 'node:process';
 import { createVSIX } from '@vscode/vsce';
+import { prepareSharpRuntime } from './sharp-package-runtime.mjs';
 
 const targets = ['linux-x64', 'win32-x64', 'darwin-x64', 'darwin-arm64'];
 const args = process.argv.slice(2);
@@ -38,6 +39,8 @@ const pruning = childProcess.spawnSync(process.execPath, ['scripts/reliable-kern
 });
 if (pruning.error) throw pruning.error;
 if (pruning.status !== 0) process.exit(pruning.status ?? 1);
+
+prepareSharpRuntime(root);
 
 for (const packageTarget of all ? targets : [target]) {
   const packagePath = output ? path.resolve(root, output.replaceAll('{target}', packageTarget ?? 'universal')) : undefined;

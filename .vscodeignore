@@ -6,6 +6,7 @@ output/**
 .github/**
 .claude/**
 .codex/**
+.codestable/**
 .iris/**
 backend/**
 shared/**

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import { readZipArchive } from './lib/zip-archive.mjs';
+import { sharpRuntimeRequiredFiles } from './sharp-package-runtime.mjs';
 
 const root = process.cwd();
 const artifact = option('artifact');
@@ -40,6 +41,7 @@ const forbidden = [
   },
   { id: '内部架构文档', match: (file) => /(^|\/)docs\/architecture\//.test(file) },
   { id: '内部工具报告', match: (file) => /(^|\/)\.ide-tool-test\//.test(file) },
+  { id: '本地开发工具配置', match: (file) => /^\.codestable\//.test(file) },
   { id: '存储研究资料', match: (file) => /^limcode-storage-topology-research\//.test(file) },
   { id: 'TypeScript或Vue源码', match: (file) => /^(backend|shared|vscode|webview)\/.*\.(?:ts|tsx|vue)$/.test(file) },
   { id: '嵌套VSIX', match: (file) => file.endsWith('.vsix') },
@@ -59,6 +61,11 @@ const required = [
   'node_modules/better-sqlite3/prebuilds/darwin-x64.node',
   'node_modules/better-sqlite3/prebuilds/darwin-arm64.node'
 ];
+try {
+  required.push(...sharpRuntimeRequiredFiles(listing.sharpManifest));
+} catch (error) {
+  failures.push(`无法确定sharp运行时必需文件：${error.message}`);
+}
 for (const file of required) if (!files.includes(file)) failures.push(`安装包缺少必需文件：${file}`);
 if (!sqliteBinding?.includes("process.report?.getReport?.()?.header")
   || !sqliteBinding.includes("fs.existsSync('/lib/ld-musl-' + loader + '.so.1')")) {
@@ -93,6 +100,7 @@ function listWorkspaceCandidateFiles() {
   return {
     files: lines(result.stdout),
     manifest: JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')),
+    sharpManifest: JSON.parse(fs.readFileSync(path.join(root, 'node_modules/sharp/package.json'), 'utf8')),
     sqliteBinding: fs.readFileSync(path.join(root, 'node_modules/better-sqlite3/lib/binding.js'), 'utf8')
   };
 }
@@ -112,6 +120,7 @@ function listArtifactFiles(relativeArtifactPath) {
         .map((file) => file.replace(/^extension\//, ''))
         .filter((file) => file && file !== '[Content_Types].xml' && file !== 'extension.vsixmanifest'),
       manifest: JSON.parse(manifestBytes.toString('utf8')),
+      sharpManifest: JSON.parse(archive.read('extension/node_modules/sharp/package.json')?.toString('utf8') ?? 'null'),
       sqliteBinding: archive.read('extension/node_modules/better-sqlite3/lib/binding.js')?.toString('utf8')
     };
   } catch (error) {
