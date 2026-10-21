@@ -561,7 +561,7 @@ export async function startLlmProvider(
         // 明确的不支持参数 400：按目标记住适配后立即重发；不占普通重试次数，也不等待。
         // 只有本次尝试还没发出任何事件时才立即重发；已经发出输出的，只记住给之后的请求，本次照常报错。
         if (!retryControl.cancelRequested && adaptationRetry.shouldRetryImmediately(failure.rawError) && !attemptEmitted) continue;
-        failure = withUserRequestBodyRejection(failure, adaptationRetry, settings);
+        failure = withGeminiHttpFailureDiagnostic(withUserRequestBodyRejection(failure, adaptationRetry, settings), settings);
         const nextRetryCount = retryCount + 1;
         // 接入库标明不可重试的错误（如 finish_reason=length 截断的工具参数）原样重发只会再失败一次。
         const canRetry = retryEnabled
@@ -1495,6 +1495,22 @@ function emitRetryRecovered(requestId: string, emit: Emit, notice: LlmAttemptRet
 
 function hasUnifiedError(value: unknown): value is { error: unknown; rawResponse?: unknown; rawChunk?: unknown } {
   return isRecord(value) && value.error !== undefined && value.error !== null;
+}
+
+/** 405 只证明该请求的方法未被接受；提示检查配置与路由，不据此改协议、模型或重试分类。 */
+function withGeminiHttpFailureDiagnostic(
+  failure: LlmAttemptFailure,
+  settings: Pick<LlmProviderConfigRecord, 'provider' | 'model' | 'stream'>
+): LlmAttemptFailure {
+  if (settings.provider !== 'gemini' || failure.rawError?.status !== 405) return failure;
+  const action = settings.stream !== false ? 'streamGenerateContent' : 'generateContent';
+  const modelPathHint = settings.model.includes('/')
+    ? ' 模型 ID 含有 /，请确认网关路由能接收完整模型路径；客户端会保留这些路径分隔符。'
+    : '';
+  return {
+    ...failure,
+    message: `${failure.message}\nGemini HTTP 405：服务未接受 POST models/<model>:${action}。请核对渠道协议、Base URL 的 API 版本前缀及网关 POST 路由；仅凭 405 不能确定具体原因。${modelPathHint}`
+  };
 }
 
 function failureFromCaughtError(error: unknown): LlmAttemptFailure {
