@@ -183,6 +183,72 @@ test('真实model编辑器的排队Save只接受自己的ACK，thinking控件写
   assert.doesNotThrow(() => structuredClone(inherit.payload));
 });
 
+test('Agent 模型下拉展示渠道默认配置，切换渠道重置模型且选择只修改草稿', async t => {
+  const f = channelSettings(t);
+  const { view } = f.mount('Model', { scopeKind: 'agent', scopeId: 'worker' });
+  const read = f.last(T.ModelProfileScopeRead);
+  f.models.applyScopeSnapshot({ ...modelSnapshot('worker', 1), scopeKind: 'agent' }, read.id);
+  assert.equal(view.isInheritSelected, true);
+  assert.match(view.modelOptions[0].label, /渠道默认配置/);
+  view.selectedProviderConfigId = 'B';
+  assert.equal(view.model, 'B-one');
+  assert.equal(view.modelOptions[0].value, 'B-one');
+  assert.match(view.modelOptions[0].label, /渠道默认配置/);
+  assert.ok(view.modelOptions.some(option => option.value === 'B-two'));
+  view.model = 'B-two';
+  view.selectedProviderConfigId = 'A';
+  assert.equal(view.model, 'A-one', '不能把另一个渠道的模型带入新渠道');
+  assert.equal(f.global.llm.activeProviderConfigId, 'A');
+  assert.equal(f.messagesOf(T.ModelProfileScopeSet).length, 0);
+  view.save();
+  const saved = f.last(T.ModelProfileScopeSet);
+  assert.equal(saved.payload.scopeKind, 'agent');
+  assert.equal(saved.payload.scopeId, 'worker');
+  assert.equal(saved.payload.providerConfigId, 'A');
+  assert.equal(saved.payload.model, 'A-one');
+});
+
+test('Agent 从选中渠道获取并添加模型，不改变全局渠道或默认模型', async t => {
+  const f = channelSettings(t);
+  const { view } = f.mount('Model', { scopeKind: 'agent', scopeId: 'worker' });
+  view.selectedProviderConfigId = 'B';
+  view.fetchModels();
+  const request = f.last(T.LlmProviderModelsGet);
+  assert.equal(request.payload.config.id, 'B');
+  assert.equal(view.modelFetchDialog.loading, true);
+  f.global.applyLlmProviderModelsSnapshot(modelListResponse(request, 'B-fetched'), request.id);
+  assert.equal(view.modelFetchDialog.loading, false);
+  view.addFetchedModels(view.modelFetchDialog.models);
+  assert.equal(f.global.fetchedModelsDialog.open, false);
+  assert.ok(view.modelOptions.some(option => option.value === 'B-fetched'));
+  assert.equal(view.model, 'B-one', '添加模型不隐式选中它');
+  assert.equal(f.global.llm.activeProviderConfigId, 'A');
+  const config = f.global.llmProviderConfigs.configs.find(item => item.id === 'B');
+  assert.equal(config.model, 'B-one');
+  view.confirmManualModel(' B-custom ');
+  assert.equal(view.model, 'B-custom');
+  assert.ok(config.models.some(item => item.id === 'B-custom'));
+  assert.equal(config.model, 'B-one');
+  assert.equal(f.global.llm.activeProviderConfigId, 'A');
+});
+
+test('Agent 获取模型时切换渠道或 Agent 关闭旧弹窗，迟到响应不改新目标', async t => {
+  const f = channelSettings(t);
+  const mounted = f.mount('Model', { scopeKind: 'agent', scopeId: 'worker' }), { view } = mounted;
+  view.selectedProviderConfigId = 'B'; view.fetchModels();
+  const old = f.last(T.LlmProviderModelsGet);
+  view.selectedProviderConfigId = 'A';
+  assert.equal(f.global.fetchedModelsDialog.open, false);
+  f.global.applyLlmProviderModelsSnapshot(modelListResponse(old, 'B-late'), old.id);
+  assert.equal(view.model, 'A-one');
+  assert.ok(!view.modelOptions.some(option => option.value === 'B-late'));
+  view.fetchModels();
+  view.manualModelOpen = true;
+  await mounted.setProps({ scopeId: 'another-agent' });
+  assert.equal(f.global.fetchedModelsDialog.open, false);
+  assert.equal(view.manualModelOpen, false);
+});
+
 test('新root重连保留草稿，迟到旧保存与错误不恢复旧scope', async t => {
   const f = graph.session(t), release = activate(f, 'root-change'); t.after(release);
   f.models.setThinkingForScope('root-change', { providerConfigId: 'provider', provider: 'openai-compatible', model: 'o3' }, { kind: 'openai-effort', value: 'high' });

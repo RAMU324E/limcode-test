@@ -10,16 +10,19 @@ const entry = `
 import { createApp, h, reactive, ref } from 'vue';
 import { createPinia } from 'pinia';
 import Panel from '/src/components/settings/GlobalSettingsPanel.vue';
+import ModelProfileScopeEditor from '/src/components/settings/config/ModelProfileScopeEditor.vue';
 import InputPanel from '/src/components/ui/InputPanel.vue';
 import { useGlobalSettingsStore } from '/src/stores/useGlobalSettingsStore';
 import { useClientStateStore } from '/src/stores/useClientStateStore';
+import { useModelProfileStore } from '/src/stores/useModelProfileStore';
 import { GLOBAL_SETTINGS_SECTIONS, createDefaultLlmCompressionConfig } from '@shared/protocol';
 import '/src/theme/tokens.css'; import '/src/theme/base.css';
 import '/src/theme/motion/dialog.css'; import '/src/theme/motion/dropdown.css'; import '/src/theme/motion/collapse.css';
 const pinia = createPinia(), mode = ref('settings'), confirmed = [];
 const inputProps = reactive({ open: true, title: '名称校验', label: '名称', initialValue: 'duplicate', required: true,
   validate: value => value === 'duplicate' ? '名称已存在' : '' });
-const app = createApp({ setup: () => () => mode.value === 'settings' ? h(Panel) : h(InputPanel, {
+const app = createApp({ setup: () => () => mode.value === 'settings' ? h(Panel)
+  : mode.value === 'model' ? h(ModelProfileScopeEditor, { scopeKind: 'agent', scopeId: 'worker', title: 'Agent 默认 LLM' }) : h(InputPanel, {
   ...inputProps, onConfirm: value => confirmed.push(value), onCancel: () => inputProps.open = false }) });
 app.use(pinia);
 const settings = useGlobalSettingsStore(pinia), client = useClientStateStore(pinia);
@@ -36,7 +39,7 @@ for (const section of GLOBAL_SETTINGS_SECTIONS) settings.applySnapshot({ section
 client.toolDefinitions = [{ id: 'edit', name: 'edit', description: '修改文件内容', parameters: {}, execution: 'immediate', source: { kind: 'builtin' } }];
 client.toolPolicies = [{ id: 'policy', name: '测试策略', preset: 'custom', allowedTools: ['edit'], toolConfigs: { edit: { autoSubmitResult: false, config: {} } } }];
 client.toolPolicyScopeLinks = [{ id: 'link', scopeKind: 'global', toolPolicyId: 'policy', role: 'active', createdAt: 1, updatedAt: 1 }];
-window.fixture = { settings, client, mode, inputProps, confirmed };
+window.fixture = { settings, client, mode, inputProps, confirmed, models: useModelProfileStore(pinia) };
 app.mount('#app');
 `;
 const theme = `:root {
@@ -87,6 +90,54 @@ async function pageFor(t) {
 async function shot(page, name) {
   if (screenshotDir) await page.screenshot({ path: path.join(screenshotDir, name + '.png'), animations: 'disabled' });
 }
+
+test('Agent 模型可下拉选择并获取，默认显示选中渠道的默认配置', async t => {
+  const p = await pageFor(t);
+  await p.setViewportSize({ width: 400, height: 900 });
+  await p.evaluate(() => {
+    const { settings, mode } = window.fixture;
+    settings.llmProviderConfigs.configs.push({ ...settings.llmProviderConfigs.configs[0], id: 'agent-target', name: 'Agent 渠道',
+      provider: 'gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', model: 'gemini-3.8-flash',
+      models: [{ id: 'gemini-3.8-flash', name: 'Flash' }, { id: 'gemini-3.1-pro-preview', name: 'Pro' }] });
+    mode.value = 'model';
+  });
+  const editor = p.locator('.model-profile-editor');
+  await editor.waitFor();
+  await p.evaluate(() => {
+    const read = window.fixtureMessages.findLast(message => message.type === 'modelProfile.scope.read');
+    window.fixture.models.applyScopeSnapshot({ scopeKind: 'agent', scopeId: 'worker', authorityId: 'fixture', sessionId: 'worker',
+      revision: '1', sequence: 1, outcome: 'observed', profileState: 'absent' }, read.id);
+  });
+  const source = editor.locator('.model-profile-grid .settings-dropdown-button').nth(0);
+  const model = editor.locator('.model-profile-grid .settings-dropdown-button').nth(1);
+  await source.click(); await p.getByRole('option', { name: /Agent 渠道/ }).click();
+  assert.match(await model.innerText(), /渠道默认配置.*gemini-3\.8-flash/);
+  assert.equal(await p.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth), true);
+  await shot(p, 'agent-model-default-400');
+  await editor.getByRole('button', { name: '获取模型', exact: true }).click();
+  const dialog = p.getByRole('dialog', { name: '选择要添加的 LLM' });
+  await dialog.waitFor();
+  await p.evaluate(() => {
+    const request = window.fixtureMessages.findLast(message => message.type === 'llm.providerModels.get');
+    const config = request.payload.config;
+    window.fixture.settings.applyLlmProviderModelsSnapshot({ configId: config.id, provider: config.provider, baseUrl: config.baseUrl,
+      models: [{ id: 'gemini-new-option', name: '获取的新模型' }] }, request.id);
+  });
+  await dialog.locator('.model-fetch-loading').waitFor({ state: 'hidden' });
+  await shot(p, 'agent-model-fetched-400');
+  await dialog.getByRole('button', { name: /获取的新模型/ }).click();
+  await dialog.getByRole('button', { name: '添加（1）', exact: true }).click();
+  await dialog.waitFor({ state: 'hidden' });
+  await model.click(); await p.getByRole('option', { name: /获取的新模型/ }).click();
+  await editor.getByRole('button', { name: '保存 LLM 配置', exact: true }).click();
+  const saved = await p.evaluate(() => window.fixtureMessages.findLast(message => message.type === 'modelProfile.scope.set'));
+  assert.equal(saved.payload.providerConfigId, 'agent-target');
+  assert.equal(saved.payload.model, 'gemini-new-option');
+  assert.equal(saved.payload.scopeId, 'worker');
+  const defaults = await p.evaluate(() => ({ active: window.fixture.settings.llm.activeProviderConfigId,
+    model: window.fixture.settings.llmProviderConfigs.configs.find(item => item.id === 'agent-target').model }));
+  assert.deepEqual(defaults, { active: 'provider', model: 'gemini-3.8-flash' });
+});
 
 test('图片发送开关独立并默认开启，关闭保留数字与选择，模型复制及保存保留确切值', async t => {
   const p = await pageFor(t);
