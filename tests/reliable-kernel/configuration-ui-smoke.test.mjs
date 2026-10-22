@@ -507,6 +507,46 @@ for (const targetId of ['A', 'B']) test(`获取模型的新请求${targetId}不�
   assert.equal(f.global.fetchedModelsDialog.open, false);
 });
 
+test('未知 Gemini 模型默认可选思考等级，官方地址与网关一致且不写入默认值', async t => {
+  const f = channelSettings(t), emitted = [];
+  const base = { ...f.global.activeLlmProviderConfig, provider: 'gemini', generationConfig: {} };
+  const parameters = f.mount('Parameters', { config: base,
+    'onUpdate-generation-config': value => emitted.push(value) });
+  const { validateSessionThinkingOverride } = compiled('shared/sessionThinking.js');
+  for (const model of ['gemini-4-argon', 'gemini-flash-latest']) {
+    for (const baseUrl of ['https://generativelanguage.googleapis.com',
+      'https://generativelanguage.googleapis.com/v1beta/', 'https://relay.invalid/v1beta']) {
+      const config = { ...base, model, baseUrl };
+      await parameters.setProps({ config });
+      assert.equal(emitted.length, 0, '显示选项不自动写入思考参数');
+      const level = parameters.view.definitions.find(item => item.key === 'thinkingLevel');
+      assert.deepEqual(level?.options.map(item => item.value), ['minimal', 'low', 'medium', 'high'], `${model} ${baseUrl}`);
+      assert.equal(parameters.view.definitions.some(item => item.key === 'thinkingBudget'), false);
+      parameters.view.updateKnownValue(level, 'high');
+      assert.equal(parameters.view.jsonError, '');
+      assert.deepEqual(emitted.pop(), { thinkingConfig: { thinkingLevel: 'high' } });
+      const override = { kind: 'gemini-level', value: 'high' };
+      assert.deepEqual(validateSessionThinkingOverride(override, 'gemini', model, {}, undefined, config), override);
+    }
+  }
+  for (const [model, levels, budget] of [
+    ['gemini-3-pro-preview', ['low', 'high'], false],
+    ['gemini-3.8-flash', ['low', 'medium', 'high'], false],
+    ['gemini-2.5-pro', [], true]
+  ]) {
+    await parameters.setProps({ config: { ...base, model, baseUrl: 'https://generativelanguage.googleapis.com/v1beta' } });
+    const level = parameters.view.definitions.find(item => item.key === 'thinkingLevel');
+    assert.deepEqual(level?.options.map(item => item.value) ?? [], levels);
+    assert.equal(parameters.view.definitions.some(item => item.key === 'thinkingBudget'), budget);
+  }
+  await parameters.setProps({ config: { ...base, model: 'gemini-4-argon',
+    baseUrl: 'https://generativelanguage.googleapis.com', generationConfig: { thinkingConfig: { thinkingBudget: 1024 } } } });
+  const budget = parameters.view.definitions.find(item => item.key === 'thinkingBudget');
+  assert.ok(budget, '已有预算保留供清除');
+  parameters.view.removeKnownParameter(budget);
+  assert.equal(emitted.pop(), undefined);
+});
+
 test('专业参数编辑挂载不写默认，数值清空不落为0，思考档位复用能力集合', async t => {
   const f = channelSettings(t), emitted = [];
   const config = { ...f.global.activeLlmProviderConfig, model: 'gpt-6-astra' };
