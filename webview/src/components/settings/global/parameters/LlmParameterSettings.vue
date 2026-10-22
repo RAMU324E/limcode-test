@@ -43,6 +43,7 @@ const supportedDefinitions = computed(() => {
     if (definition.key === 'topK'
       && props.config.provider === 'claude' && anthropicRejectsNonDefaultSampling(props.config.model)) return false;
     if (definition.path[0] !== 'thinkingConfig') return true;
+    if (definition.key === 'thinkingBudget' && thinking?.kind === 'gemini-level') return false;
     if (props.config.provider === 'openai-compatible'
       && resolveProviderOpenAICompatibleDialect(props.config, props.config.model).format === 'omit') return false;
     if (thinking && 'min' in thinking && definition.key === 'thinkingLevel') {

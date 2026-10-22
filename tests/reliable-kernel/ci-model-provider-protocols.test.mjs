@@ -212,6 +212,21 @@ test('Claude 网关拒绝 clear_at 后只给原目标记住尾巴模式', () => 
   assert.deepEqual(tail, [user('q'), model([{ text: 'a' }]), user('current')]);
 });
 
+test('未知 Gemini 模型显式选择的思考等级按原值发送，未设置时不填入等级', async () => {
+  const { validateSessionThinkingOverride, applySessionThinkingOverride } = load('shared/sessionThinking.js');
+  const config = settings('gemini', { model: 'gemini-4-argon',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta' });
+  for (const value of ['minimal', 'low', 'medium', 'high']) {
+    const override = validateSessionThinkingOverride({ kind: 'gemini-level', value }, 'gemini', config.model,
+      undefined, undefined, config);
+    const request = await wire({ ...config, generationConfig: applySessionThinkingOverride(undefined, override) });
+    assert.equal(request.body.generationConfig.thinkingConfig.thinkingLevel, value);
+  }
+  assert.throws(() => validateSessionThinkingOverride({ kind: 'gemini-level', value: 'none' }, 'gemini', config.model));
+  const request = await wire(config);
+  assert.equal(request.body.generationConfig?.thinkingConfig?.thinkingLevel, undefined);
+});
+
 test('Gemini 自定义网关复用渠道 Key 发送 x-api-key，Google 官方端点保持原认证头', async () => {
   const gateway = settings('gemini', { apiKey: 'offline-gateway-key' });
   const gatewayRequest = startRequest([user('auth')]);

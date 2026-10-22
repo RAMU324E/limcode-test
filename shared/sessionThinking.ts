@@ -33,7 +33,8 @@ export function sessionThinkingCapability(provider: LlmProviderKind, modelId: st
   const model = modelId.toLowerCase().replace(/^models\//, '');
   if (provider === 'gemini') {
     const capability = geminiThinkingCapabilityForModel(model);
-    if (capability.kind === 'thinkingLevel') return { kind: 'gemini-level', values: capability.levels };
+    // 未识别的 Gemini 模型沿用通用等级；只有用户显式选择时才发送覆盖。
+    if (capability.kind === 'thinkingLevel' || capability.kind === 'unknown') return { kind: 'gemini-level', values: capability.levels };
     if (capability.kind === 'thinkingBudget' && !/image|audio|tts|live/.test(model)) {
       if (model.includes('pro')) return { kind: 'gemini-budget', min: 128, max: 32768, automatic: -1 };
       if (model.includes('flash')) return { kind: 'gemini-budget', min: model.includes('lite') ? 512 : 1, max: 24576, automatic: -1, allowZero: true };
