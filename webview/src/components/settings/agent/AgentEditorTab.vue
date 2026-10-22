@@ -72,7 +72,7 @@ function explainDeleteRestriction(): void { const agent = activeAgent.value; if 
       <span class="agent-pill">{{ activeAgent.source === 'builtin' ? '内置' : '用户' }}</span>
     </div>
 
-    <AgentCollaborationSettings v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="当前 Agent 协作设置" />
+    <ModelProfileScopeEditor v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 默认 LLM" description="当对话、工作流或本次运行没有单独设置时使用。" />
 
     <label v-if="activeAgent" class="global-settings-field global-settings-field-wide">
       <span>Agent 描述</span>
@@ -81,10 +81,10 @@ function explainDeleteRestriction(): void { const agent = activeAgent.value; if 
 
     <SystemPromptScopeEditor v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 角色提示词" description="按全局 → Agent → 工作流 → 对话 → 本次运行的顺序拼接。这里定义这个 Agent 的角色。" />
     <RuntimeContextScopeEditor v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 初始上下文模板" description="用于生成 Agent 新对话的初始上下文；变量只在首次启动时替换一次。" />
-    <ModelProfileScopeEditor v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 默认 LLM" description="当对话、工作流或本次运行没有单独设置时使用。" />
+    <WorkEnvironmentPolicyEditor v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 工作环境策略" description="限制这个 Agent 可使用的工作环境。" />
     <ToolPolicyEditor v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 工具能力上限" description="Agent 的工具策略决定能力上限；工作流、对话和本次运行只能继续收窄，不能扩大。" />
     <SkillPolicyEditor v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 技能策略" description="限制这个 Agent 可使用的技能；未配置时继承全局技能策略。" />
-    <WorkEnvironmentPolicyEditor v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 工作环境策略" description="限制这个 Agent 可使用的工作环境。" />
+    <AgentCollaborationSettings v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="当前 Agent 协作设置" />
     <CheckpointPolicyEditor v-if="CHECKPOINT_FEATURE_ENABLED && activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 存档点策略" description="限制这个 Agent 创建存档点的时机和内部仓库的文件过滤规则。" />
 
     <p class="global-settings-status">{{ agentStore.status }}</p>
