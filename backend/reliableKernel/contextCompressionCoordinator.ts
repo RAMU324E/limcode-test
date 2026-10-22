@@ -4,7 +4,7 @@ import { freezeToolDefinitions, resolveFrozenToolDefinitions } from './frozenToo
 import { resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
 import { createHash } from 'node:crypto';
 import { planCompressionSummaryCalls } from '../capabilities/llmProvider';
-import { compactRequestForCompressionPlanning, estimateCompactProjection } from './llmCapabilityProviderAdapter';
+import { compactRequestForCompressionPlanning, estimateCompactProjection, estimateHistoricalReminderTokens } from './llmCapabilityProviderAdapter';
 import { readCompressionPurpose, safeProviderFailureMessage, type CompressionAttemptFailure, type CompressionRecoveryDecision } from '../../shared/compressionExecution';
 export type { CompressionAttemptFailure } from '../../shared/compressionExecution';
 import type { MessageContent } from '../../shared/protocol';
@@ -42,7 +42,7 @@ import {
 } from './contextSequence';
 import { EffectControlPlane } from './effectControlPlane';
 import { isExecutionHandoffError } from './executionLeaseFence';
-import { frozenCompressionPolicy, frozenContextProfile, type FrozenCompressionPolicy, type FrozenTurnAuthority } from './frozenAuthority';
+import { frozenCompressionPolicy, frozenContextProfile, frozenModelIdentity, type FrozenCompressionPolicy, type FrozenTurnAuthority } from './frozenAuthority';
 import { readRequestTurnAuthority } from './requestCompressionSettings';
 import {
   evaluateNativeCompressionGuard,
@@ -608,6 +608,12 @@ export class ReliableContextCompressionCoordinator {
     const preparedBudget = usesConfiguredThreshold ? undefined : resolveRequestBudget();
     const decision = await this.compression.evaluate(headRootId, authoritySnapshotId, settingsSnapshotContentObjectId,
       frozen, command.preparedContext?.());
+    if (decision.source !== 'provider-observed-delta' && command.requestBudget?.historyTokensBySegment) {
+      // Semantic-only estimates do not include request-level historical snapshots. Provider
+      // observations already include them and must not be charged a second time.
+      for (const tokens of command.requestBudget.historyTokensBySegment.values()) decision.estimatedTokens += tokens;
+      decision.shouldCompress = decision.estimatedTokens >= decision.thresholdTokens;
+    }
     if (usesConfiguredThreshold && !decision.shouldCompress) {
       return {
         status: 'skipped',
@@ -701,6 +707,24 @@ export class ReliableContextCompressionCoordinator {
       semanticMaterialized.segments.map(segment => Buffer.from(segment.content).toString('utf8')),
       mergeModelHandleCatalogs({ entries: fullAttachmentHandles.entries }, contextHandles)
     );
+    let historyTokensBySegment = requestBudget.historyTokensBySegment;
+    if (!command.requestBudget) {
+      // Manual compression has no ordinary preview. Read through the same immutable recipe
+      // cache once, then measure the same visible layout; summaries still receive semantic text.
+      const history = await this.modelProvider.materializeTurnReminderHistory(
+        frozen.document, { kind: 'reliable-agent-turn' }, semanticMaterialized.segments
+      );
+      if (history?.length) historyTokensBySegment = await estimateHistoricalReminderTokens({
+        kind: 'full-model-request', modelRequestId: headRootId, conversationId: frozen.conversationId,
+        attemptSeq: '1', socketGeneration: '1', ...frozenModelIdentity(frozen.document),
+        authoritySnapshot: frozen.document, recipe: { kind: 'reliable-agent-turn' },
+        resolvedModelHandleCatalog: fullModelHandleCatalog, resolvedTools: [],
+        context: storedContextItems(semanticMaterialized.segments),
+        attachmentCatalogState: fullAttachmentCatalogState,
+        requestAddenda: { turnReminderHistory: history }
+      });
+    }
+    const historyTokensBefore = retainedHistoryTokens(semanticMaterialized.segments, historyTokensBySegment);
     if (
       policy.methodKind === 'provider_native' && attempt.nativeKind === 'openai_responses'
       && command.compressSegmentCount !== undefined
@@ -730,7 +754,8 @@ export class ReliableContextCompressionCoordinator {
       // Provider rejection disproved the ordinary estimate's admission decision. Aim below half
       // of the measured history rather than retaining an entire below-threshold window again.
       // This is an estimator-space reduction target, not a claimed Provider token oracle.
-      const currentTokens = estimateMaterializedContextTokens(semanticMaterialized.segments, fullAttachmentCatalogState, fullModelHandleCatalog);
+      const currentTokens = estimateMaterializedContextTokens(semanticMaterialized.segments, fullAttachmentCatalogState, fullModelHandleCatalog)
+        + historyTokensBefore;
       rooms.calibratedBodyTargetTokens = Math.min(rooms.calibratedBodyTargetTokens,
         rooms.calibratedAddendaTokens + calibrateEstimatorToProvider(Math.floor(currentTokens / 2), calibration));
     }
@@ -760,7 +785,8 @@ export class ReliableContextCompressionCoordinator {
               (effectiveSummaryMaxTokens ?? 0) + calibrateEstimatorToProvider(skillReserveTokens, calibration)
             ),
             fullAttachmentCatalogState,
-            fullModelHandleCatalog
+            fullModelHandleCatalog,
+            historyTokensBySegment
           );
     const hardContextRoomTokens = rooms.hardContextRoomTokens;
     if (textTailPlan?.newestGroupTokens !== undefined && textTailPlan.newestGroupTokens > hardContextRoomTokens) {
@@ -1198,14 +1224,15 @@ export class ReliableContextCompressionCoordinator {
     // recorded 0 and made every later estimate of this Context too small).
     const summaryEstimatedTokens = estimateCompressionResultTokens(summary, providerOutputTokens, calibration.ratio);
     const projectedTokens = summaryEstimatedTokens
-      + Math.max(0, candidateProjection.tokenCount - summaryProjectionTokens);
+      + Math.max(0, candidateProjection.tokenCount - summaryProjectionTokens)
+      + retainedHistoryTokens(tailSegments, historyTokensBySegment);
     const projectedBodyTokens = calibrateEstimatorToProvider(
       projectedTokens + irreducibleAddendaTokens,
       calibration
     );
     const currentContextTokens = estimateMaterializedContextTokens(
       semanticMaterialized.segments, fullAttachmentCatalogState, fullModelHandleCatalog
-    );
+    ) + historyTokensBefore;
     const contextSizeKnown = !hasUnsizedOpaqueCompaction(semanticMaterialized.segments);
     const strictCapacityProgress = capacityProofMatches && contextSizeKnown
       && !hasOpaqueProviderCompaction(summary) && projectedTokens < currentContextTokens;
@@ -1757,7 +1784,8 @@ function selectCompressionPrefixByTokens(
   }>,
   tailBudgetTokens: number,
   attachmentCatalogState: AttachmentCatalogState,
-  modelHandleCatalog: ModelHandleCatalog
+  modelHandleCatalog: ModelHandleCatalog,
+  historyTokensBySegment?: ReadonlyMap<string, number>
 ): {
   sourceSegmentCount: number;
   newestGroupTokens?: number;
@@ -1796,7 +1824,8 @@ function selectCompressionPrefixByTokens(
         messageRole: segments[position].messageRole,
         contentType: logicalMessageContentType(segments[position].contentObject.content_type),
         content: segments[position].content.toString('utf8')
-      })), groupAttachmentState, modelHandleCatalog).tokenCount,
+      })), groupAttachmentState, modelHandleCatalog).tokenCount
+        + segmentIds.reduce((total, id) => total + (historyTokensBySegment?.get(id) ?? 0), 0),
       functionCallCount: functionResponseCount > 0 ? 1 : 0,
       functionResponseCount,
       complete: true
@@ -1810,7 +1839,13 @@ function selectCompressionPrefixByTokens(
   };
 }
 
-function storedContextItems(segments: readonly MaterializedContextSegment[]): StoredModelFacingContextItem[] {
+function retainedHistoryTokens(
+  segments: readonly { segmentId: string }[], costs?: ReadonlyMap<string, number>
+): number {
+  return costs ? segments.reduce((total, segment) => total + (costs.get(segment.segmentId) ?? 0), 0) : 0;
+}
+
+function storedContextItems(segments: readonly MaterializedContextSegment[]): FullProviderContextItem[] {
   return segments.map((segment) => ({
     segmentId: segment.segmentId,
     segmentKind: segment.segmentKind,

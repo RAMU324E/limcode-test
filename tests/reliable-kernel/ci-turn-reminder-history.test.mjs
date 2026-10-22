@@ -57,6 +57,8 @@ test('历史提醒在同一 recipe 的首个真实输出前只放一次，分支
   ]);
   assert.match(entries[0].content, /runningProcesses=1$/);
   assert.match(entries[1].content, /runningProcesses=0$/);
+  // Removing the first output moves the snapshot before the next surviving output.
+  assert.equal(entries[0].budgetSegmentId, 'text-a');
   assert.deepEqual(reads, ['first', 'second', 'legacy']);
   const fork = await plane.materializeTurnReminderHistory({ model: { provider: 'claude' } }, ordinary,
     [source('fork-a', 'first', 'tool_pair')]);
@@ -78,6 +80,7 @@ test('重注入输入随首个发送位置保留一次，原生压缩保留历�
   const entries = await plane.materializeTurnReminderHistory(responses, compact, history);
   assert.equal(entries.length, 2);
   assert.equal(entries[0].reinjectedInputs[0].messageRevisionId, 'input-revision');
+  assert.equal(entries[0].reinjectedInputs[0].budgetSegmentId, 'second-output');
   assert.equal(entries[1].reinjectedInputs, undefined);
   assert.match(entries[1].content, /latest$/);
   assert.equal(await plane.materializeTurnReminderHistory(responses,
@@ -102,7 +105,8 @@ test('有序输入集合按独立修订冻结和重放，缺项、乱序与混�
   assert.match(history[1].content, /second-round$/);
   assert.deepEqual(await plane.materializeTurnReminderHistory(responses,
     { kind: 'reliable-context-compression', compressionMethodKind: 'provider_native' },
-    [source('first-text', 'first'), source('next-text', 'second')]), history);
+    [source('first-text', 'first'), source('next-text', 'second')]),
+    history.map(entry => ({ ...entry, budgetSegmentId: entry.segmentId })));
   assert.throws(() => recipeCurrentTurnInputs({ ...recipe, currentTurnInput: inputs[0] }), /conflicting/);
   assert.throws(() => recipeCurrentTurnInputs({ ...recipe, currentTurnInputs: [inputs[0], inputs[0]] }), /duplicate/);
 

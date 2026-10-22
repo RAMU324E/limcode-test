@@ -863,12 +863,20 @@ function isGptModelId(modelId: string): boolean {
   return /^gpt[-_.]?\d/i.test(name);
 }
 
+/** Manual compression has no ordinary preview. Only measure its visible history addenda;
+ * foreign native state is about to be summarized, so ordinary send compatibility is irrelevant. */
+export async function estimateHistoricalReminderTokens(request: FullProviderRequest): Promise<ReadonlyMap<string, number> | undefined> {
+  const projected = await completeModelProjectionCooperatively(toLlmStartRequestWork(request, false));
+  return (await completeModelProjectionCooperatively(estimateOrdinaryProjectedInputWork(request, projected, true))).historyTokensBySegment;
+}
+
 function* estimateOrdinaryRequestInputWork(request: FullProviderRequest): ModelProjectionWork<ProjectedRequestTokenBreakdown> {
   const projected = yield* toLlmStartRequestWork(request);
   return yield* estimateOrdinaryProjectedInputWork(request, projected);
 }
 
-function* estimateOrdinaryProjectedInputWork(request: FullProviderRequest, projected: LlmStartRequest): ModelProjectionWork<ProjectedRequestTokenBreakdown> {
+function* estimateOrdinaryProjectedInputWork(request: FullProviderRequest, projected: LlmStartRequest,
+  historyOnly = false): ModelProjectionWork<ProjectedRequestTokenBreakdown> {
   // 按实际发出的布局估算：网关拒绝过轮内系统消息的渠道与模型退回尾巴模式（与开关关闭时相同）。
   // Claude 轮内系统消息：已清除的历史提醒不显示、不计 token（官方 “Token counting follows what renders”），
   // 只有按 user 消息发出的历史提醒（拆分发出的只有运行状态卡那条 user 消息）计入上下文；本轮提醒照常计入
@@ -876,6 +884,7 @@ function* estimateOrdinaryProjectedInputWork(request: FullProviderRequest, proje
   // 也就没有本轮输入。
   const deliveries = turnReminderDeliveries(projected.contents, estimatedTurnReminderLayout(request.providerId, request.modelId));
   let supersededTailInputCount = 0;
+  const historySegmentByContent = new Map<MessageContent, string>();
   const visibleContents = projected.contents.flatMap((content, index) => {
     const marker = readTurnReminderMarker(content);
     if (!marker) return [content];
@@ -885,7 +894,11 @@ function* estimateOrdinaryProjectedInputWork(request: FullProviderRequest, proje
       return [];
     }
     const visible = visibleHistoryTurnReminder(content, deliveries[index]);
+    if (visible && marker.budgetSegmentId) historySegmentByContent.set(visible, marker.budgetSegmentId);
     return visible ? [visible] : [];
+  });
+  if (historyOnly) return yield* estimateProjectedModelInputWork({
+    contextContents: visibleContents.filter(content => historySegmentByContent.has(content)), historySegmentByContent
   });
   const frozenInputs = request.requestAddenda?.currentTurnInputs ?? [];
   const currentInputCount = frozenInputs.filter(input => input.reinject).length - supersededTailInputCount;
@@ -917,6 +930,7 @@ function* estimateOrdinaryProjectedInputWork(request: FullProviderRequest, proje
     ...(projected.systemInstruction ? { systemInstruction: projected.systemInstruction } : {}),
     tools: projected.tools,
     contextContents: projectedContext,
+    historySegmentByContent,
     ...(currentInputContents.length ? { currentInputContents } : {}),
     ...(reminderCount ? { turnReminderContents: visibleContents.slice(currentEnd) } : {}),
     providerFramingTokens: 64
@@ -927,7 +941,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
   return completeModelProjection(toLlmStartRequestWork(request));
 }
 
-function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWork<LlmStartRequest> {
+function* toLlmStartRequestWork(request: FullProviderRequest, checkCompressionBinding = true): ModelProjectionWork<LlmStartRequest> {
   const recipe = requireRecord(request.recipe, 'Provider recipe');
   const modelHandleCatalog = prepareModelHandleCatalog(providerRequestModelHandleCatalog(request));
   const authority = requireRecord(request.authoritySnapshot, 'Provider authority snapshot');
@@ -1014,7 +1028,7 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
     }
     const compressed = decodeCompressionContents(item.content, item.contentType);
     if (compressed) {
-      assertCompressionBinding(compressed, {
+      if (checkCompressionBinding) assertCompressionBinding(compressed, {
         providerConfigId: request.providerId,
         provider,
         modelId: request.modelId
@@ -1163,10 +1177,11 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
 interface HistoryInsertion {
   /** 那次请求的模型输出在投影前内容里的位置。 */
   beforeIndex: number;
+  budgetSegmentId: string;
   delivery: TurnReminderDeliveryMode;
   reminder?: string;
   reminderIdentitySplit?: TurnReminderIdentitySplit;
-  inputs: Array<{ messageRevisionId: string; content: MessageContent }>;
+  inputs: Array<{ messageRevisionId: string; content: MessageContent; budgetSegmentId: string }>;
 }
 
 function turnReminderHistoryBySegment(request: FullProviderRequest): Map<string, TurnReminderHistoryEntry> {
@@ -1182,10 +1197,11 @@ function historyInsertion(entry: TurnReminderHistoryEntry, beforeIndex: number):
     }
     const content = reinjectedCurrentTurnInput(current);
     if (input.currentTurnAttachmentState) content.parts.push(...input.currentTurnAttachmentState.parts);
-    return { messageRevisionId: input.messageRevisionId, content };
+    return { messageRevisionId: input.messageRevisionId, content, budgetSegmentId: input.budgetSegmentId ?? entry.segmentId };
   });
   return {
     beforeIndex,
+    budgetSegmentId: entry.budgetSegmentId ?? entry.segmentId,
     delivery: entry.delivery,
     ...(entry.content !== undefined ? { reminder: entry.content } : {}),
     ...(entry.content !== undefined && entry.identitySplit ? { reminderIdentitySplit: entry.identitySplit } : {}),
@@ -1276,10 +1292,11 @@ function withTurnReminderMarkers(
   projected.forEach((content, index) => {
     while (cursor < insertions.length && insertions[cursor].beforeIndex === index) {
       const insertion = insertions[cursor++];
-      for (const input of insertion.inputs) result.push(markedReinjectedInput(input.content, 'history', insertion.delivery));
+      for (const input of insertion.inputs) result.push(markedReinjectedInput(input.content, 'history', insertion.delivery, input.budgetSegmentId));
       if (insertion.reminder !== undefined) {
         result.push(turnReminderContent(insertion.reminder, {
           placement: 'history',
+          budgetSegmentId: insertion.budgetSegmentId,
           delivery: insertion.delivery,
           ...(insertion.reminderIdentitySplit ? { identitySplit: insertion.reminderIdentitySplit } : {})
         }));
