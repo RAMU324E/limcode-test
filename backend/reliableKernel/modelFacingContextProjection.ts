@@ -24,6 +24,7 @@ import {
   measureJsonTokens,
   estimateMessageContentsMediaTokens,
   estimateMessageContentsTokens,
+  estimateMessageContentTokens,
   estimateMessageContentsTokenWork,
   estimateMessageContentsMediaTokenWork,
   estimateTextTokens
@@ -131,6 +132,8 @@ export interface ProjectedModelInput {
   tools?: readonly unknown[];
   /** Durable model-visible history. Current input/addenda must not also be present below. */
   contextContents?: readonly MessageContent[];
+  /** Already projected historical snapshots, attributed to their last surviving producer. */
+  historySegmentByContent?: ReadonlyMap<MessageContent, string>;
   /** Exact current Turn request when it must be re-injected after compression. */
   currentInputContents?: readonly MessageContent[];
   /** Runtime deliveries that arrived after a native/text compression candidate was frozen. */
@@ -142,6 +145,8 @@ export interface ProjectedModelInput {
 }
 
 export interface ProjectedRequestTokenBreakdown {
+  /** Process-local costs collected during the ordinary token pass; never persisted. */
+  historyTokensBySegment?: ReadonlyMap<string, number>;
   systemTokens: number;
   toolSchemaTokens: number;
   providerFramingTokens: number;
@@ -171,6 +176,7 @@ export interface FullRequestPlanningInput {
  * a request that the Provider may accept.
  */
 export interface FullRequestPlanningBudget {
+  historyTokensBySegment?: ReadonlyMap<string, number>;
   contextWindowTokens: number;
   compressionThresholdTokens: number;
   providerInputLimitTokens?: number;
@@ -209,7 +215,16 @@ export function* estimateProjectedModelInputWork(input: ProjectedModelInput): Mo
   for (const tool of input.tools ?? []) { yield; toolEstimates.push(10 + estimateJsonTokens(tool)); }
   const toolSchemaTokens = safeSum(toolEstimates);
   const providerFramingTokens = nonNegativeTokenCount(input.providerFramingTokens ?? 0, 'providerFramingTokens');
-  const contextTokens = yield* estimateMessageContentsTokenWork(context);
+  const historyTokensBySegment = new Map<string, number>();
+  let contextTotal = 0;
+  for (const content of context) {
+    yield;
+    const tokens = estimateMessageContentTokens(content);
+    contextTotal += tokens;
+    const segmentId = input.historySegmentByContent?.get(content);
+    if (segmentId) historyTokensBySegment.set(segmentId, (historyTokensBySegment.get(segmentId) ?? 0) + tokens);
+  }
+  const contextTokens = nonNegativeTokenCount(contextTotal, 'contextTokens');
   const currentInputTokens = yield* estimateMessageContentsTokenWork(currentInput);
   const runtimeDeliveryTokens = yield* estimateMessageContentsTokenWork(runtimeDeliveries);
   const turnReminderTokens = yield* estimateMessageContentsTokenWork(reminder);
@@ -225,6 +240,7 @@ export function* estimateProjectedModelInputWork(input: ProjectedModelInput): Mo
   const fixedTokens = safeSum([systemTokens, prefixTokens, toolSchemaTokens, providerFramingTokens]);
   const bodyTokens = safeSum([contextTokens, currentInputTokens, runtimeDeliveryTokens, turnReminderTokens]);
   return {
+    ...(historyTokensBySegment.size ? { historyTokensBySegment } : {}),
     systemTokens: safeSum([systemTokens, prefixTokens]),
     toolSchemaTokens,
     providerFramingTokens,
@@ -262,7 +278,9 @@ export function calculateFullRequestPlanningBudget(
   const planningBodyRoomTokens = Math.max(0, planningInputCapacityTokens - fixedTokens);
   const policyBodyRoomTokens = Math.max(0, compressionThresholdTokens - fixedTokens - 1);
   const fixedOverPolicy = fixedTokens >= compressionThresholdTokens;
+  const { historyTokensBySegment, ...breakdown } = input.breakdown;
   return {
+    ...(historyTokensBySegment ? { historyTokensBySegment } : {}),
     contextWindowTokens,
     compressionThresholdTokens,
     ...(providerInputLimitTokens === undefined ? {} : { providerInputLimitTokens }),
@@ -279,7 +297,7 @@ export function calculateFullRequestPlanningBudget(
       fixedOverPolicy ? planningBodyRoomTokens : policyBodyRoomTokens
     ),
     fixedOverPolicy,
-    breakdown: { ...input.breakdown, fullTokens: estimatedFullInputTokens }
+    breakdown: { ...breakdown, fullTokens: estimatedFullInputTokens }
   };
 }
 

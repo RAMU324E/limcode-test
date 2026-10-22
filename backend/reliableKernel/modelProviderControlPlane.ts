@@ -225,12 +225,15 @@ export interface FullProviderRequest {
 
 export interface TurnReminderHistoryEntry {
   segmentId: string;
+  /** Process-local budget owner: the snapshot survives until its last producing output is removed. */
+  budgetSegmentId?: string;
   delivery: TurnReminderDeliveryMode;
   content?: string;
   /** 那次请求提醒的身份拆分（有运行状态卡时）；与那次请求发出时相同。 */
   identitySplit?: TurnReminderIdentitySplit;
   reinjectedInputs?: Array<{
     messageRevisionId: string;
+    budgetSegmentId?: string;
     contentType: string;
     content: string;
     /** 那次请求随重新注入的输入一起渲染的本 Turn 附件目录增量（current_turn_delta）。 */
@@ -3031,7 +3034,7 @@ export class ModelProviderControlPlane {
    * 重新注入的输入在一个窗口里只放回第一次：那次请求的尾巴带着它，之后的请求看到窗口里已有它（本方法同样的判断），
    * 尾巴不再重发。这个判断只看本窗口里排在前面的片段，也就是之后那些请求各自的窗口，所以每次得到同样的结果。
    */
-  private async materializeTurnReminderHistory(
+  public async materializeTurnReminderHistory(
     authority: PlainJsonValue,
     recipe: PlainJsonValue,
     segments: readonly ContextSegmentMetadata[]
@@ -3069,8 +3072,11 @@ export class ModelProviderControlPlane {
     }
     const placedInputs = new Set<string>();
     const placedRecipes = new Set<string>();
+    const lastRecipeSegment = new Map<string, string>();
+    const lastInputSegment = new Map<string, string>();
     const planned: Array<{
       segmentId: string;
+      recipeId: string;
       delivery: TurnReminderDeliveryMode;
       reminder?: string;
       reminderIdentitySplit?: TurnReminderIdentitySplit;
@@ -3078,15 +3084,20 @@ export class ModelProviderControlPlane {
     }> = [];
     for (const segment of sources) {
       const recipeId = segment.sourceRecipeObjectId as string;
-      if (placedRecipes.has(recipeId)) continue;
-      placedRecipes.add(recipeId);
       const historical = facts.get(recipeId);
       if (!historical || (historical.delivery !== USER_HISTORY_REMINDER_DELIVERY && !replayClaude)) continue;
+      // A prefix cut can move a shared snapshot/input to a later producer. Charge its last
+      // eligible output so every continuous retained suffix pays exactly once.
+      lastRecipeSegment.set(recipeId, segment.segmentId);
+      for (const input of historical.reinjectedInputs) lastInputSegment.set(input.messageRevisionId, segment.segmentId);
+      if (placedRecipes.has(recipeId)) continue;
+      placedRecipes.add(recipeId);
       const inputs = historical.reinjectedInputs.filter(input => !placedInputs.has(input.messageRevisionId));
       for (const input of inputs) placedInputs.add(input.messageRevisionId);
       if (historical.reminder === undefined && inputs.length === 0) continue;
       planned.push({
         segmentId: segment.segmentId,
+        recipeId,
         delivery: historical.delivery,
         ...(historical.reminder !== undefined ? { reminder: historical.reminder } : {}),
         ...(historical.reminderIdentitySplit ? { reminderIdentitySplit: historical.reminderIdentitySplit } : {}),
@@ -3109,12 +3120,14 @@ export class ModelProviderControlPlane {
     return planned.map((entry) => {
       return {
         segmentId: entry.segmentId,
+        budgetSegmentId: lastRecipeSegment.get(entry.recipeId),
         delivery: entry.delivery,
         ...(entry.reminder !== undefined ? { content: entry.reminder } : {}),
         ...(entry.reminderIdentitySplit ? { identitySplit: { ...entry.reminderIdentitySplit } } : {}),
         ...(entry.inputs.length ? { reinjectedInputs: entry.inputs.map(reference => {
           const input = inputs.get(reference.contentObjectId)!;
-          return { messageRevisionId: reference.messageRevisionId, ...input,
+          return { messageRevisionId: reference.messageRevisionId,
+            budgetSegmentId: lastInputSegment.get(reference.messageRevisionId), ...input,
             ...(reference.currentTurnAttachmentText !== undefined ? { currentTurnAttachmentState: {
               role: 'user' as const, parts: [{ text: reference.currentTurnAttachmentText }]
             } } : {}) };

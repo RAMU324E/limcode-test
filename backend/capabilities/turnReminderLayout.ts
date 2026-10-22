@@ -6,6 +6,8 @@ import { isRecord } from './llmStreamEventProjection';
 export interface TurnReminderMarker {
   /** `current`：本请求的提醒；`history`：之前某次请求发过、紧挨在那次请求模型输出之前的提醒。 */
   placement: 'current' | 'history';
+  /** Process-local compression accounting; stripped together with the marker before sending. */
+  budgetSegmentId?: string;
   /** 该请求冻结的发送方式；user 快照在切换 provider 后仍保留普通 user 身份。 */
   delivery?: 'user_history' | 'claude_turn_scoped';
   /**
@@ -39,9 +41,11 @@ export function turnReminderContent(text: string, marker: TurnReminderMarker): T
 export function markedReinjectedInput(
   content: MessageContent,
   placement: TurnReminderMarker['placement'],
-  delivery?: TurnReminderMarker['delivery']
+  delivery?: TurnReminderMarker['delivery'],
+  budgetSegmentId?: string
 ): TurnReminderContent {
-  return { role: 'user', parts: content.parts, turnReminder: { placement, kind: 'reinjected_input', ...(delivery ? { delivery } : {}) } };
+  return { role: 'user', parts: content.parts, turnReminder: { placement, kind: 'reinjected_input',
+    ...(delivery ? { delivery } : {}), ...(budgetSegmentId ? { budgetSegmentId } : {}) } };
 }
 
 export function readTurnReminderMarker(content: MessageContent): TurnReminderMarker | undefined {

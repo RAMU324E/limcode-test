@@ -49,7 +49,7 @@ function dependencies(thresholdTokens, options = {}) {
               turnId: request.turnId,
               conversationId: request.conversationId,
               executorAgentId: request.executorAgentId,
-              model: { providerConfigId: PROVIDER_ID, provider: 'openai-compatible', modelId: MODEL_ID },
+              model: { providerConfigId: PROVIDER_ID, provider: options.provider ?? 'openai-compatible', modelId: MODEL_ID },
               modelProfile: {
                 compressionThresholdTokens: thresholdTokens,
                 contextWindowTokens: 200_000,
@@ -210,6 +210,66 @@ async function rejectOrdinaryContextRequest(app, seeded, code = 'CONTEXT_WINDOW_
 }
 
 function registerCases(test) {
+
+test('自动与手动压缩都把冻结快照计入保留尾巴，下一请求实际降到目标以内', async () => {
+  for (const trigger of ['auto', 'manual']) await withTurn(`snapshot-compression-${trigger}`, 60_000, async (app, seeded) => {
+    for (let index = 0; index < 5; index++) {
+      const head = await app.context.currentHeadRootId(seeded.conversationId);
+      const recipe = await app.agentLoop.freezeOrdinaryRequestRecipe({ ...seeded, headRootId: head,
+        round: String(index + 1), tools: [], includeOpenTaskCompletionCheck: false });
+      const created = await app.modelProvider.createModelRequest({ ...seeded, contextRootId: head,
+        recipe: { ...recipe, runtimeStatusCard: { card: 'active process '.repeat(5_000) } }, idempotencyKey: `snapshot-${index}` });
+      await app.modelProvider.dispatch(created.modelRequestId, { providerId: PROVIDER_ID,
+        async sendFullRequest(_request, controls) {
+          await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { text: 'small output' } });
+        } });
+      await app.turnOutput.appendAssistantMessage({ turnId: seeded.turnId, modelRequestId: created.modelRequestId,
+        sourceKey: `snapshot-${index}`, content: JSON.stringify({ role: 'model', parts: [{ text: 'small output' }] }) });
+    }
+    await appendMessage(app, seeded, 'snapshot-tail', 'user', 'latest question');
+    const preview = async () => {
+      const headRootId = await app.context.currentHeadRootId(seeded.conversationId);
+      const recipe = await app.agentLoop.freezeOrdinaryRequestRecipe({ ...seeded, headRootId,
+        round: '6', tools: [], includeOpenTaskCompletionCheck: false });
+      return app.modelProvider.previewOrdinaryRequest({ ...seeded, contextRootId: headRootId, recipe, idempotencyKey: 'next' });
+    };
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter(PROVIDER_ID, {});
+    const before = app.modelProvider.planFullRequest(await preview(), adapter);
+    assert.ok(before.breakdown.contextTokens > 60_000);
+    const result = await summaryCoordinator(app, 'Short faithful summary', () => {}).coordinate({ ...seeded, trigger,
+      headRootId: await app.context.currentHeadRootId(seeded.conversationId),
+      ...(trigger === 'auto' ? { requestBudget: before } : {}) });
+    assert.equal(result.status, 'compressed', JSON.stringify(result));
+    const after = app.modelProvider.planFullRequest(await preview(), adapter);
+    assert.ok(after.estimatedFullInputTokens < 30_000, `actual next input: ${after.estimatedFullInputTokens}`);
+    const metadata = await compressionMetadata(app, seeded.conversationId);
+    assert.ok(metadata.contextTokensBefore > 60_000);
+    assert.ok(Math.abs(metadata.estimatedTokensAfter - after.breakdown.contextTokens) < 100);
+  }, { provider: 'openai-responses' });
+});
+
+test('历史快照占据预算时继续压掉旧输出，保留费用与压缩后统计一致', async () => {
+  await withTurn('historical-reminder-tail-budget', 60_000, async (app, seeded) => {
+    await appendMessage(app, seeded, 'archive', 'assistant', 'archive '.repeat(60_000));
+    await appendMessage(app, seeded, 'history-a', 'assistant', 'small first output');
+    await appendMessage(app, seeded, 'history-b', 'assistant', 'small second output');
+    await appendMessage(app, seeded, 'history-tail', 'user', 'latest question');
+    const head = await app.context.currentHeadRootId(seeded.conversationId);
+    const before = await app.context.materialize(head);
+    const costs = new Map(before.segments.slice(2, 4).map(segment => [segment.segmentId, 15_000]));
+    const budget = { ...requestBudget(60_000, 0, 110_100), historyTokensBySegment: costs };
+    const coordinator = summaryCoordinator(app, 'Short history summary', () => {});
+    const result = await coordinator.coordinate({ ...seeded, headRootId: head, trigger: 'auto', requestBudget: budget });
+    assert.equal(result.status, 'compressed', JSON.stringify(result));
+    const after = await app.context.materialize(await app.context.currentHeadRootId(seeded.conversationId));
+    assert.equal(after.segments.filter(segment => costs.has(segment.segmentId)).length, 1,
+      'the retained tail must fit snapshots as well as semantic text');
+    const metadata = await compressionMetadata(app, seeded.conversationId);
+    assert.ok(metadata.contextTokensBefore >= 30_000);
+    assert.ok(metadata.estimatedTokensAfter >= 15_000);
+    assert.ok(metadata.estimatedTokensAfter < 30_000);
+  });
+});
 
 test('a summary that does not shrink the Context is still skipped as non_reducing and replays without a second call', async () => {
   const thresholdTokens = 1;

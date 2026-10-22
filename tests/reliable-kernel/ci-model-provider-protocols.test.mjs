@@ -16,6 +16,55 @@ const BINDING_ERROR = { status: 400, rawBody: { error: { message:
   + 'Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to "drop_block".' } } };
 afterEach(() => adaptation.resetProviderRequestAdaptations());
 
+test('压缩预算复用实际历史快照计数，按最后存活输出计费并排除 Claude 已清除系统内容', () => {
+  for (const provider of ['openai-responses', 'claude']) {
+    const config = settings(provider);
+    const request = fullRequest(config, [user('question'), model([{ text: 'first' }]), model([{ text: 'last' }])]);
+    request.authoritySnapshot.model.claudeTurnScopedReminders = true;
+    request.recipe.kind = 'reliable-agent-turn';
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter(config.id, fakeCapability(() => {}));
+    const before = adapter.estimateFullRequestInput(request);
+    request.requestAddenda = { turnReminderHistory: [{
+      segmentId: 'segment-1', budgetSegmentId: 'segment-2',
+      delivery: provider === 'claude' ? 'claude_turn_scoped' : 'user_history',
+      content: 'task details '.repeat(1_000) + 'running=1',
+      identitySplit: { user: 'running=1', system: 'task details '.repeat(1_000) }
+    }] };
+    const after = adapter.estimateFullRequestInput(request);
+    const extra = after.contextTokens - before.contextTokens;
+    assert.ok(extra > 0);
+    if (provider === 'claude') assert.ok(extra < 20, 'cleared system content must not count');
+    else assert.ok(extra > 1_000);
+    assert.deepEqual([...after.historyTokensBySegment], [['segment-2', extra]]);
+    const budget = kernel.calculateFullRequestPlanningBudget({ contextWindowTokens: 200_000,
+      compressionThresholdTokens: 100_000, breakdown: after });
+    assert.deepEqual(budget.historyTokensBySegment, after.historyTokensBySegment);
+    assert.equal(budget.breakdown.historyTokensBySegment, undefined, 'process-local costs must not enter summary metadata');
+  }
+});
+
+test('手动压缩只计历史快照，不重算语义正文，也不按普通发送拒绝待摘要的外来原生状态', async t => {
+  const config = settings('openai-responses');
+  const request = fullRequest(config, [user('question'), model([{ text: 'output' }])]);
+  request.recipe.kind = 'reliable-agent-turn';
+  request.requestAddenda = { turnReminderHistory: [{ segmentId: 'segment-1', delivery: 'user_history', content: 'frozen snapshot' }] };
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter(config.id, fakeCapability(() => {}));
+  const expected = adapter.estimateFullRequestInput(request).historyTokensBySegment;
+  request.context.unshift({ segmentId: 'old-compact', segmentKind: 'compression', messageRole: null,
+    contentType: 'application/vnd.limcode.compression-contents+json', content: JSON.stringify({
+      kind: 'compression_contents', version: 1, contents: [model([{ text: 'old native state' }])],
+      nativeBinding: { providerConfigId: 'previous-channel', provider: 'openai-responses', modelId: 'previous-model' }
+    }) });
+  assert.throws(() => adapter.estimateFullRequestInput(request), /incompatible/);
+  const estimator = load('backend/reliableKernel/modelTokenEstimator.js');
+  const estimate = estimator.estimateMessageContentTokens;
+  const seen = [];
+  t.mock.method(estimator, 'estimateMessageContentTokens', content => { seen.push(content); return estimate(content); });
+  const actual = await load('backend/reliableKernel/llmCapabilityProviderAdapter.js').estimateHistoricalReminderTokens(request);
+  assert.deepEqual(actual, expected);
+  assert.equal(seen.length, 1, 'manual accounting must tokenize only the snapshot');
+});
+
 test('获取模型列表时各渠道均使用已配置的代理', async t => {
   const requests = [];
   t.mock.method(globalThis, 'fetch', async () => assert.fail('模型列表请求绕过了已配置的代理'));
