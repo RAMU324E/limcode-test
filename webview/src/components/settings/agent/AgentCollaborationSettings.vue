@@ -6,6 +6,7 @@ import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
 import {
   AGENT_COLLABORATION_CONFIG_KEYS,
+  ALLOW_DELETE_SUBAGENTS_CONFIG_KEY,
   CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY,
   SUB_AGENT_TOOL_NAME,
   useToolPolicyStore,
@@ -55,6 +56,15 @@ const listError = computed(() => store.toolListErrorFor(props.scopeKind, props.s
 const canEdit = computed(() => !props.readonly && !!tool.value && !loading.value && (props.scopeKind === 'global' || !!props.scopeId?.trim())
   && listError.value?.own !== true);
 const spawnToolEnabled = computed(() => store.effectivePolicyFor(props.scopeKind, props.scopeId).policy?.allowedTools.includes(SUB_AGENT_TOOL_NAME) === true);
+const deleteChildField = computed(() => {
+  const field = tool.value?.configSchema?.fields.find(item => item.key === ALLOW_DELETE_SUBAGENTS_CONFIG_KEY);
+  if (!field) return undefined;
+  const upper = inherited(ALLOW_DELETE_SUBAGENTS_CONFIG_KEY);
+  const own = localConfig.value[ALLOW_DELETE_SUBAGENTS_CONFIG_KEY];
+  return { ...field, enabled: (own ?? upper?.value ?? field.defaultValue) === true,
+    overridden: own !== undefined,
+    inheritedLabel: `${upper?.source ?? '默认'} ${(upper?.value ?? field.defaultValue) === true ? '开启' : '关闭'}` };
+});
 const crossConversationField = computed(() => tool.value?.configSchema?.fields.find((field) => field.key === CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY));
 const crossConversationOverridden = computed(() => typeof localConfig.value[CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY] === 'boolean');
 const crossConversationInherited = computed(() => inherited(CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY));
@@ -110,6 +120,11 @@ function setCrossConversation(value: boolean): void {
   store.setCrossConversationCollaborationForScope(props.scopeKind, props.scopeId, value);
 }
 
+function setDeleteChild(value: boolean | undefined): void {
+  if (!canEdit.value) return;
+  store.setRunAgentConfigValueForScope(props.scopeKind, props.scopeId, ALLOW_DELETE_SUBAGENTS_CONFIG_KEY, value);
+}
+
 function restoreCrossConversation(): void {
   if (!canEdit.value) return;
   store.setCrossConversationCollaborationForScope(props.scopeKind, props.scopeId, undefined);
@@ -143,6 +158,19 @@ function restoreCrossConversation(): void {
       <p>开启后提供列出、读取、发送、新建和分支对话五个工具，仅顶层对话可用，不能寻址子 Agent 对话。发送类工具默认自动执行，可在工具设置中逐个改为执行前确认。目标对话正在运行时，消息排队到它本轮结束后再投递。</p>
       <p>开关就是授权：开启后直接提供这些工具，不写入工具列表，也不受工具列表影响；工具设置里不能单独停用其中某个工具，只能逐个改为执行前确认。工具列表不含 run_agent 时只提供列出和读取对话。</p>
       <p v-if="!listError" class="collaboration-note collaboration-cross-state">{{ crossConversationStateText }}</p>
+    </div>
+    <div v-if="deleteChildField" class="collaboration-field">
+      <div class="collaboration-field-row">
+        <LcCheckbox :model-value="deleteChildField.enabled" :disabled="!canEdit"
+          :aria-label="deleteChildField.label" @update:model-value="setDeleteChild">{{ deleteChildField.label }}</LcCheckbox>
+        <div class="collaboration-field-actions">
+          <span>{{ deleteChildField.overridden ? (scopeKind === 'global' ? '全局默认' : '本层单独设置') : (scopeKind === 'global' ? '系统默认' : `继承上层 · ${deleteChildField.inheritedLabel}`) }}</span>
+          <button type="button" :disabled="!canEdit || !deleteChildField.overridden"
+            :aria-label="`${deleteChildField.label}：${scopeKind === 'global' ? '恢复默认' : '恢复继承'}`"
+            @click="setDeleteChild(undefined)">{{ scopeKind === 'global' ? '恢复默认 关闭' : '恢复继承' }}</button>
+        </div>
+      </div>
+      <p>{{ deleteChildField.description }}</p>
     </div>
     <div v-for="field in fields" :key="field.key" class="collaboration-field">
       <div class="collaboration-field-row">

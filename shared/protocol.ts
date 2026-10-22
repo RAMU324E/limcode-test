@@ -406,6 +406,7 @@ export const CROSS_CONVERSATION_TOOL_NAMES = [
 /** The cross-conversation tools that only look: they need no run_agent in the Turn's tool list. */
 export const READONLY_CROSS_CONVERSATION_TOOL_NAMES = ['list_conversations', 'read_conversation'] as const;
 export const CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY = 'crossConversationCollaboration';
+export const ALLOW_DELETE_SUBAGENTS_CONFIG_KEY = 'allowDeleteSubagents';
 
 export type EditToolMode = 'hunk' | 'insert' | 'delete';
 

@@ -18,6 +18,20 @@ let f;
 before(async () => { f = await openChildFixture(); });
 after(async () => { await f?.close(); });
 
+test('子 Agent 的删除权限受派出方约束，删除使用单个短引用且强制串行', () => {
+  const enabled = policy({ toolConfigs: { run_agent: { config: { allowDeleteSubagents: true } } } });
+  const disabled = policy({ toolConfigs: { run_agent: { config: { allowDeleteSubagents: false } } } });
+  assert.equal(boundChildToolPolicy(enabled, disabled).toolConfigs.run_agent.config.allowDeleteSubagents, false);
+  assert.equal(boundChildToolPolicy(enabled, policy()).toolConfigs.run_agent.config.allowDeleteSubagents, undefined);
+  assert.equal(boundChildToolPolicy(enabled, enabled).toolConfigs.run_agent.config.allowDeleteSubagents, true);
+  const { resolveModelToolArguments } = load('backend/reliableKernel/modelHandleCatalog.js');
+  const args = resolveModelToolArguments('run_agent', { operation: 'delete_subtree', childRef: 'A1', childRefs: ['ignored'] },
+    { entries: [{ kind: 'child', ref: 'A1', target: 'child-bridge' }] });
+  assert.equal(args.answerBridgeId, 'child-bridge');
+  const { runAgentTool } = load('backend/world/modules/tools/definitions/runAgent/index.js');
+  assert.equal(runAgentTool.scheduling({ operation: 'delete_subtree', scheduling: 'parallel' }).mode, 'serial');
+});
+
 async function startedChildForQueuedWait(parentTurnId, fixture = f) {
   const child = await fixture.app.runtime.children.spawn(fixture.command(await fixture.source(parentTurnId)));
   await fixture.app.runtime.children.claimSpawnDispatch(child.effectIntentId);

@@ -1,5 +1,6 @@
 import { before, after, test } from 'node:test';
-import { openStopFixture } from './stop-control-fixture.mjs';
+import assert from 'node:assert/strict';
+import { openStopFixture, load } from './stop-control-fixture.mjs';
 import { queueCancellationBeforeStop, pendingAnswerDeletionNotice, consumedAnswerDeletionNotice, backgroundChildDeletion, stopWholeTree,
   timeoutPreservesThenRetry, writerDeletionAtomicRefusal, durableStopRecovery, stopClosesOutputCrashWindow } from './stop-delete-cases.mjs';
 import { stopForeignProcess, liveOwnerStops, unknownDispatchIdentity, stopAllWaits, userStopsDeadHost, liveDispatchKeepsReceipt,
@@ -25,3 +26,57 @@ test('a dead dispatched spawn recovers its existing child and stops without disp
 test('explicit rejection survives a stop and competing responses commit only one approval outcome', () => rejectCancelRace(f));
 test('停止补建已经提交输出但尚未建成的调用，并把取消结果进入 Context', () => stopClosesOutputCrashWindow(f, 'output-before-calls'));
 test('停止补齐已有终态工具结果的 Context，不再次派发工具', () => stopClosesOutputCrashWindow(f, 'result-before-context'));
+
+async function deleteChild(turnId, answerBridgeId) {
+  const args = { operation: 'delete_subtree', answerBridgeId };
+  const source = await f.source(turnId, 'run_agent', args);
+  const lease = (await f.rows('ExecutionLease', { turn_id: turnId }))[0];
+  const { runWithExecutionLeaseFence } = load('backend/reliableKernel/executionLeaseFence.js');
+  await runWithExecutionLeaseFence({ id: lease.id, conversationId: lease.conversation_id, turnId,
+    ownerId: lease.owner_id, hostBootId: lease.host_boot_id, generation: BigInt(lease.generation) }, async () => {
+    try { await f.app.toolDispatcher.dispatch({ ...source, toolName: 'run_agent', arguments: args }); }
+    catch (error) {
+      await f.app.runtime.effects.settleWithoutEffect({ source: { kind: 'internal', key: `delete-fixture:${source.toolCallId}` },
+        toolCallId: source.toolCallId, status: 'failed', detail: { message: error.message } });
+      throw error;
+    }
+  });
+  return f.app.runtime.effects.readTerminalResult(source.toolCallId, false);
+}
+
+test('Agent 删除开关关闭时不提供删除操作，后续设置不改变已经冻结的授权', async () => {
+  f.allowDeleteSubagents = false;
+  const parent = await f.conversation('delete-switch-off');
+  const turn = await f.input(parent);
+  const child = await f.spawn(turn.turnId);
+  const definitions = await f.app.toolDispatcher.definitions(turn.turnId);
+  assert.ok(!definitions.find(tool => tool.name === 'run_agent').parameters.properties.operation.enum.includes('delete_subtree'));
+  f.allowDeleteSubagents = true;
+  try {
+    await assert.rejects(deleteChild(turn.turnId, child.answerBridgeId), /未开启/);
+    assert.ok(await f.get('Conversation', child.childConversationId));
+  } finally { f.allowDeleteSubagents = false; }
+});
+
+test('Agent 只能删除自己的直属子 Agent，删除先停止整棵子树并保留父任务', async () => {
+  f.allowDeleteSubagents = true;
+  try {
+    const parent = await f.conversation('delete-own-child');
+    const turn = await f.input(parent);
+    const child = await f.spawn(turn.turnId);
+    const grandchild = await f.spawn(child.childTurnId);
+    const definitions = await f.app.toolDispatcher.definitions(turn.turnId);
+    assert.ok(definitions.find(tool => tool.name === 'run_agent').parameters.properties.operation.enum.includes('delete_subtree'));
+    const foreignParent = await f.conversation('delete-foreign-child');
+    const foreignTurn = await f.input(foreignParent);
+    await assert.rejects(deleteChild(foreignTurn.turnId, child.answerBridgeId), /outside.*direct/);
+    assert.ok(await f.get('Conversation', child.childConversationId));
+    await assert.rejects(deleteChild(turn.turnId, grandchild.answerBridgeId), /outside.*direct/);
+    assert.equal((await deleteChild(turn.turnId, child.answerBridgeId)).status, 'succeeded');
+    assert.equal(await f.get('Conversation', child.childConversationId), null);
+    assert.equal(await f.get('Conversation', grandchild.childConversationId), null);
+    assert.ok(await f.get('Conversation', parent));
+    assert.equal((await f.get('Turn', turn.turnId)).status, 'active');
+    assert.equal((await deleteChild(turn.turnId, child.answerBridgeId)).status, 'succeeded');
+  } finally { f.allowDeleteSubagents = false; }
+});

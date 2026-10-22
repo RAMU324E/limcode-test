@@ -607,6 +607,7 @@ function fallbackToolSummary(toolName: string, args: unknown): string | undefine
     if (operation === 'wait') return '等待子 Agent 回答';
     if (operation === 'send') return answerBridgeId ? `继续子 Agent · ${answerBridgeId}` : '继续子 Agent';
     if (operation === 'interrupt_subtree') return '终止子 Agent 子树';
+    if (operation === 'delete_subtree') return '删除子 Agent 及子对话';
     if (operation !== 'spawn') return '子 Agent 操作';
     const agent = isRecord(source.agent) ? source.agent : undefined;
     const agentType = boundedInlineValue(agent?.type) ?? 'worker';

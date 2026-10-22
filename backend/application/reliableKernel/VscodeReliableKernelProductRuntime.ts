@@ -15,6 +15,8 @@ import type {
 } from '../../reliableKernel/agentLoop';
 import { ReliableChildAgentCoordinator } from '../../reliableKernel/childAgentCoordinator';
 import { childConversationModelProfiles } from '../../reliableKernel/childThinkingInheritance';
+import { recordRuntimeDeletedConversations } from '../../reliableKernel/runtimeMergeTombstones';
+import { stopAndDeleteConversation } from './conversationDeleteCommand';
 import { CollaborationToolDispatcher } from '../../reliableKernel/collaborationToolDispatcher';
 import { ReliableDiagnosticJournal } from '../../reliableKernel/diagnosticJournal';
 import { DebugCaptureService } from '../../reliableKernel/debugCapture/service';
@@ -228,7 +230,8 @@ export class VscodeReliableKernelProductRuntime {
     context: vscode.ExtensionContext,
     options: VscodeReliableKernelProductRuntimeOptions = {}
   ): Promise<VscodeReliableKernelProductRuntime> {
-    const getPaths = pinnedDataRootPaths(context, options.runtimePlacement?.configurationRootPath ?? resolveDataRootUri(context).fsPath);
+    const configurationRootPath = options.runtimePlacement?.configurationRootPath ?? resolveDataRootUri(context).fsPath;
+    const getPaths = pinnedDataRootPaths(context, configurationRootPath);
     const workspaceFolders = currentWorkspaceFolders();
     const configuration = new VscodeConfigurationAuthority(
       getPaths,
@@ -539,6 +542,12 @@ export class VscodeReliableKernelProductRuntime {
         deliveryWakeups: application.processDeliveries,
         ownedProcessCleanup: application.childOwnedProcessCleanup,
         deadHostEffects: application.phaseDRecovery,
+        deleteConversation: (input) => {
+          getPaths();
+          return stopAndDeleteConversation({ application: application!, conversations: conversations!, childAgents: childAgents!,
+            recordDeleted: (ids) => recordRuntimeDeletedConversations(configurationRootPath, application!.database.binding, ids)
+          }, input);
+        },
         cancelTurnExecution: async ({ turnId, reason }) => {
           await Promise.all([
             application!.modelProvider.cancelTurnDispatches(turnId, reason),

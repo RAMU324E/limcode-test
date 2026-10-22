@@ -17,7 +17,8 @@ const componentFiles = {
   Thinking: path.join(sourceRoot, 'components/input/SessionThinkingControl.vue'),
   Composer: path.join(sourceRoot, 'components/input/Composer.vue'),
   RichEditor: path.join(sourceRoot, 'components/content/RichContentEditor.vue'),
-  Tools: path.join(sourceRoot, 'components/settings/tools/ToolPolicyEditor.vue')
+  Tools: path.join(sourceRoot, 'components/settings/tools/ToolPolicyEditor.vue'),
+  Collaboration: path.join(sourceRoot, 'components/settings/agent/AgentCollaborationSettings.vue')
 };
 const testedComponents = new Set(Object.values(componentFiles));
 const presentation = { __esModule: true, default: { render() { return null; } } };

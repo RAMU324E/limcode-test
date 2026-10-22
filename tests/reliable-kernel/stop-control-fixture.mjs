@@ -23,6 +23,7 @@ const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel
 const { ReliableChildAgentCoordinator } = load('backend/reliableKernel/childAgentCoordinator.js');
 const { ReliableConversationRunner } = load('backend/application/reliableKernel/ReliableConversationRunner.js');
 const { createRuntimeDeliveryWakeHandler } = load('backend/application/reliableKernel/runtimeDeliveryWakeHandler.js');
+const { stopAndDeleteConversation } = load('backend/application/reliableKernel/conversationDeleteCommand.js');
 const { askUserTool } = load('backend/world/modules/tools/definitions/askUser/index.js');
 const { runAgentTool } = load('backend/world/modules/tools/definitions/runAgent/index.js');
 const { submitPlanTool } = load('backend/world/modules/tools/definitions/submitPlan/index.js');
@@ -52,7 +53,8 @@ export async function openStopHost(rootPath, { label = 'stop-suite', directory }
     modelProfile: { contextWindowTokens: 128000, compressionThresholdTokens: 100000, tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 } },
     toolPolicy: { id: 'stop-tools', allowedTools: ['ask_user', 'submit_plan', 'run_agent', 'bash'], preset: 'custom',
       sourceConfigs: { fixture: { enabled: true } },
-      toolConfigs: { run_agent: { config: { maxChildAgentDepth: 3, maxConcurrentAgents: 8 } } } },
+      toolConfigs: { run_agent: { config: { maxChildAgentDepth: 3, maxConcurrentAgents: 8,
+        allowDeleteSubagents: f.allowDeleteSubagents === true } } } },
     planReviewPolicy: { mode: 'optional' }, systemPrompt: { id: 'prompt', text: '' },
     runtimeContext: { id: null, name: '', template: '' },
     workEnvironmentPolicy: { id: null, enabled: false, allowedWorkEnvironmentIds: [], defaultWorkEnvironmentId: null }
@@ -86,7 +88,9 @@ export async function openStopHost(rootPath, { label = 'stop-suite', directory }
   coordinator = new ReliableChildAgentCoordinator({ database: app.database, ...app.runtime, turns: app.turns, modelProvider: app.modelProvider,
     agentLoop: app.agentLoop, agents: { async resolve() { return { agentId: 'agent-main', agentType: 'worker' }; } },
     modelProfiles: { async initializeConversation() { return { created: true }; } }, deliveryWakeups: app.processDeliveries,
-    ownedProcessCleanup: app.childOwnedProcessCleanup, deadHostEffects: app.phaseDRecovery });
+    ownedProcessCleanup: app.childOwnedProcessCleanup, deadHostEffects: app.phaseDRecovery,
+    deleteConversation: input => stopAndDeleteConversation({ application: app, conversations: f.runner,
+      childAgents: coordinator, pollMs: 0, timeoutMs: 2000 }, input) });
   f.coordinator = coordinator;
   f.runner = new ReliableConversationRunner(app, `${label}:${app.database.hostBootId}`, error => { f.errors.push(error); });
   app.processDeliveries.setWakeHandler(createRuntimeDeliveryWakeHandler({ application: () => app,

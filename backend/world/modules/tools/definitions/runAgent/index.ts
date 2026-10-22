@@ -1,5 +1,5 @@
 import { MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN } from '../../../../../../shared/agentScheduling';
-import { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, type ToolConfigRecord } from '../../../../../../shared/protocol';
+import { ALLOW_DELETE_SUBAGENTS_CONFIG_KEY, CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, type ToolConfigRecord } from '../../../../../../shared/protocol';
 import { isEmptyToolArgument } from '../../../../../../shared/toolArgumentUtils';
 import type { ToolCallSummaryContext, ToolDefinition } from '../../registry';
 import { defineToolDefinitionModule } from '../types';
@@ -14,7 +14,7 @@ export const MAX_AUTOMATIC_FOLLOWUPS_CONFIG_KEY = 'maxAutomaticFollowups';
 export const DEFAULT_MAX_AUTOMATIC_FOLLOWUPS = 32;
 /** Boolean user switch, frozen per Turn; it has no defaultConfig entry and is off unless set. */
 export { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY };
-export const RUN_AGENT_OPERATIONS = ['spawn', 'send', 'list', 'read', 'wait', 'interrupt_subtree'] as const;
+export const RUN_AGENT_OPERATIONS = ['spawn', 'send', 'list', 'read', 'wait', 'interrupt_subtree', 'delete_subtree'] as const;
 /** Skills one spawn may preload into its child's first input. */
 export const MAX_RUN_AGENT_SKILLS = 8;
 export type RunAgentOperation = typeof RUN_AGENT_OPERATIONS[number];
@@ -81,9 +81,10 @@ export const runAgentTool: ToolDefinition = {
 - spawn forkTurns defaults to "none". Use "all" or a positive integer string to inherit all or the most recent N completed turns. Current, failed and interrupted turns are excluded; inherited child references never grant control. The prompt always starts a new assignment.
 - send requires answerBridgeId and prompt, reusing that child conversation and answer channel. It queues after the current child turn unless interrupt=true explicitly redirects current work. An unknown or missing reference fails; it never creates a replacement child.
 - A child's answer is the final reply of each of its turns: it settles a foreground wait, otherwise it is delivered to you as that child's final result. Progress the child reports mid-task arrives separately as a collaboration message.
-- read/list/wait default to direct children; scope="tree" also permits verified descendants. send and interrupt_subtree only control direct children. Inherited history references are not authority to control another conversation's children.
+- read/list/wait default to direct children; scope="tree" also permits verified descendants. send, interrupt_subtree and delete_subtree only control direct children. Inherited history references are not authority to control another conversation's children.
 - wait observes one answerBridgeId or 1 to 32 answerBridgeIds until a status/task/result change or the bounded timeout. A single answerBridgeId takes priority over an unused answerBridgeIds array, which is reported. It never resumes, cancels or sends work. Do not repeatedly poll; continue independent work, then wait or finish the turn when only a child answer remains.
 - interrupt_subtree explicitly stops a direct child and its descendants without assigning a new task. Do not interrupt merely because a child is slow.
+- delete_subtree permanently deletes an unneeded direct child conversation and its descendants, stopping their work first. Use only after retaining the results you need. Available only when the user enables deletion in Agent settings. The deleted child cannot be continued.
 - list/read pages are bounded by both limit and a token budget. Follow nextCursor to continue. If a tool-result preview was truncated, repeat the same operation and target with cursor=rereadCursor, preferably as a single call, so omitted text is not skipped. A read source may span pages; reassemble its text by textOffset and respect textFormat (text or message_json).
 - List cursors keep the original upper boundary; start a new list to include children created during pagination. Activity changes do not invalidate cursors.
 - foregroundWaitMs is optional for spawn/send and defaults to 0. It bounds the foreground wait, not child execution. Numeric budgets use their documented bounds, accept integer strings, and preserve 0 for immediate observation. At most ${MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN} starts enter admission concurrently per parent turn.`,
@@ -93,7 +94,7 @@ export const runAgentTool: ToolDefinition = {
         operation: {
           type: 'string',
           enum: [...RUN_AGENT_OPERATIONS],
-          description: 'Required. Explicitly select spawn, send, list, read, wait or interrupt_subtree. There is no default operation.'
+          description: 'Required. Explicitly select an available operation. There is no default operation.'
         },
         prompt: {
           type: 'string',
@@ -101,7 +102,7 @@ export const runAgentTool: ToolDefinition = {
         },
         answerBridgeId: {
           type: 'string',
-          description: 'Required for send, read and interrupt_subtree. For wait, this single target takes priority over answerBridgeIds.'
+          description: 'Required for send, read, interrupt_subtree and delete_subtree. For wait, this single target takes priority over answerBridgeIds.'
         },
         answerBridgeIds: {
           type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 32,
@@ -187,6 +188,12 @@ export const runAgentTool: ToolDefinition = {
         description: '限制同一轮任务中 Agent 自动续派的次数；用户开始新一轮任务时重新计数。0 表示不允许自动续派，仍可仅发送消息。',
         defaultValue: DEFAULT_MAX_AUTOMATIC_FOLLOWUPS
       }, {
+        key: ALLOW_DELETE_SUBAGENTS_CONFIG_KEY,
+        label: '允许 Agent 删除子 Agent',
+        type: 'boolean',
+        description: '允许 Agent 删除自己直属的子 Agent 及其子对话；运行中的任务会先停止再删除，删除后无法继续该子任务。默认关闭，从下一轮任务开始生效。',
+        defaultValue: false
+      }, {
         key: CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY,
         label: '跨对话协作',
         type: 'boolean',
@@ -216,6 +223,7 @@ function summarizeRunAgentToolCall(rawArgs: unknown, context: ToolCallSummaryCon
   if (!(RUN_AGENT_OPERATIONS as readonly string[]).includes(operation)) return undefined;
   const answerBridgeId = typeof args.answerBridgeId === 'string' ? args.answerBridgeId.trim() : '';
   if (operation === 'interrupt_subtree') return answerBridgeId ? `Interrupt Agent · ${answerBridgeId}` : 'Interrupt Agent';
+  if (operation === 'delete_subtree') return answerBridgeId ? `删除子 Agent · ${answerBridgeId}` : '删除子 Agent';
   if (['list', 'read', 'wait'].includes(operation)) return `${operation} child tasks${answerBridgeId ? ` · ${answerBridgeId}` : ''}`;
   const prompt = typeof args.prompt === 'string' ? normalizeSummaryText(args.prompt) : '';
   const resolvedType = runAgentTypeFromValue(context.result) ?? runAgentTypeFromValue(context.progress);
@@ -246,7 +254,7 @@ function runAgentTypeFromValue(value: unknown): string | undefined {
 
 function resolveRunAgentScheduling(rawArgs: unknown): { mode: 'parallel' | 'serial'; reason: string } {
   const args = (rawArgs ?? {}) as RunAgentSchedulingArgs;
-  if (typeof args.operation === 'string' && args.operation.trim() === 'interrupt_subtree') return { mode: 'serial', reason: 'interrupt_subtree' };
+  if (args.operation === 'interrupt_subtree' || args.operation === 'delete_subtree') return { mode: 'serial', reason: args.operation };
   if (args.scheduling === 'serial') return { mode: 'serial', reason: 'explicit_serial' };
   if (args.scheduling === 'parallel') return { mode: 'parallel', reason: 'explicit_parallel' };
 

@@ -17,6 +17,7 @@ import {
 } from '../../shared/agentScheduling';
 import {
   SKILLS_TOOL_NAME,
+  ALLOW_DELETE_SUBAGENTS_CONFIG_KEY,
   SWITCH_WORK_ENVIRONMENT_TOOL_NAME,
   TRANSFER_TOOL_NAME,
   type SkillDefinitionRecord,
@@ -670,14 +671,17 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
 
   private projectDefinition(input: EffectiveToolDefinitionInput): ReliableAgentToolDefinition {
     let declaration = input.definition.declaration;
-    if (!input.allowChildSpawn) {
+    if (declaration.name === RUN_AGENT_TOOL_NAME && (!input.allowChildSpawn || !input.allowChildDelete)) {
       const parameters = plainOptionalRecord(normalizePlainJson(declaration.parameters ?? {})) ?? {};
       const properties = plainOptionalRecord(parameters.properties) ?? {};
       const operation = plainOptionalRecord(properties.operation) ?? {};
       declaration = { ...declaration,
-        description: `${declaration.description}\nNew child spawning is unavailable at the current depth. Use list/read/wait/send/interrupt_subtree for existing children.`,
+        description: (input.allowChildDelete ? declaration.description
+          : declaration.description.split('\n').filter(line => !line.startsWith('- delete_subtree ')).join('\n'))
+          + (input.allowChildSpawn ? '' : '\nNew child spawning is unavailable at the current depth. Existing child operations remain available.'),
         parameters: { ...parameters, properties: { ...properties,
-          operation: { ...operation, enum: RUN_AGENT_OPERATIONS.filter(value => value !== 'spawn') }
+          operation: { ...operation, enum: RUN_AGENT_OPERATIONS.filter(value =>
+            (value !== 'spawn' || input.allowChildSpawn) && (value !== 'delete_subtree' || input.allowChildDelete)) }
         } }
       };
     }
@@ -2172,6 +2176,8 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     ).map((definition): EffectiveToolDefinitionInput => ({
       definition,
       allowChildSpawn: definition.declaration.name !== RUN_AGENT_TOOL_NAME || allowChildSpawn,
+      allowChildDelete: definition.declaration.name === RUN_AGENT_TOOL_NAME
+        && toolPolicy.toolConfigs[RUN_AGENT_TOOL_NAME]?.config?.[ALLOW_DELETE_SUBAGENTS_CONFIG_KEY] === true,
       nativeAsync: nativeAsyncTools.has(toolConfigKey(definition.declaration))
     }));
     this.augmentSkillsInput(inputs, authority.document);

@@ -23,6 +23,32 @@ function globals(t) {
   });
 }
 
+test('Agent 删除子任务开关默认关闭，保存与恢复继承只修改对应配置', async t => {
+  const f = graph.session(t);
+  const { createBuiltinToolDefinitions } = compiled('backend/world/modules/tools/definitions/index.js');
+  const { commandDeclarationCapability } = compiled('backend/reliableKernel/builtinToolCatalog.js');
+  const { toolDefinitionRecord } = compiled('backend/world/modules/tools/registry.js');
+  f.client.configurationReady = true;
+  f.client.toolDefinitions = createBuiltinToolDefinitions({ command: commandDeclarationCapability() }).map(toolDefinitionRecord);
+  const { view } = f.mount('Collaboration', { scopeKind: 'agent', scopeId: 'worker' });
+  assert.equal(view.deleteChildField.enabled, false);
+  view.setDeleteChild(true);
+  const write = f.last(T.ToolPolicyScopeSet);
+  assert.equal(write.payload.toolConfigs.run_agent.config.allowDeleteSubagents, true);
+  assert.equal(write.payload.allowedTools, undefined);
+  f.client.toolPolicies = [{ id: 'delete-global', name: 'Global', toolConfigs: { run_agent: { config: { allowDeleteSubagents: true } } } },
+    { id: 'delete-agent', name: 'Agent', toolConfigs: { run_agent: { config: { allowDeleteSubagents: false, maxChildAgentDepth: 2 } } } }];
+  f.client.toolPolicyScopeLinks = [{ id: 'delete-global-link', scopeKind: 'global', role: 'active', toolPolicyId: 'delete-global' },
+    { id: 'delete-agent-link', scopeKind: 'agent', scopeId: 'worker', role: 'active', toolPolicyId: 'delete-agent' }];
+  assert.equal(view.deleteChildField.enabled, false);
+  view.setDeleteChild(undefined);
+  const restore = f.last(T.ToolPolicyScopeSet);
+  assert.equal(restore.payload.toolConfigs.run_agent.config.allowDeleteSubagents, undefined);
+  assert.equal(restore.payload.toolConfigs.run_agent.config.maxChildAgentDepth, 2);
+  f.client.toolPolicies[1].toolConfigs.run_agent.config = { maxChildAgentDepth: 2 };
+  assert.equal(view.deleteChildField.enabled, true);
+});
+
 test('真实自动保存仅在最新编辑和多面板确认到齐后放行', async t => {
   const f = globals(t), { GlobalSettingsSaveBarrier } = compiled('backend/application/reliableKernel/GlobalSettingsSaveBarrier.js');
   const barrier = new GlobalSettingsSaveBarrier(1000), flushMessages = [];
