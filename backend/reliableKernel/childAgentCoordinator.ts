@@ -45,6 +45,7 @@ import type {
   SkillDefinitionRecord,
   SkillPolicyRecord
 } from '../../shared/protocol';
+import { ALLOW_DELETE_SUBAGENTS_CONFIG_KEY } from '../../shared/protocol';
 import {
   ExecutionEligibilityLostError,
   ExecutionHandoffError,
@@ -123,6 +124,10 @@ export interface ReliableChildAgentCoordinatorDependencies {
     notify(): void;
   };
   cancelTurnExecution?: (input: { turnId: string; reason: string }) => Promise<void>;
+  /** Product's existing stop-and-delete command, including deletion records for later merges. */
+  deleteConversation?: (input: { conversationId: string; requestId: string }) => Promise<{
+    deletedConversationIds: string[]; deletionRecordError?: string;
+  } | null>;
   /** Closes work a window left running when it exited unexpectedly; used only by a user's stop. */
   deadHostEffects?: {
     deadHostEffectsForTurn(turnId: string, selfHostBootId: string): Promise<DeadHostTurnEffects>;
@@ -2085,6 +2090,8 @@ export class ReliableChildAgentCoordinator {
         return this.waitChildTasks(input, args, signal);
       case 'interrupt_subtree':
         return this.interruptChild(input, args);
+      case 'delete_subtree':
+        return this.deleteChild(input, args, authority, signal);
       default:
         throw new Error(`Unsupported run_agent operation: ${operation}.`);
     }
@@ -2177,7 +2184,7 @@ export class ReliableChildAgentCoordinator {
       const own = new Set(projection.tasks.map(item => item.answerBridgeId));
       if (forkInheritedChildTargets(handles, own).includes(bridgeId)) {
         throw new Error(`子 Agent ${bridgeId} 属于分支来源对话：本分支只从复制的历史中继承了它的引用，没有继承父子关系，`
-          + '因此不能在这里读取、等待、续聊或中断它；需要时请在来源对话中操作，或在本对话新建子 Agent。');
+          + '因此不能在这里读取、等待、续聊、中断或删除它；需要时请在来源对话中操作，或在本对话新建子 Agent。');
       }
     }
     throw new Error(`Child task ${bridgeId} is outside the caller's ${scope} parent lineage or does not exist.`);
@@ -2497,6 +2504,31 @@ export class ReliableChildAgentCoordinator {
     }, `run-agent-interrupt:${input.toolCallId}`);
   }
 
+  private async deleteChild(input: ReliableAgentToolDispatchInput, args: { [key: string]: PlainJsonValue },
+    authority: ReliableToolDispatchAuthority | undefined, signal?: AbortSignal): Promise<ChildDispatchResult> {
+    if (authority?.toolConfig?.config?.[ALLOW_DELETE_SUBAGENTS_CONFIG_KEY] !== true) {
+      throw new Error('当前任务未开启“允许 Agent 删除子 Agent”，不能删除子任务。');
+    }
+    const remove = this.dependencies.deleteConversation;
+    if (!remove) throw new Error('当前宿主未接入子 Agent 删除操作。');
+    const answerBridgeId = requireText(args.answerBridgeId, 'run_agent.answerBridgeId');
+    const conversationId = await this.conversationForCaller(input);
+    // Replaying a deletion after its target vanished is a no-op. Existing foreign targets still
+    // go through the same direct-parent lineage check as send and interrupt.
+    if (!await this.get('AnswerBridge', answerBridgeId)) return this.settleOwnTool(input.toolCallId,
+      { ok: true, operation: 'delete_subtree', status: 'not_found', answerBridgeId, deletedCount: 0 }, `run-agent-delete:${input.toolCallId}`);
+    const projection = await this.dependencies.children.readConversationTaskProjection(conversationId, []);
+    const task = await this.requireScopedChildTask(projection, answerBridgeId, 'direct');
+    signal?.throwIfAborted();
+    const deleted = await remove({ conversationId: task.conversationId,
+      requestId: `run-agent-delete:${input.toolCallId}` });
+    return this.settleOwnTool(input.toolCallId, {
+      ok: true, operation: 'delete_subtree', status: deleted ? 'deleted' : 'not_found', answerBridgeId,
+      deletedCount: deleted?.deletedConversationIds.length ?? 0,
+      ...(deleted?.deletionRecordError ? { warning: deleted.deletionRecordError } : {})
+    }, `run-agent-delete:${input.toolCallId}`);
+  }
+
   /**
    * The final output of a child task Turn becomes the answer on its AnswerBridge: it settles a
    * waiting run_agent call or is delivered to the parent. A peer's followup taken in by that Turn
@@ -2624,7 +2656,7 @@ export class ReliableChildAgentCoordinator {
     this.ensureRecoveryPolling();
     void task.then((result) => {
       terminalStatus = result.terminalStatus;
-    }, (error) => {
+    }, async (error) => {
       if (this.disposing || this.handoff) return;
       if (isExecutionHandoffError(error)) {
         handoff = true;
@@ -2633,6 +2665,9 @@ export class ReliableChildAgentCoordinator {
       // Another live owner claimed the child Conversation between recovery and launch; its own
       // coordinator drives the Turn, so there is nothing local to report or recover.
       if (isConversationRuntimeOwnerBusyError(error)) return;
+      // Stop-and-delete can remove the terminal child before this in-flight drive unwinds.
+      const remaining = await this.get('ChildExecution', childExecutionId).catch(() => undefined);
+      if (remaining === null || this.disposing || this.handoff) return;
       this.reportError(error, 'drive-child-terminalization', turnId);
     }).finally(() => {
       if (this.activeTurns.get(turnId) === task) this.activeTurns.delete(turnId);
@@ -3452,7 +3487,8 @@ const RUN_AGENT_OPERATION_FIELDS: Record<typeof RUN_AGENT_OPERATIONS[number], re
   list: ['scope', 'status', 'limit', 'cursor'],
   read: ['answerBridgeId', 'scope', 'limit', 'cursor'],
   wait: ['answerBridgeId', 'answerBridgeIds', 'scope', 'timeoutMs'],
-  interrupt_subtree: ['answerBridgeId']
+  interrupt_subtree: ['answerBridgeId'],
+  delete_subtree: ['answerBridgeId']
 };
 const RUN_AGENT_ARGUMENT_FIELDS = new Set(Object.values(RUN_AGENT_OPERATION_FIELDS).flat());
 
@@ -3486,7 +3522,7 @@ export function validateRunAgentToolArguments(value: unknown): { [key: string]: 
       if (args.interrupt !== undefined && typeof args.interrupt !== 'boolean') {
         throw new ToolArgumentError('run_agent.interrupt must be a boolean.');
       }
-    } else if (operation === 'read' || operation === 'interrupt_subtree') {
+    } else if (operation === 'read' || operation === 'interrupt_subtree' || operation === 'delete_subtree') {
       args.answerBridgeId = requireText(args.answerBridgeId, 'run_agent.answerBridgeId');
     } else if (operation === 'wait') {
       const references = childTaskWaitReferences(args);

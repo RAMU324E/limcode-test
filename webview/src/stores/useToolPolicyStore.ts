@@ -12,7 +12,7 @@ import type {
   ToolPolicyScopeSetPayload,
   ToolPolicyToolConfigRecord
 } from '@shared/protocol';
-import { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, CROSS_CONVERSATION_TOOL_NAMES, READONLY_CROSS_CONVERSATION_TOOL_NAMES, TOOL_POLICY_ALL_MCP_SOURCES } from '@shared/protocol';
+import { ALLOW_DELETE_SUBAGENTS_CONFIG_KEY, CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, CROSS_CONVERSATION_TOOL_NAMES, READONLY_CROSS_CONVERSATION_TOOL_NAMES, TOOL_POLICY_ALL_MCP_SOURCES } from '@shared/protocol';
 import {
   crossConversationSwitchOn,
   crossConversationToolPermitted,
@@ -36,7 +36,7 @@ import { DEFAULT_WORKFLOW_OPTION_ID, useWorkflowStore } from './useWorkflowStore
 export const SUB_AGENT_TOOL_NAME = 'run_agent';
 export const AGENT_COLLABORATION_CONFIG_KEYS = ['maxChildAgentDepth', 'maxConcurrentAgents', 'maxAutomaticFollowups'] as const;
 export type AgentCollaborationConfigKey = typeof AGENT_COLLABORATION_CONFIG_KEYS[number];
-export { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, CROSS_CONVERSATION_TOOL_NAMES, READONLY_CROSS_CONVERSATION_TOOL_NAMES };
+export { ALLOW_DELETE_SUBAGENTS_CONFIG_KEY, CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, CROSS_CONVERSATION_TOOL_NAMES, READONLY_CROSS_CONVERSATION_TOOL_NAMES };
 
 export interface ToolPolicyResolution {
   policy?: ToolPolicyRecord;

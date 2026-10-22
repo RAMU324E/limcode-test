@@ -72,7 +72,7 @@ function explainDeleteRestriction(): void { const agent = activeAgent.value; if 
       <span class="agent-pill">{{ activeAgent.source === 'builtin' ? '内置' : '用户' }}</span>
     </div>
 
-    <AgentCollaborationSettings v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 协作" />
+    <AgentCollaborationSettings v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="当前 Agent 协作设置" />
 
     <label v-if="activeAgent" class="global-settings-field global-settings-field-wide">
       <span>Agent 描述</span>

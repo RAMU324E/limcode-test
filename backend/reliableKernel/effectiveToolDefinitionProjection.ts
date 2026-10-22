@@ -12,6 +12,7 @@ import {
 export interface EffectiveToolDefinitionInput {
   definition: ToolDefinition;
   allowChildSpawn: boolean;
+  allowChildDelete?: boolean;
   nativeAsync: boolean;
   skillDescription?: string;
   environmentText?: string;
@@ -85,7 +86,7 @@ export class EffectiveToolDefinitionProjection {
 }
 
 function sameProjectionInput(left: EffectiveToolDefinitionInput, right: EffectiveToolDefinitionInput): boolean {
-  return left.allowChildSpawn === right.allowChildSpawn && left.nativeAsync === right.nativeAsync
+  return left.allowChildSpawn === right.allowChildSpawn && left.allowChildDelete === right.allowChildDelete && left.nativeAsync === right.nativeAsync
     && left.skillDescription === right.skillDescription && left.environmentText === right.environmentText
     && left.agentTypeList === right.agentTypeList
     && sameToolDeclarationProjection(left.definition.declaration, right.definition.declaration);

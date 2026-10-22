@@ -7,6 +7,7 @@ import type { FrozenWorkEnvironmentBoundaryPolicy } from './workEnvironmentBound
 import { requireSkillSourceConfigs } from '../world/modules/skill/policy';
 import {
   ALLOW_OUTSIDE_PROJECT_PATHS_CONFIG_KEY,
+  ALLOW_DELETE_SUBAGENTS_CONFIG_KEY,
   TOOL_POLICY_ALL_MCP_SOURCES,
   type SkillPolicySourceConfigRecord,
   type SkillSource,
@@ -74,7 +75,8 @@ const MAX_INHERITED_DEPTH = 64;
  *   `disabledTools` add up; a source the parent never enabled stays off.
  * - Settings that decide whether something may run at all, merged exactly: a path outside the
  *   project (`allowOutsideProjectPaths`) and ask_user/submit_plan auto-approval (`autoApprove`)
- *   need both sides; `denyCommands` add up; `maxChildAgentDepth` takes the smaller depth.
+ *   and child deletion (`allowDeleteSubagents`) need both sides; `denyCommands` add up;
+ *   `maxChildAgentDepth` takes the smaller depth.
  * - Execution approval, automatic change application, automatic result submission and
  *   `allowCommands` depend on the call, so they stay per side: `inherited` keeps the parent's
  *   policy and dispatch requires every side on the chain to agree (`inheritedToolPolicyChain`).
@@ -298,6 +300,7 @@ type ConfigRule = 'both' | 'union' | 'min';
 /** Config keys that decide whether something may run at all, and how two sides combine. */
 const BOUNDED_CONFIG_KEYS: ReadonlyArray<readonly [string, ConfigRule]> = [
   [ALLOW_OUTSIDE_PROJECT_PATHS_CONFIG_KEY, 'both'],
+  [ALLOW_DELETE_SUBAGENTS_CONFIG_KEY, 'both'],
   ['autoApprove', 'both'],
   ['denyCommands', 'union'],
   [MAX_CHILD_AGENT_DEPTH_CONFIG_KEY, 'min']
