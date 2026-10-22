@@ -95,6 +95,8 @@ llmProviderConfigs:
 
 Agent / Workflow / Conversation 复用模型和渠道时，通过独立模型配置及作用域关系引用配置 id，不把渠道配置对象嵌入主体。
 
+Agent / 工作流的模型选择复用 `ModelProfileScopeEditor`：下拉展示已保存的渠道模型，选择渠道时先选中其当前默认模型，标为“渠道默认配置”。获取模型与手动添加复用渠道现有入口，仅更新指定渠道的模型列表，不激活渠道、不更改渠道默认模型，也不自动保存 Agent 的选择；保存仍使用确切的 `providerConfigId + model`。切换渠道或编辑对象时关闭旧获取弹窗，获取响应继续由现有请求关联校验。
+
 ### 4.1 GPT-6 原生 Responses 配置
 
 - `LlmProviderConfigRecord.nativeResponses` 与模型专属配置的同名字段只保存 `enabled`、`asyncTools`、`steering`、`reasoningUpdates`、`multiplexing` 布尔选项；仍通过 `llmProviderConfigs` section 保存，不新增 Bridge CRUD 或数据目录。

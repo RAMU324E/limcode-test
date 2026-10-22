@@ -1267,10 +1267,10 @@ function isSectionDirty(state: GlobalSettingsState, section: GlobalSettingsSecti
   return contentDirty || state.pendingSettingsSections[section] === true || hasPendingSectionSave(section);
 }
 
-function clearModelFetch(state: object): void {
-  const pending = pendingModelFetches.get(state);
+function clearModelFetch(store: { $state: object }): void {
+  const pending = pendingModelFetches.get(store.$state);
   if (pending?.timeout !== undefined) window.clearTimeout(pending.timeout);
-  pendingModelFetches.delete(state);
+  pendingModelFetches.delete(store.$state);
 }
 
 /** 全局设置（数据目录 + LLM 渠道配置）表单 store。组件只读 state + 调 action，传输细节收口在此。 */
@@ -2283,12 +2283,13 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       const pending: PendingModelFetch = {
         requestId, configId: requestConfig.id, provider: requestConfig.provider, baseUrl: requestConfig.baseUrl.trim()
       };
-      pendingModelFetches.set(this, pending);
+      // 浏览器的 action 跟踪可能包装 this；同一渠道请求始终按稳定的 store state 关联。
+      pendingModelFetches.set(this.$state, pending);
       this.status = '正在获取 LLM 列表…';
       this.fetchedModelsDialog = { open: true, loading: true, configId: requestConfig.id, models: [] };
       // Register both the identity and deadline before posting: a synchronous reply may finish it.
       pending.timeout = window.setTimeout(() => {
-        if (pendingModelFetches.get(this) !== pending) return;
+        if (pendingModelFetches.get(this.$state) !== pending) return;
         clearModelFetch(this);
         this.status = '获取 LLM 列表超时，请检查 Base URL、API Key 或网络代理设置。';
         this.fetchedModelsDialog = { open: true, loading: false, configId: requestConfig.id, models: [] };
@@ -2296,7 +2297,7 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       try {
         bridge.request(BridgeMessageType.LlmProviderModelsGet, { config: requestConfig }, { requestId });
       } catch (error) {
-        if (pendingModelFetches.get(this) !== pending) return;
+        if (pendingModelFetches.get(this.$state) !== pending) return;
         this.status = `获取 LLM 列表请求发送失败：${error instanceof Error ? error.message : String(error)}`;
         this.closeFetchedModelsDialog();
       }
@@ -2763,7 +2764,7 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       }
       // A list response belongs to the open request, never to a probe or an earlier dialog.
       if (payload.purpose === undefined) {
-        const pending = pendingModelFetches.get(this);
+        const pending = pendingModelFetches.get(this.$state);
         if (!pending || pending.requestId !== correlationId || pending.configId !== payload.configId
           || pending.provider !== payload.provider || pending.baseUrl !== payload.baseUrl.trim()
           || !this.fetchedModelsDialog.open || this.fetchedModelsDialog.configId !== pending.configId) return;
@@ -2804,7 +2805,7 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
           this.status = `端点验证失败：${message}`;
           return;
         }
-        const pending = pendingModelFetches.get(this);
+        const pending = pendingModelFetches.get(this.$state);
         if (!pending || pending.requestId !== options.correlationId) return;
         this.closeFetchedModelsDialog();
         this.status = settingsErrorStatus(options.requestType, message);
