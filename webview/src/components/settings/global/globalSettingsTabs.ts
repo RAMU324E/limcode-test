@@ -61,8 +61,8 @@ export const GLOBAL_SETTINGS_TABS: readonly GlobalSettingsTabDefinition[] = [
   },
   {
     key: 'agent-collaboration',
-    label: 'Agent 协作',
-    description: '子 Agent 深度与团队预算',
+    label: 'Agent 协作默认值',
+    description: '协作开关、子 Agent 深度与团队预算的全局默认值',
     icon: IconRobot,
     component: AgentCollaborationSettingsTab
   },

@@ -87,7 +87,8 @@ const sourceError = computed(() => store.sourceConfigErrorFor(props.scopeKind, p
 /** A child task's conversation: the cross-conversation tools are never offered there. */
 const childConversation = computed(() => props.scopeKind === 'conversation' && store.isChildConversation(props.scopeId));
 /** Where the cross-conversation switch lives for this scope. */
-const collaborationArea = computed(() => props.scopeKind === 'global' ? '全局设置的「Agent 协作」页' : '当前设置页顶部的「Agent 协作」区域');
+const collaborationArea = computed(() => props.scopeKind === 'global' ? '全局设置的「Agent 协作默认值」页'
+  : props.scopeKind === 'agent' ? '当前设置页顶部的「当前 Agent 协作设置」区域' : '当前设置页顶部的「Agent 协作」区域');
 // Mirrors the backend child bound (childExecutionBoundary.ts): a child Turn keeps only what its parent Turn also allows.
 // A Plan the user approved to run in a new conversation is the exception: it keeps the executor's own settings.
 const childBoundNote = computed(() => {
