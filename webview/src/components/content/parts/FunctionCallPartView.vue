@@ -167,6 +167,11 @@ const transientPreview = computed(() => {
 const transientPreviewAwaitingExecution = computed(() => props.streaming === true
   || toolCall.value?.status === 'streaming'
   || toolCall.value?.status === 'queued');
+// 预览卡换成正式工具卡时淡入，避免整块瞬间替换；历史消息里直接出现的工具卡不做动画。
+const revealedFromPreview = ref(false);
+watch(transientPreview, (next, previous) => {
+  if (previous && !next) revealedFromPreview.value = true;
+});
 const executionInteraction = computed(() => reliableInteractionForKind('exec_approval'));
 const fileChangeInteractionView = computed(() => reliableInteractionForKind('patch_approval'));
 const resultReviewInteraction = computed(() => reliableInteractionForKind('result_review'));
@@ -1019,7 +1024,8 @@ function isFinalizingProgress(progress: unknown): boolean {
       hasBatchMeta ? `batch-${batchState}` : undefined,
       hasBatchMeta ? `batch-pos-${batchPosition}` : undefined,
       hasBatchMeta ? `batch-mode-${batchMode}` : undefined,
-      hasBatchMeta ? `batch-color-${batchColorIndex ?? 1}` : undefined
+      hasBatchMeta ? `batch-color-${batchColorIndex ?? 1}` : undefined,
+      { 'is-revealed-from-preview': revealedFromPreview }
     ]"
     kind="input"
     :collapsible="hasDetails"
@@ -1242,6 +1248,10 @@ function isFinalizingProgress(progress: unknown): boolean {
   font-size: var(--font-size-sm);
   font-style: normal;
   --tool-batch-color: transparent;
+}
+
+.tool-call-card.is-revealed-from-preview {
+  animation: lc-block-reveal var(--lc-block-reveal-duration) ease-out both;
 }
 
 .tool-call-card.batch-color-1 { --tool-batch-color: #6a9955; }

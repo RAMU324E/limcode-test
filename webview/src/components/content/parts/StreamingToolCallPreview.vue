@@ -180,6 +180,7 @@ function stoppedPreviewTitle(kind: ReturnType<typeof toolCallPreviewPresentation
   background: color-mix(in srgb, var(--vscode-editor-background) 96%, var(--vscode-foreground) 4%);
   color: var(--vscode-foreground);
   min-width: 0;
+  animation: lc-block-reveal var(--lc-block-reveal-duration) ease-out both;
 }
 
 .tool-preview-card.is-compact {
@@ -322,6 +323,7 @@ function stoppedPreviewTitle(kind: ReturnType<typeof toolCallPreviewPresentation
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .tool-preview-card,
   .tool-preview-pulse i,
   .tool-preview-caret { animation: none; }
 }
