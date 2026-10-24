@@ -163,6 +163,10 @@ const transientPreview = computed(() => {
     { includeFinal: true }
   );
 });
+// 预览只在工具还没开始执行时显示：模型仍在输出，或工具调用已落库但仍在流式/排队。
+const transientPreviewAwaitingExecution = computed(() => props.streaming === true
+  || toolCall.value?.status === 'streaming'
+  || toolCall.value?.status === 'queued');
 const executionInteraction = computed(() => reliableInteractionForKind('exec_approval'));
 const fileChangeInteractionView = computed(() => reliableInteractionForKind('patch_approval'));
 const resultReviewInteraction = computed(() => reliableInteractionForKind('result_review'));
@@ -1001,6 +1005,7 @@ function isFinalizingProgress(progress: unknown): boolean {
     v-if="transientPreview"
     :preview="transientPreview"
     :active="props.streaming === true"
+    :awaiting-execution="transientPreviewAwaitingExecution"
     :max-body-height="streamingPreviewMaxBodyHeight"
     :compact="props.batchMode === 'parallel' && (props.batchSize ?? 1) > 1"
   />
