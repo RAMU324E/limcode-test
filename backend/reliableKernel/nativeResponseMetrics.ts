@@ -5,7 +5,7 @@
  * that excludes the time spent running tools.
  */
 
-import type { ModelResponseMetric, ModelResponseMetrics, ModelResponseTiming } from '../../shared/protocol';
+import { MIN_TOKEN_SPEED_OUTPUT_MS, type ModelResponseMetric, type ModelResponseMetrics, type ModelResponseTiming } from '../../shared/protocol';
 
 /** Newest responses kept for the per-round breakdown; the totals below cover every response. */
 export const MAX_RECENT_NATIVE_RESPONSE_METRICS = 8;
@@ -14,6 +14,7 @@ const MAX_RESPONSE_ID_LENGTH = 512;
 
 const TIMING_FIELDS = new Set(['startedAt', 'completedAt', 'firstOutputAt', 'ttftMs', 'outputDurationMs']);
 const METRIC_FIELDS = new Set([...TIMING_FIELDS, 'responseId', 'outputTokens', 'reasoningTokens']);
+// speedTotalDurationMs was written by an earlier build; it is accepted and ignored.
 const METRICS_FIELDS = new Set([
   'responseCount', 'first', 'recent', 'ttftTotalMs', 'ttftCount', 'speedOutputTokens', 'speedOutputDurationMs', 'speedTotalDurationMs'
 ]);
@@ -51,11 +52,8 @@ export function foldNativeResponseMetrics(
     ...(outputTokens === undefined ? {} : { outputTokens }),
     ...(reasoningTokens === undefined ? {} : { reasoningTokens })
   };
-  const durationMs = Math.max(0, metric.completedAt - metric.startedAt);
-  const timed = metric.outputTokens !== undefined && durationMs > 0;
-  // An existing aggregate without this measurement cannot supply its earlier request time.
-  const speedTotalDurationMs = previous && previous.speedTotalDurationMs === undefined ? undefined
-    : (previous?.speedTotalDurationMs ?? 0) + (timed ? durationMs : 0);
+  const timed = metric.outputTokens !== undefined && metric.outputDurationMs !== undefined
+    && metric.outputDurationMs >= MIN_TOKEN_SPEED_OUTPUT_MS;
   return {
     responseCount: (previous?.responseCount ?? 0) + 1,
     first: previous?.first ?? metric,
@@ -63,8 +61,7 @@ export function foldNativeResponseMetrics(
     ttftTotalMs: (previous?.ttftTotalMs ?? 0) + (metric.ttftMs ?? 0),
     ttftCount: (previous?.ttftCount ?? 0) + (metric.ttftMs === undefined ? 0 : 1),
     speedOutputTokens: (previous?.speedOutputTokens ?? 0) + (timed ? metric.outputTokens! : 0),
-    speedOutputDurationMs: (previous?.speedOutputDurationMs ?? 0) + (timed ? metric.outputDurationMs ?? 0 : 0),
-    ...(speedTotalDurationMs === undefined ? {} : { speedTotalDurationMs })
+    speedOutputDurationMs: (previous?.speedOutputDurationMs ?? 0) + (timed ? metric.outputDurationMs! : 0)
   };
 }
 
@@ -87,10 +84,7 @@ export function parseNativeResponseMetrics(
     ttftTotalMs: requireInteger(record.ttftTotalMs, `${label}.ttftTotalMs`, 0),
     ttftCount,
     speedOutputTokens: requireInteger(record.speedOutputTokens, `${label}.speedOutputTokens`, 0),
-    speedOutputDurationMs: requireInteger(record.speedOutputDurationMs, `${label}.speedOutputDurationMs`, 0),
-    ...(record.speedTotalDurationMs === undefined ? {} : {
-      speedTotalDurationMs: requireInteger(record.speedTotalDurationMs, `${label}.speedTotalDurationMs`, 0)
-    })
+    speedOutputDurationMs: requireInteger(record.speedOutputDurationMs, `${label}.speedOutputDurationMs`, 0)
   };
 }
 

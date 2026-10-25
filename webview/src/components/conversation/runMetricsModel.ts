@@ -1,4 +1,4 @@
-import type { MessageRecord, ModelResponseMetric } from '../../../../shared/protocol';
+import { MIN_TOKEN_SPEED_OUTPUT_MS, type MessageRecord, type ModelResponseMetric } from '../../../../shared/protocol';
 import { normalizeTokenUsage } from './tokenUsageModel';
 
 /** One physical response of a native request, numbered from the request's first response. */
@@ -6,7 +6,6 @@ export interface ModelRunRound {
   index: number;
   ttftMs?: number;
   outputDurationMs?: number;
-  speedDurationMs?: number;
   outputTokens?: number;
   tokenSpeed?: number;
 }
@@ -18,9 +17,8 @@ export interface ModelRunMetrics {
   totalMs?: number;
   /** First observed output to completion; native responses exclude the tool time between them. */
   outputDurationMs?: number;
-  /** Request time including first-output wait; native responses exclude tool waits between them. */
-  speedDurationMs?: number;
   outputTokens?: number;
+  /** Output tokens over output time, only for spans of at least MIN_TOKEN_SPEED_OUTPUT_MS. */
   tokenSpeed?: number;
   /** Native requests only. */
   roundCount?: number;
@@ -46,17 +44,15 @@ export function modelRunMetrics(message: MessageRecord, streaming: boolean): Mod
   if (response) {
     const ttftMs = response.first.ttftMs;
     const outputDurationMs = response.speedOutputDurationMs > 0 ? response.speedOutputDurationMs : undefined;
-    const speedDurationMs = positiveNumber(response.speedTotalDurationMs);
     const firstRoundIndex = response.responseCount - response.recent.length + 1;
     return {
       ...(ttftMs === undefined ? {} : { ttftMs }),
       ...totalMetric(requestStartedAt, completedAt),
       ...(outputDurationMs === undefined ? {} : { outputDurationMs }),
-      ...(speedDurationMs === undefined ? {} : {
-        speedDurationMs,
+      ...(outputDurationMs !== undefined && outputDurationMs >= MIN_TOKEN_SPEED_OUTPUT_MS ? {
         outputTokens: response.speedOutputTokens,
-        tokenSpeed: response.speedOutputTokens / (speedDurationMs / 1000)
-      }),
+        tokenSpeed: response.speedOutputTokens / (outputDurationMs / 1000)
+      } : {}),
       roundCount: response.responseCount,
       ...(response.ttftCount > 0 ? { averageTtftMs: response.ttftTotalMs / response.ttftCount } : {}),
       rounds: response.recent.map((metric, offset) => roundMetric(metric, firstRoundIndex + offset))
@@ -76,25 +72,23 @@ export function modelRunMetrics(message: MessageRecord, streaming: boolean): Mod
   return {
     ...(observedTtftMs === undefined ? {} : { ttftMs: observedTtftMs }),
     ...(totalMs === undefined ? {} : { totalMs }),
-    ...(totalMs === undefined ? {} : { speedDurationMs: totalMs }),
     ...(outputDurationMs === undefined ? {} : { outputDurationMs }),
     ...(outputTokens === undefined ? {} : { outputTokens }),
-    ...(totalMs !== undefined && totalMs > 0 && outputTokens !== undefined
-      ? { tokenSpeed: outputTokens / (totalMs / 1000) }
+    ...(outputDurationMs !== undefined && outputDurationMs >= MIN_TOKEN_SPEED_OUTPUT_MS && outputTokens !== undefined
+      ? { tokenSpeed: outputTokens / (outputDurationMs / 1000) }
       : {})
   };
 }
 
 function roundMetric(metric: ModelResponseMetric, index: number): ModelRunRound {
-  const speedDurationMs = Math.max(0, metric.completedAt - metric.startedAt);
-  const timed = metric.outputTokens !== undefined && speedDurationMs > 0;
+  const timed = metric.outputTokens !== undefined && metric.outputDurationMs !== undefined
+    && metric.outputDurationMs >= MIN_TOKEN_SPEED_OUTPUT_MS;
   return {
     index,
     ...(metric.ttftMs === undefined ? {} : { ttftMs: metric.ttftMs }),
     ...(metric.outputDurationMs === undefined ? {} : { outputDurationMs: metric.outputDurationMs }),
-    ...(speedDurationMs > 0 ? { speedDurationMs } : {}),
     ...(metric.outputTokens === undefined ? {} : { outputTokens: metric.outputTokens }),
-    ...(timed ? { tokenSpeed: metric.outputTokens! / (speedDurationMs / 1000) } : {})
+    ...(timed ? { tokenSpeed: metric.outputTokens! / (metric.outputDurationMs! / 1000) } : {})
   };
 }
 
