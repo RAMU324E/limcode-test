@@ -27,8 +27,11 @@ const fixtureHtml = `<!doctype html><html><head><link rel="icon" href="data:,"><
     { id: 'provider-write', functionCall: { name: 'write', args: { path: 'src/helper.txt', content: 'x' } } },
     { id: 'provider-read', functionCall: { name: 'read', args: { path: 'docs/main.md' } } }
   ];
-  const parts = [{ text: '先写再读', thought: true, thoughtDurationMs: 1200 }, ...calls];
+  const parts = query.has('waiting') ? []
+    : query.has('thinking') ? [{ text: '先写再读', thought: true }]
+    : [{ text: '先写再读', thought: true, thoughtDurationMs: 1200 }, ...calls];
   if (query.has('text')) parts.push({ text: '全部完成。' });
+  const streaming = query.has('waiting') || query.has('thinking');
   const session = { sessionId: 'concise-session', hostBootId: 'concise-host' };
   feed.observe({ type: 'reliable-kernel.snapshot', ...session, messageSeq: '1', snapshotCommitSeq: '1',
     projections: { activeConversationWindow: {
@@ -50,7 +53,7 @@ const fixtureHtml = `<!doctype html><html><head><link rel="icon" href="data:,"><
     } }
   });
   const message = { id: 'message', conversationId: 'conversation', role: 'model', model: 'fast-model',
-    status: 'final', content: { role: 'model', parts }, createdAt: 1, requestStartedAt: 1, completedAt: 2000 };
+    status: streaming ? 'streaming' : 'final', content: { role: 'model', parts }, createdAt: 1, requestStartedAt: 1, completedAt: 2000 };
   createApp(MessageItem, { message, floorNumber: 64 }).use(pinia).mount('#app');
 </script></body></html>`;
 
@@ -101,12 +104,23 @@ test('concise mode folds a tool-only round into one step summary row', async () 
     await summary.click();
     await page.locator('.tool-call-card').first().waitFor({ state: 'detached' });
 
-    // 有正文的消息保留头部和底栏，步骤照样折叠。
+    // 有正文的消息也不显示头部，模型名挪到底栏；步骤照样折叠。
     await open('?concise&text');
     await summary.waitFor();
-    assert.equal(await page.locator('.floor-header').count(), 1);
-    assert.equal(await page.locator('.message-footer').count(), 1);
+    assert.equal(await page.locator('.floor-header').count(), 0);
+    assert.match(await page.locator('.message-footer').innerText(), /fast-model/);
     await page.getByText('全部完成。').waitFor();
+
+    // 流式中：等待首个内容块和思考中都显示同一行步骤卡，不出现头部和独立的编写中尾行。
+    await open('?concise&waiting');
+    await page.locator('.rich-step-group').waitFor();
+    assert.equal(await page.locator('.floor-header').count(), 0);
+    assert.match(await page.locator('.rich-step-group').innerText(), /少女等待中/);
+    await open('?concise&thinking');
+    await summary.waitFor();
+    assert.match(await summary.innerText(), /少女思考中/);
+    assert.equal(await page.locator('.floor-header').count(), 0);
+    assert.equal(await page.locator('.rich-streaming-tail-row').count(), 0);
 
     // 等待审批的调用不能藏起来：摘要自动展开。
     await open('?concise&pending');
