@@ -13,6 +13,7 @@ import {
   TRANSFER_TOOL_NAME
 } from '@shared/protocol';
 import { MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN } from '@shared/agentScheduling';
+import { toolCallPreviewPresentation } from '@shared/toolCallPreview';
 import { submitPlanOutputFromResult } from '@shared/planReview';
 import type {
   FunctionCallPart,
@@ -359,6 +360,12 @@ const autoExpandDetails = computed(() => hasFilePreview.value
   || hasMandatoryInteraction.value
   || toolCall.value?.display?.autoExpand === true
   || (toolCall.value?.display?.autoExpand === undefined && defaultAutoExpandTool.value));
+// read 这类默认收起的普通工具，参数预览只会先撑开一张 JSON 卡片、生成完又缩回一行，像抽搐；
+// 只有内容会展开显示的工具才用流式预览，其余直接显示收起的工具卡（“正在生成工具调用”）。
+const showStreamingPreview = computed(() => {
+  const preview = transientPreview.value;
+  return !!preview && (autoExpandDetails.value || toolCallPreviewPresentation(preview).kind !== 'generic');
+});
 const autoOpenDiffPreview = computed(() => toolCall.value?.display?.autoOpenDiffPreview === true);
 const autoApplyChange = computed(() => {
   const policy = fileChangeInteraction.value?.policySnapshot;
@@ -1007,7 +1014,7 @@ function isFinalizingProgress(progress: unknown): boolean {
 
 <template>
   <StreamingToolCallPreview
-    v-if="transientPreview"
+    v-if="showStreamingPreview && transientPreview"
     :preview="transientPreview"
     :active="props.streaming === true"
     :awaiting-execution="transientPreviewAwaitingExecution"
@@ -1222,7 +1229,7 @@ function isFinalizingProgress(progress: unknown): boolean {
     {{ interactionResolutionMessage }}
   </p>
 
-  <div v-if="!transientPreview && needsExecutionDecision" class="tool-decision-actions is-external">
+  <div v-if="!showStreamingPreview && needsExecutionDecision" class="tool-decision-actions is-external">
     <button type="button" :disabled="interactionDecisionPending" @click="resolveToolInteraction('exec_approval', 'accept')">批准执行</button>
     <button type="button" class="secondary" :disabled="interactionDecisionPending" @click="resolveToolInteraction('exec_approval', 'reject')">拒绝</button>
   </div>
