@@ -245,16 +245,16 @@ const runMetricItems = computed<RunMetricItem[]>(() => {
     metrics.tokenSpeed !== undefined
       ? {
           key: 'speed' as const,
-          label: '平均速度',
+          label: '速度',
           value: formattokenSpeed(metrics.tokenSpeed),
-          tooltipTitle: metrics.roundCount ? '平均 Token 速度（含思考与首字等待，不含工具时间）' : '平均 Token 速度（含思考与首字等待）',
+          tooltipTitle: metrics.roundCount ? '输出 Token 速度（含思考，从首字到结束，不含工具时间）' : '输出 Token 速度（含思考，从首字到结束）',
           details: [
             { label: '输出 Token（含思考）', value: formatExactNumber(metrics.outputTokens!) },
-            { label: '计速用时（含首字等待）', value: formatDurationMs(metrics.speedDurationMs!) },
-            { label: '平均速度', value: formattokenSpeedExact(metrics.tokenSpeed) },
+            { label: '输出耗时', value: formatDurationMs(metrics.outputDurationMs!) },
+            { label: '速度', value: formattokenSpeedExact(metrics.tokenSpeed) },
             ...roundRows((round) => round.tokenSpeed === undefined
               ? undefined
-              : `${formattokenSpeedExact(round.tokenSpeed)}（${formatExactNumber(round.outputTokens!)} Token · ${formatDurationMs(round.speedDurationMs!)}）`)
+              : `${formattokenSpeedExact(round.tokenSpeed)}（${formatExactNumber(round.outputTokens!)} Token · ${formatDurationMs(round.outputDurationMs!)}）`)
           ]
         }
       : undefined

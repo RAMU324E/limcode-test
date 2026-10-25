@@ -1867,12 +1867,18 @@ export interface ModelResponseMetrics {
   recent: ModelResponseMetric[];
   ttftTotalMs: number;
   ttftCount: number;
-  /** Output tokens and observed streaming time for responses with known usage and request time. */
+  /** Output tokens and output time summed over the responses long enough to time (see below). */
   speedOutputTokens: number;
   speedOutputDurationMs: number;
-  /** Request time (including first-output wait) for the same responses; excludes tool waits. */
-  speedTotalDurationMs?: number;
 }
+
+/**
+ * Shortest first-output-to-completion span that gives an output speed. A response that arrives in
+ * one burst (common for tool calls) has a span of a few milliseconds; dividing by it reports
+ * thousands of tokens per second, while dividing by the whole request time folds in the prompt
+ * reading before the first output. Neither is the generation speed, so such responses are not timed.
+ */
+export const MIN_TOKEN_SPEED_OUTPUT_MS = 500;
 
 export interface MessageRecord {
   id: string;

@@ -49,7 +49,6 @@ export function modelRequestResponseMetrics(
   const recent = raw.recent.map(responseMetric);
   const totals = [raw.responseCount, raw.ttftTotalMs, raw.ttftCount, raw.speedOutputTokens, raw.speedOutputDurationMs];
   if (!first || recent.some((entry) => !entry) || totals.some((entry) => !isCount(entry))) return undefined;
-  if (raw.speedTotalDurationMs !== undefined && !isCount(raw.speedTotalDurationMs)) return undefined;
   return {
     responseCount: raw.responseCount as number,
     first,
@@ -57,8 +56,7 @@ export function modelRequestResponseMetrics(
     ttftTotalMs: raw.ttftTotalMs as number,
     ttftCount: raw.ttftCount as number,
     speedOutputTokens: raw.speedOutputTokens as number,
-    speedOutputDurationMs: raw.speedOutputDurationMs as number,
-    ...(raw.speedTotalDurationMs === undefined ? {} : { speedTotalDurationMs: raw.speedTotalDurationMs as number })
+    speedOutputDurationMs: raw.speedOutputDurationMs as number
   };
 }
 
