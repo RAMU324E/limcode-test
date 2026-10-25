@@ -239,12 +239,13 @@ function addStepAction(
   for (const path of paths) {
     if (typeof path === 'string' && path.trim()) action.targets.set(path, path.split(/[\\/]/).filter(Boolean).pop() ?? path);
   }
-  if (typeof args.command === 'string' && args.command.trim()) action.targets.set(args.command, shortStepText(args.command));
+  if (typeof args.command === 'string' && args.command.trim()) action.targets.set(args.command, commandProgram(args.command));
 }
 
-function shortStepText(value: string): string {
-  const text = value.trim().replace(/\s+/g, ' ');
-  return text.length > 24 ? `${text.slice(0, 23)}…` : text;
+/** 命令只显示开头的程序名（npm、git）；以变量、引号、括号或路径开头的看不出在做什么，返回空串让摘要只写条数。 */
+function commandProgram(command: string): string {
+  const first = command.trim().split(/\s+/)[0] ?? '';
+  return /^[A-Za-z][\w.-]*$/.test(first) ? first : '';
 }
 
 function toggleStepGroup(key: string, expanded: boolean): void {
