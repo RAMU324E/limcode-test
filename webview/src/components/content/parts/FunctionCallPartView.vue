@@ -39,6 +39,7 @@ import {
   reliableKernelDetailKey
 } from '@webview/domain/reliableDetailKey';
 import { useInteractionStore } from '@webview/stores/useInteractionStore';
+import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import AskUserContent from '@webview/components/askUser/AskUserContent.vue';
@@ -77,6 +78,7 @@ const reliableConversation = useReliableConversation();
 const detailOwner = `function-call:${getCurrentInstance()!.uid}`;
 onBeforeUnmount(() => reliableConversation.feed.setDetailOwnerKeys(detailOwner, []));
 const interactions = useInteractionStore();
+const globalSettings = useGlobalSettingsStore();
 const expanded = ref(false);
 const callDetailsExpanded = ref(false);
 const userChangedExpanded = ref(false);
@@ -131,7 +133,7 @@ const toolEvents = computed<ToolCallEventRecord[]>(() => {
 });
 const transientPreview = computed(() => {
   const partId = props.part.id;
-  if (!partId || !props.messageId) return undefined;
+  if (!partId || !props.messageId || globalSettings.appearance.conciseMode) return undefined;
   const projection = reliableConversation.projection.value;
   const durableCallId = toolCall.value?.id;
   // 转向边界拆分出的展示条目没有独立的持久化身份；预览与正文详请一律回溯到来源聚合消息，
@@ -346,10 +348,10 @@ const hasDetails = computed(() => hasFilePreview.value
   || Boolean(toolCall.value?.error)
   || executionApprovalPending.value
   || hasMandatoryInteraction.value);
-const autoExpandDetails = computed(() => hasFilePreview.value
-  || hasMandatoryInteraction.value
-  || toolCall.value?.display?.autoExpand === true
-  || (toolCall.value?.display?.autoExpand === undefined && defaultAutoExpandTool.value));
+const autoExpandDetails = computed(() => hasMandatoryInteraction.value
+  || (!globalSettings.appearance.conciseMode && (hasFilePreview.value
+    || toolCall.value?.display?.autoExpand === true
+    || (toolCall.value?.display?.autoExpand === undefined && defaultAutoExpandTool.value))));
 const autoOpenDiffPreview = computed(() => toolCall.value?.display?.autoOpenDiffPreview === true);
 const autoApplyChange = computed(() => {
   const policy = fileChangeInteraction.value?.policySnapshot;
