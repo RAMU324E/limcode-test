@@ -15,6 +15,7 @@ import { useContentBlockWindow } from '@webview/composables/useContentBlockWindo
 import { IconTool } from '@tabler/icons-vue';
 import StreamingIndicatorTail from './StreamingIndicatorTail.vue';
 import CollapsibleContentBlock from './CollapsibleContentBlock.vue';
+import { formatThoughtDuration } from './thoughtTiming';
 import { partViewComponent, RichRenderNodeProjector, type RichRenderNode } from './partRegistry';
 
 const props = defineProps<{
@@ -74,12 +75,13 @@ const blockWindow = useContentBlockWindow({ keys: blockKeys, root, scroller: com
 const visibleBlocks = computed(() => displayBlocks.value.slice(blockWindow.start.value, blockWindow.end.value));
 const messageToolCalls = computed(() => props.messageId
   ? reliableConversation.projection.value.toolCallsByMessageId[props.messageId] : undefined);
+const endsWithStepGroup = computed(() => displayBlocks.value[displayBlocks.value.length - 1]?.group !== undefined);
 const showToolExecutingTail = computed(() => {
-  if (props.streaming || !props.messageId) return false;
+  if (props.streaming || !props.messageId || endsWithStepGroup.value) return false;
   return messageToolCalls.value?.some(call => isToolExecutingStatus(call.status, call.progress)) ?? false;
 });
 const showStandaloneStreamingTail = computed(() => {
-  if (!props.streaming || nodes.value.length === 0) return false;
+  if (!props.streaming || nodes.value.length === 0 || endsWithStepGroup.value) return false;
   const lastIndex = nodes.value.length - 1;
   const last = nodes.value[lastIndex];
   return !!last && !nodeStreaming(last, lastIndex);
@@ -198,7 +200,8 @@ function groupStepRuns(inputNodes: RichRenderNode[]): DisplayBlock[] {
   const blocks: DisplayBlock[] = [];
   let run: { node: RichRenderNode; index: number }[] = [];
   const flushRun = (): void => {
-    if (run.length >= 2 && run.some(item => item.node.kind === 'functionCall')) {
+    // 思考一出现就进步骤卡，之后只在这一行里更新文字，不再从思考行、编写中尾行切换成卡片。
+    if (run.some(item => item.node.kind === 'thought' || item.node.kind === 'functionCall')) {
       blocks.push({ key: `steps:${run[0]!.node.key}`, group: stepGroup(run, run[run.length - 1]!.index === inputNodes.length - 1) });
     } else {
       for (const item of run) blocks.push({ key: item.node.key, ...item });
@@ -236,10 +239,19 @@ function stepGroup(items: StepGroup['items'], atEnd: boolean): StepGroup {
       || reliableConversation.projection.value.interactionByToolCallId[call.id]?.status === 'pending';
     if (call.status === 'error') failed += 1;
   }
+  const last = items[items.length - 1]!.node;
+  const thinking = props.streaming === true && atEnd && last.kind === 'thought' && last.props.thoughtOpen === true;
   let label = steps.slice(0, 3).join(' · ');
   if (steps.length > 3) label += active ? ` … ${steps[steps.length - 1]}` : ' 等';
-  const meta = [`${steps.length} 步`, failed > 0 ? `${failed} 失败` : '', active ? '进行中' : ''].filter(Boolean).join(' · ');
+  if (!label) label = thinking ? globalSettings.appearance.streamingTextThinking : thoughtLabel(items);
+  const meta = [steps.length > 0 ? `${steps.length} 步` : '', failed > 0 ? `${failed} 失败` : '',
+    thinking && steps.length > 0 ? '思考中' : active && !thinking ? '进行中' : ''].filter(Boolean).join(' · ');
   return { items, label, meta, active, forceOpen };
+}
+
+function thoughtLabel(items: StepGroup['items']): string {
+  const durationMs = items.reduce((sum, { node }) => sum + (typeof node.props.durationMs === 'number' ? node.props.durationMs : 0), 0);
+  return durationMs > 0 ? `已思考 ${formatThoughtDuration(durationMs)}` : '思考';
 }
 
 function stepLabel(part: FunctionCallPart, call: ToolCallRecord | undefined): string {
@@ -423,6 +435,12 @@ function isExecutionApprovedProgress(progress: unknown): boolean {
         </div>
       </div>
     </template>
+    <!-- 简洁模式下等待首个内容块时就显示步骤卡的样子，内容到达后原地变成步骤摘要。 -->
+    <CollapsibleContentBlock v-else-if="streaming && globalSettings.appearance.conciseMode" class="rich-step-group"
+      :collapsible="false" icon-active :aria-label="globalSettings.appearance.streamingTextWaiting">
+      <template #icon><IconTool stroke="2" /></template>
+      <template #summary><span class="rich-step-group-label">{{ globalSettings.appearance.streamingTextWaiting }}</span></template>
+    </CollapsibleContentBlock>
     <!-- 流式中但还没有任何内容块：渲染一个仅含光标的空文本节点。 -->
     <component
       :is="partViewComponent('text')"

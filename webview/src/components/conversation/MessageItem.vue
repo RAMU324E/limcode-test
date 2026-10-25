@@ -265,7 +265,8 @@ const runMetricItems = computed<RunMetricItem[]>(() => {
   return items.filter((item): item is RunMetricItem => item !== undefined);
 });
 
-const messageFooterVisible = computed(() => props.floorNumber > 0 || runMetricItems.value.length > 0 || tokenUsageItems.value.length > 0);
+const messageFooterVisible = computed(() => props.floorNumber > 0 || runMetricItems.value.length > 0 || tokenUsageItems.value.length > 0
+  || conciseFloor.value);
 
 function createTokenUsageItem(key: TokenUsageKind, label: string, value: number | undefined, usage: LlmUsageMetadataRecord): TokenUsageItem | undefined {
   if (value === undefined) return undefined;
@@ -321,10 +322,12 @@ const hasTerminatedAuditContent = computed(() => terminatedPartial.value && prop
 const showMessageContent = computed(() =>
   !terminatedPartial.value || props.terminationNoticeSuppressed || terminatedContentExpanded.value
 );
-// 简洁模式：只有思考和工具调用的模型消息不显示头尾，正文只剩步骤摘要；指标留在有正文的消息上。
+// 简洁模式：模型消息从一开始就不显示头部（模型名挪到底栏），免得正文到达或折叠成步骤卡时上下跳动。
+const conciseFloor = computed(() => globalSettings.appearance.conciseMode && props.message.role === 'model'
+  && !terminationLabel.value && !props.mutationPending);
+// 只有思考和工具调用的消息连底栏也不显示，整条消息只剩步骤摘要；指标留在有正文的消息上。
 const compactFloor = computed(() => {
-  if (!globalSettings.appearance.conciseMode || props.message.role !== 'model') return false;
-  if (terminationLabel.value || props.mutationPending || props.message.content.parts.length === 0) return false;
+  if (!conciseFloor.value) return false;
   const loaded = props.contentWindow;
   if (loaded && (loaded.firstSequence > 1 || loaded.lastSequence < loaded.totalItems)) return false;
   return !props.message.content.parts.some(part => isVisibleTextPart(part) && part.text.trim().length > 0);
@@ -758,10 +761,10 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
 </script>
 
 <template>
-  <article class="message-floor" :class="[message.role, { streaming, 'is-deleting': deleting, 'is-entering': entering, 'is-edit-target': editingHighlighted, 'is-mutation-pending': mutationPending, 'is-compact': compactFloor }]" :data-scroll-marker-id="message.id" :data-message-id="message.id">
+  <article class="message-floor" :class="[message.role, { streaming, 'is-deleting': deleting, 'is-entering': entering, 'is-edit-target': editingHighlighted, 'is-mutation-pending': mutationPending, 'is-compact': conciseFloor }]" :data-scroll-marker-id="message.id" :data-message-id="message.id">
     <div class="floor-container">
       <div class="floor-content-column">
-        <header v-if="!compactFloor" class="floor-header">
+        <header v-if="!conciseFloor" class="floor-header">
           <span class="role-chip" :class="message.role === 'user' ? 'user' : 'assistant'">
             <span class="role-dot" aria-hidden="true"></span>
             <span class="floor-role-name">{{ roleLabel }}</span>
@@ -822,7 +825,8 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
           <p v-if="copyError" class="message-content-read-error" role="alert">{{ copyError }}</p>
         </div>
         <footer v-if="messageFooterVisible && !compactFloor" class="message-footer">
-          <div v-if="floorNumber > 0 || runMetricItems.length > 0" class="message-turn-metrics" aria-label="消息楼层与 LLM 调用指标">
+          <div v-if="floorNumber > 0 || runMetricItems.length > 0 || conciseFloor" class="message-turn-metrics" aria-label="消息楼层与 LLM 调用指标">
+            <span v-if="conciseFloor" class="message-floor-model">{{ roleLabel }}</span>
             <span v-if="floorNumber > 0" class="message-floor-index">#{{ floorNumber }}</span>
             <HoverTooltipPanel
               v-for="metric in runMetricItems"
@@ -1008,7 +1012,12 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
 }
 
 .message-floor.is-compact {
-  --message-floor-padding-block: 3px;
+  --message-floor-padding-block: 4px;
+}
+
+.message-floor-model {
+  font-size: var(--font-size-xs);
+  color: var(--vscode-descriptionForeground);
 }
 
 /* 没有头部时操作按钮浮在步骤摘要上，垫一层底色免得和文字叠在一起。 */
