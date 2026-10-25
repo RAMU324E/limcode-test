@@ -5,6 +5,7 @@ import { createBrowserFixtureServer } from './reliable-kernel/browser-fixture-se
 
 const fixtureHtml = `<!doctype html><html><head><link rel="icon" href="data:,"></head><body>
 <div id="app" style="width:720px"></div>
+<div id="activity" style="width:720px"></div>
 <script>
   window.acquireVsCodeApi = () => ({ postMessage() {}, getState() {}, setState() {} });
 </script>
@@ -15,6 +16,7 @@ const fixtureHtml = `<!doctype html><html><head><link rel="icon" href="data:,"><
   import { createApp } from 'vue';
   import { createPinia, setActivePinia } from 'pinia';
   import MessageItem from '/src/components/conversation/MessageItem.vue';
+  import TimelineActivityRow from '/src/components/conversation/TimelineActivityRow.vue';
   import { useReliableKernelClientFeedStore } from '/src/stores/useReliableKernelClientFeedStore.ts';
   import { useGlobalSettingsStore } from '/src/stores/useGlobalSettingsStore.ts';
   const query = new URLSearchParams(window.location.search);
@@ -55,6 +57,9 @@ const fixtureHtml = `<!doctype html><html><head><link rel="icon" href="data:,"><
   const message = { id: 'message', conversationId: 'conversation', role: 'model', model: 'fast-model',
     status: streaming ? 'streaming' : 'final', content: { role: 'model', parts }, createdAt: 1, requestStartedAt: 1, completedAt: 2000 };
   createApp(MessageItem, { message, floorNumber: 64 }).use(pinia).mount('#app');
+  const settings = useGlobalSettingsStore();
+  createApp(TimelineActivityRow, { activityKind: 'preparing', label: settings.appearance.streamingTextWaiting,
+    modelLabel: 'fast-model', concise: settings.appearance.conciseMode }).use(pinia).mount('#activity');
 </script></body></html>`;
 
 test('concise mode folds a tool-only round into one step summary row', async () => {
@@ -116,6 +121,12 @@ test('concise mode folds a tool-only round into one step summary row', async () 
     await page.locator('.rich-step-group').waitFor();
     assert.equal(await page.locator('.floor-header').count(), 0);
     assert.match(await page.locator('.rich-step-group').innerText(), /少女等待中/);
+    // 每轮开始前列表里那行等待提示，换成这条消息时高度和文字都不变。
+    const heights = await page.evaluate(() => [document.querySelector('.message-floor').getBoundingClientRect().height,
+      document.querySelector('.timeline-activity-row').getBoundingClientRect().height]);
+    assert.equal(heights[0], heights[1]);
+    assert.equal(await page.locator('.timeline-activity-row').innerText(), await page.locator('.rich-step-group').innerText());
+    assert.equal(await page.locator('.timeline-activity-row .activity-header').count(), 0);
     await open('?concise&thinking');
     await summary.waitFor();
     assert.match(await summary.innerText(), /少女思考中/);
