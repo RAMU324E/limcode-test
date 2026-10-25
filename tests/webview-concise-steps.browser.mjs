@@ -1,0 +1,123 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { chromium } from 'playwright';
+import { createBrowserFixtureServer } from './reliable-kernel/browser-fixture-server.mjs';
+
+const fixtureHtml = `<!doctype html><html><head><link rel="icon" href="data:,"></head><body>
+<div id="app" style="width:720px"></div>
+<script>
+  window.acquireVsCodeApi = () => ({ postMessage() {}, getState() {}, setState() {} });
+</script>
+<script type="module">
+  import '/src/theme/tokens.css';
+  import '/src/theme/base.css';
+  import '/src/theme/motion/collapse.css';
+  import { createApp } from 'vue';
+  import { createPinia, setActivePinia } from 'pinia';
+  import MessageItem from '/src/components/conversation/MessageItem.vue';
+  import { useReliableKernelClientFeedStore } from '/src/stores/useReliableKernelClientFeedStore.ts';
+  import { useGlobalSettingsStore } from '/src/stores/useGlobalSettingsStore.ts';
+  const query = new URLSearchParams(window.location.search);
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  useGlobalSettingsStore().appearance.conciseMode = query.has('concise');
+  const feed = useReliableKernelClientFeedStore();
+  feed.requestDetail = () => {};
+  const calls = [
+    { id: 'provider-write', functionCall: { name: 'write', args: { path: 'src/helper.txt', content: 'x' } } },
+    { id: 'provider-read', functionCall: { name: 'read', args: { path: 'docs/main.md' } } }
+  ];
+  const parts = [{ text: '先写再读', thought: true, thoughtDurationMs: 1200 }, ...calls];
+  if (query.has('text')) parts.push({ text: '全部完成。' });
+  const session = { sessionId: 'concise-session', hostBootId: 'concise-host' };
+  feed.observe({ type: 'reliable-kernel.snapshot', ...session, messageSeq: '1', snapshotCommitSeq: '1',
+    projections: { activeConversationWindow: {
+      conversationId: 'conversation',
+      turns: [{ id: 'turn', conversation_id: 'conversation', status: 'active' }],
+      messages: [{ id: 'message', conversation_id: 'conversation', role: 'model', message_seq: '1',
+        revision_id: 'revision', created_at: '2026-10-25T10:00:00.000Z' }],
+      messageTurnLinks: [{ id: 'link', message_id: 'message', turn_id: 'turn', role: 'model' }],
+      toolCalls: calls.map((part, index) => ({ id: 'call-' + index, turn_id: 'turn', call_seq: String(index + 1),
+        tool_name: part.functionCall.name, status: query.has('pending') && index === 1 ? 'pending' : 'terminal' })),
+      toolCallSourceLinks: calls.map((part, index) => ({ id: 'source-' + index, tool_call_id: 'call-' + index,
+        model_request_id: 'request', message_id: 'message', provider_call_id: part.id, provider_ordinal: index })),
+      toolOutcomes: calls.flatMap((part, index) => query.has('pending') && index === 1 ? []
+        : [{ id: 'outcome-' + index, tool_call_id: 'call-' + index, status: 'succeeded' }]),
+      // 第二个调用挂着一条待处理的执行审批。
+      interactionRequests: query.has('pending') ? [{ id: 'approval', request_kind: 'exec_approval', status: 'pending',
+        created_at: '2026-10-25T10:00:01.000Z', updated_at: '2026-10-25T10:00:01.000Z' }] : [],
+      interactionToolCallLinks: query.has('pending') ? [{ id: 'approval-link', request_id: 'approval', tool_call_id: 'call-1' }] : []
+    } }
+  });
+  const message = { id: 'message', conversationId: 'conversation', role: 'model', model: 'fast-model',
+    status: 'final', content: { role: 'model', parts }, createdAt: 1, requestStartedAt: 1, completedAt: 2000 };
+  createApp(MessageItem, { message, floorNumber: 64 }).use(pinia).mount('#app');
+</script></body></html>`;
+
+test('concise mode folds a tool-only round into one step summary row', async () => {
+  const server = await createBrowserFixtureServer({
+    dependencies: ['vue', 'pinia', '@tabler/icons-vue', 'markdown-it', 'markdown-it-texmath', 'katex'],
+    plugins: [{
+      name: 'concise-steps-browser-fixture',
+      configureServer(vite) {
+        vite.middlewares.use('/concise-steps-fixture', async (_request, response) => {
+          response.setHeader('Content-Type', 'text/html');
+          response.end(await vite.transformIndexHtml('/concise-steps-fixture', fixtureHtml));
+        });
+      }
+    }]
+  });
+  let browser;
+  const errors = [];
+  try {
+    await server.listen();
+    browser = await chromium.launch({ headless: true,
+      ...(process.env.LIMCODE_TEST_BROWSER_PATH ? { executablePath: process.env.LIMCODE_TEST_BROWSER_PATH } : {}) });
+    const page = await browser.newPage({ viewport: { width: 1000, height: 800 } });
+    page.setDefaultTimeout(10000);
+    page.on('pageerror', error => errors.push(error.message));
+    const open = search => page.goto(`http://127.0.0.1:${server.httpServer.address().port}/concise-steps-fixture${search}`, { waitUntil: 'domcontentloaded' });
+    const summary = page.locator('.rich-step-group > .lc-collapsible-header .lc-collapsible-summary');
+
+    // 普通模式：头部、思考、两张工具卡和底栏照常显示。
+    await open('');
+    await page.locator('.tool-call-card').nth(1).waitFor();
+    assert.equal(await page.locator('.floor-header').count(), 1);
+    assert.equal(await page.locator('.message-footer').count(), 1);
+    assert.equal(await page.locator('.rich-step-group').count(), 0);
+
+    // 简洁模式：整条消息只剩一行步骤摘要，点开才渲染思考和工具卡。
+    await open('?concise');
+    await summary.waitFor();
+    assert.match(await summary.innerText(), /write helper\.txt · read main\.md/);
+    assert.match(await summary.innerText(), /2 步/);
+    assert.equal(await summary.getAttribute('aria-expanded'), 'false');
+    assert.equal(await page.locator('.floor-header').count(), 0);
+    assert.equal(await page.locator('.message-footer').count(), 0);
+    assert.equal(await page.locator('.tool-call-card').count(), 0);
+    await summary.click();
+    await page.locator('.tool-call-card').nth(1).waitFor();
+    assert.equal(await page.locator('.rich-step-group .lc-collapsible-block').filter({ hasText: '已思考' }).count(), 1);
+    await summary.click();
+    await page.locator('.tool-call-card').first().waitFor({ state: 'detached' });
+
+    // 有正文的消息保留头部和底栏，步骤照样折叠。
+    await open('?concise&text');
+    await summary.waitFor();
+    assert.equal(await page.locator('.floor-header').count(), 1);
+    assert.equal(await page.locator('.message-footer').count(), 1);
+    await page.getByText('全部完成。').waitFor();
+
+    // 等待审批的调用不能藏起来：摘要自动展开。
+    await open('?concise&pending');
+    await summary.waitFor();
+    assert.equal(await summary.getAttribute('aria-expanded'), 'true');
+    assert.match(await summary.innerText(), /进行中/);
+    await page.locator('.tool-call-card').nth(1).waitFor();
+    assert.deepEqual(errors, []);
+    await page.close();
+  } finally {
+    await browser?.close();
+    await server.close();
+  }
+});
