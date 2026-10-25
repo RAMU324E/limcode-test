@@ -41,6 +41,7 @@ import {
 } from '@webview/domain/reliableDetailKey';
 import { useInteractionStore } from '@webview/stores/useInteractionStore';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
+import { useSwapHeightTransition } from '@webview/composables/useSwapHeightTransition';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import AskUserContent from '@webview/components/askUser/AskUserContent.vue';
 import PlanProposalContent from '@webview/components/plan/PlanProposalContent.vue';
@@ -366,6 +367,9 @@ const showStreamingPreview = computed(() => {
   const preview = transientPreview.value;
   return !!preview && (autoExpandDetails.value || toolCallPreviewPresentation(preview).kind !== 'generic');
 });
+const swapShell = ref<HTMLElement | null>(null);
+// 预览换成工具卡（命令开始执行、参数生成完）时高度会骤降，过渡一下，不让下方内容一帧跳上来。
+useSwapHeightTransition(swapShell, () => showStreamingPreview.value);
 const autoOpenDiffPreview = computed(() => toolCall.value?.display?.autoOpenDiffPreview === true);
 const autoApplyChange = computed(() => {
   const policy = fileChangeInteraction.value?.policySnapshot;
@@ -1013,6 +1017,7 @@ function isFinalizingProgress(progress: unknown): boolean {
 </script>
 
 <template>
+  <div ref="swapShell" class="tool-call-swap-shell">
   <StreamingToolCallPreview
     v-if="showStreamingPreview && transientPreview"
     :preview="transientPreview"
@@ -1224,6 +1229,7 @@ function isFinalizingProgress(progress: unknown): boolean {
       </p>
     </div>
   </CollapsibleContentBlock>
+  </div>
 
   <p v-if="interactionResolutionMessage" class="part-card-note tool-interaction-resolution-note" role="status">
     {{ interactionResolutionMessage }}
@@ -1245,6 +1251,10 @@ function isFinalizingProgress(progress: unknown): boolean {
 </template>
 
 <style scoped>
+.tool-call-swap-shell {
+  display: flow-root;
+}
+
 .tool-response-attachments {
   display: grid;
   gap: var(--space-2, 8px);
