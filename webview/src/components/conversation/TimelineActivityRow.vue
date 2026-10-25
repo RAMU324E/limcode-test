@@ -55,6 +55,22 @@ const settings = useGlobalSettingsStore();
 
 .timeline-activity-row.is-concise {
   --message-floor-padding-block: 4px;
+  /* 上一张步骤卡结束后这行才插进来，淡入避免硬跳；只动透明度和位移，不触发重排。
+     随后原地换成同高同文案的步骤卡，那张卡不加动画，否则交接时会闪。 */
+  animation: lc-concise-row-enter 0.18s var(--lc-motion-enter-emphasized, ease-out) both;
+}
+
+@keyframes lc-concise-row-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .timeline-activity-row.is-concise {
+    animation: none;
+  }
 }
 
 .activity-concise-label {

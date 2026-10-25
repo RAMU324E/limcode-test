@@ -143,6 +143,8 @@ test('concise mode folds a tool-only round into one step summary row', async () 
     assert.equal(await page.locator('.timeline-activity-row').innerText(), await page.locator('.rich-step-group').innerText());
     assert.equal(await page.locator('.timeline-activity-row .activity-header').count(), 0);
     assert.equal(await page.locator('.activity-concise-label.lc-shimmer-text').count(), 1);
+    // 这行插入时淡入，不硬跳。
+    assert.match(await page.locator('.timeline-activity-row').evaluate(node => getComputedStyle(node).animationName), /lc-concise-row-enter/);
     assert.equal(await page.locator('.rich-step-group-label.lc-shimmer-text').count(), 1);
     await open('?concise&thinking');
     await summary.waitFor();
