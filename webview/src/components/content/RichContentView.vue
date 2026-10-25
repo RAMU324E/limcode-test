@@ -12,7 +12,9 @@ import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { reliableToolCallForPart } from '@webview/domain/reliablePresentationIndex';
 import { useContentBlockWindow } from '@webview/composables/useContentBlockWindow';
+import { IconTool } from '@tabler/icons-vue';
 import StreamingIndicatorTail from './StreamingIndicatorTail.vue';
+import CollapsibleContentBlock from './CollapsibleContentBlock.vue';
 import { partViewComponent, RichRenderNodeProjector, type RichRenderNode } from './partRegistry';
 
 const props = defineProps<{
@@ -33,6 +35,19 @@ interface ToolBatchMeta {
   batchColorIndex: number;
 }
 
+interface StepGroup {
+  items: { node: RichRenderNode; index: number }[];
+  label: string;
+  meta: string;
+  active: boolean;
+  forceOpen: boolean;
+}
+
+/** 简洁模式下，连续的思考与工具调用合并成一行可展开的步骤摘要；其余节点照常逐个显示。 */
+type DisplayBlock =
+  | { key: string; node: RichRenderNode; index: number; group?: undefined }
+  | { key: string; group: StepGroup; node?: undefined; index?: undefined };
+
 interface ToolCallNodeInfo {
   nodeIndex: number;
   call?: ToolCallRecord;
@@ -46,13 +61,17 @@ const nodeProjector = new RichRenderNodeProjector();
 const rawNodes = computed(() => nodeProjector.project(props.parts));
 let previousBatchNodes = new Map<string, RichRenderNode>();
 const nodes = computed(() => withToolBatchMeta(rawNodes.value));
+const displayBlocks = computed(() => globalSettings.appearance.conciseMode
+  ? groupStepRuns(nodes.value)
+  : nodes.value.map((node, index): DisplayBlock => ({ key: node.key, node, index })));
+const expandedGroups = ref(new Set<string>());
 const blockKeys = computed<readonly string[]>((previous) => {
-  const next = nodes.value.map(node => node.key);
+  const next = displayBlocks.value.map(block => block.key);
   return previous?.length === next.length && next.every((key, index) => key === previous[index]) ? previous : next;
 });
 const root = ref<HTMLElement | null>(null);
 const blockWindow = useContentBlockWindow({ keys: blockKeys, root, scroller: computed(() => props.scroller) });
-const visibleNodes = computed(() => nodes.value.slice(blockWindow.start.value, blockWindow.end.value));
+const visibleBlocks = computed(() => displayBlocks.value.slice(blockWindow.start.value, blockWindow.end.value));
 const messageToolCalls = computed(() => props.messageId
   ? reliableConversation.projection.value.toolCallsByMessageId[props.messageId] : undefined);
 const showToolExecutingTail = computed(() => {
@@ -173,6 +192,76 @@ function streamingPhase(): 'waiting' | 'thinking' | 'writing' {
   const last = nodes.value[nodes.value.length - 1]!;
   if (last.kind === 'thought') return 'thinking';
   return 'writing';
+}
+
+function groupStepRuns(inputNodes: RichRenderNode[]): DisplayBlock[] {
+  const blocks: DisplayBlock[] = [];
+  let run: { node: RichRenderNode; index: number }[] = [];
+  const flushRun = (): void => {
+    if (run.length >= 2 && run.some(item => item.node.kind === 'functionCall')) {
+      blocks.push({ key: `steps:${run[0]!.node.key}`, group: stepGroup(run, run[run.length - 1]!.index === inputNodes.length - 1) });
+    } else {
+      for (const item of run) blocks.push({ key: item.node.key, ...item });
+    }
+    run = [];
+  };
+  inputNodes.forEach((node, index) => {
+    if (node.kind === 'thought' || node.kind === 'functionCall' || node.kind === 'functionResponse') {
+      run.push({ node, index });
+      return;
+    }
+    flushRun();
+    blocks.push({ key: node.key, node, index });
+  });
+  flushRun();
+  return blocks;
+}
+
+function stepGroup(items: StepGroup['items'], atEnd: boolean): StepGroup {
+  const steps: string[] = [];
+  let active = props.streaming === true && atEnd;
+  let forceOpen = false;
+  let failed = 0;
+  for (const { node } of items) {
+    if (node.kind !== 'functionCall') continue;
+    const call = toolCallForNode(node);
+    steps.push(stepLabel(node.props.part as FunctionCallPart, call));
+    if (!call) {
+      active ||= props.streaming === true;
+      continue;
+    }
+    active ||= isBlockingToolCall(call);
+    // 等待用户处理（执行审批、修改审批、提问等）的调用不能藏在收起的摘要里。
+    forceOpen ||= call.status === 'awaiting_user_input'
+      || reliableConversation.projection.value.interactionByToolCallId[call.id]?.status === 'pending';
+    if (call.status === 'error') failed += 1;
+  }
+  let label = steps.slice(0, 3).join(' · ');
+  if (steps.length > 3) label += active ? ` … ${steps[steps.length - 1]}` : ' 等';
+  const meta = [`${steps.length} 步`, failed > 0 ? `${failed} 失败` : '', active ? '进行中' : ''].filter(Boolean).join(' · ');
+  return { items, label, meta, active, forceOpen };
+}
+
+function stepLabel(part: FunctionCallPart, call: ToolCallRecord | undefined): string {
+  const args = part.functionCall.args && typeof part.functionCall.args === 'object' && !Array.isArray(part.functionCall.args)
+    ? part.functionCall.args as Record<string, unknown> : undefined;
+  const path = typeof args?.path === 'string' ? args.path.split(/[\\/]/).filter(Boolean).pop() : undefined;
+  const fallback = [call?.summary, args?.command, args?.query, args?.url, args?.explanation]
+    .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+  const target = path ?? (fallback ? shortStepText(fallback) : undefined);
+  return target ? `${part.functionCall.name} ${target}` : part.functionCall.name;
+}
+
+function shortStepText(value: string): string {
+  const text = value.trim().replace(/\s+/g, ' ');
+  return text.length > 24 ? `${text.slice(0, 23)}…` : text;
+}
+
+function toggleStepGroup(key: string, expanded: boolean): void {
+  const next = new Set(expandedGroups.value);
+  if (expanded) next.add(key);
+  else next.delete(key);
+  expandedGroups.value = next;
 }
 
 function withToolBatchMeta(inputNodes: RichRenderNode[]): RichRenderNode[] {
@@ -306,10 +395,26 @@ function isExecutionApprovedProgress(progress: unknown): boolean {
   <div ref="root" class="rich-content">
     <template v-if="nodes.length">
       <div v-if="blockWindow.beforeHeight.value > 0" class="rich-content-spacer" :style="{ height: `${blockWindow.beforeHeight.value}px` }" aria-hidden="true" />
-      <div v-for="(node, index) in visibleNodes" :key="node.key"
-        :ref="element => blockWindow.bindBlock(node.key, element)"
-        class="rich-content-block" :data-content-block-key="node.key">
-        <component :is="partViewComponent(node.kind)" v-bind="nodeComponentProps(node, blockWindow.start.value + index)" />
+      <div v-for="block in visibleBlocks" :key="block.key"
+        :ref="element => blockWindow.bindBlock(block.key, element)"
+        class="rich-content-block" :data-content-block-key="block.key">
+        <component :is="partViewComponent(block.node.kind)" v-if="block.node" v-bind="nodeComponentProps(block.node, block.index)" />
+        <CollapsibleContentBlock v-else class="rich-step-group"
+          :expanded="block.group.forceOpen || expandedGroups.has(block.key)"
+          :icon-active="block.group.active"
+          :aria-label="`${block.group.label}（${block.group.meta}）`"
+          @update:expanded="toggleStepGroup(block.key, $event)">
+          <template #icon><IconTool stroke="2" /></template>
+          <template #summary>
+            <span class="rich-step-group-label">{{ block.group.label }}</span>
+            <span class="rich-step-group-meta">{{ block.group.meta }}</span>
+          </template>
+          <div class="rich-step-group-body">
+            <div v-for="item in block.group.items" :key="item.node.key" class="rich-content-block">
+              <component :is="partViewComponent(item.node.kind)" v-bind="nodeComponentProps(item.node, item.index)" />
+            </div>
+          </div>
+        </CollapsibleContentBlock>
       </div>
       <div v-if="blockWindow.afterHeight.value > 0" class="rich-content-spacer" :style="{ height: `${blockWindow.afterHeight.value}px` }" aria-hidden="true" />
       <div v-if="shownTail" class="rich-streaming-tail-row lc-collapse-shell" :class="{ 'is-expanded': tailExpanded }">
@@ -339,6 +444,28 @@ function isExecutionApprovedProgress(progress: unknown): boolean {
 }
 
 .rich-content-block { min-width: 0; }
+
+.rich-step-group-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rich-step-group-meta {
+  flex: 0 0 auto;
+  margin-left: 6px;
+  opacity: 0.75;
+  white-space: nowrap;
+}
+
+.rich-step-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+}
 .rich-content-spacer { flex-shrink: 0; pointer-events: none; }
 
 .rich-streaming-tail-row {

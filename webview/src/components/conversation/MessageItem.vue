@@ -22,6 +22,7 @@ import { isManualStop, terminationNotice as terminationNoticeText } from './term
 import RichContentView from '@webview/components/content/RichContentView.vue';
 import ConfirmPanel, { type ConfirmPanelAction } from '@webview/components/ui/ConfirmPanel.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
+import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { normalizeTokenUsage } from './tokenUsageModel';
 import { modelRunMetrics, type ModelRunRound } from './runMetricsModel';
 
@@ -52,6 +53,8 @@ const props = withDefaults(
   }>(),
   { runId: undefined, termination: undefined, terminationNoticeSuppressed: false, runHadCompletedTools: false, deleteCount: 1, floorNumber: 0, compactCount: 1, deleting: false, entering: false, editingHighlighted: false, detailLoading: false, detailReady: true, mutationPending: false, mutationBlocked: false, retryBlocked: false, compactBlocked: false, forkBlocked: false, pendingLabel: '正在提交操作' }
 );
+
+const globalSettings = useGlobalSettingsStore();
 
 const emit = defineEmits<{
   (event: 'earlier-content'): void;
@@ -318,6 +321,14 @@ const hasTerminatedAuditContent = computed(() => terminatedPartial.value && prop
 const showMessageContent = computed(() =>
   !terminatedPartial.value || props.terminationNoticeSuppressed || terminatedContentExpanded.value
 );
+// 简洁模式：只有思考和工具调用的模型消息不显示头尾，正文只剩步骤摘要；指标留在有正文的消息上。
+const compactFloor = computed(() => {
+  if (!globalSettings.appearance.conciseMode || props.message.role !== 'model') return false;
+  if (terminationLabel.value || props.mutationPending || props.message.content.parts.length === 0) return false;
+  const loaded = props.contentWindow;
+  if (loaded && (loaded.firstSequence > 1 || loaded.lastSequence < loaded.totalItems)) return false;
+  return !props.message.content.parts.some(part => isVisibleTextPart(part) && part.text.trim().length > 0);
+});
 const terminationNotice = computed(() => terminationNoticeText(props.termination, props.runHadCompletedTools));
 const terminationTooltipRows = computed(() => props.termination ? [
   { label: '原因', value: props.termination.detail?.trim() || props.termination.reasonCode },
@@ -747,10 +758,10 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
 </script>
 
 <template>
-  <article class="message-floor" :class="[message.role, { streaming, 'is-deleting': deleting, 'is-entering': entering, 'is-edit-target': editingHighlighted, 'is-mutation-pending': mutationPending }]" :data-scroll-marker-id="message.id" :data-message-id="message.id">
+  <article class="message-floor" :class="[message.role, { streaming, 'is-deleting': deleting, 'is-entering': entering, 'is-edit-target': editingHighlighted, 'is-mutation-pending': mutationPending, 'is-compact': compactFloor }]" :data-scroll-marker-id="message.id" :data-message-id="message.id">
     <div class="floor-container">
       <div class="floor-content-column">
-        <header class="floor-header">
+        <header v-if="!compactFloor" class="floor-header">
           <span class="role-chip" :class="message.role === 'user' ? 'user' : 'assistant'">
             <span class="role-dot" aria-hidden="true"></span>
             <span class="floor-role-name">{{ roleLabel }}</span>
@@ -810,7 +821,7 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
             class="message-content-page-control" :disabled="contentWindow.loading" @click="emit('retry-content')">重试读取内容</button>
           <p v-if="copyError" class="message-content-read-error" role="alert">{{ copyError }}</p>
         </div>
-        <footer v-if="messageFooterVisible" class="message-footer">
+        <footer v-if="messageFooterVisible && !compactFloor" class="message-footer">
           <div v-if="floorNumber > 0 || runMetricItems.length > 0" class="message-turn-metrics" aria-label="消息楼层与 LLM 调用指标">
             <span v-if="floorNumber > 0" class="message-floor-index">#{{ floorNumber }}</span>
             <HoverTooltipPanel
@@ -993,6 +1004,16 @@ function onRetryConfirmAction(action: ConfirmPanelAction): void {
 
 .message-floor.model,
 .message-floor.assistant {
+  background-color: color-mix(in srgb, var(--vscode-editor-background) 97%, var(--vscode-foreground) 3%);
+}
+
+.message-floor.is-compact {
+  --message-floor-padding-block: 3px;
+}
+
+/* 没有头部时操作按钮浮在步骤摘要上，垫一层底色免得和文字叠在一起。 */
+.message-floor.is-compact .message-actions {
+  border-radius: var(--radius-sm);
   background-color: color-mix(in srgb, var(--vscode-editor-background) 97%, var(--vscode-foreground) 3%);
 }
 
