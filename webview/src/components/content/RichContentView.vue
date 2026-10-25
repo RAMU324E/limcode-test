@@ -45,6 +45,23 @@ interface StepGroup {
 }
 
 /** 简洁模式下，连续的思考与工具调用合并成一行可展开的步骤摘要；其余节点照常逐个显示。 */
+/** 按动作概括步骤：有单位的动作按目标计数（读取 3 个文件），只有一个目标时直接写出目标；认不出的工具写工具名。 */
+const STEP_ACTIONS: Record<string, { verb: string; unit?: string }> = {
+  read: { verb: '读取', unit: '个文件' },
+  write: { verb: '修改', unit: '个文件' },
+  edit: { verb: '修改', unit: '个文件' },
+  delete: { verb: '删除', unit: '个文件' },
+  bash: { verb: '运行', unit: '条命令' },
+  shell: { verb: '运行', unit: '条命令' },
+  update_task_list: { verb: '更新任务清单' },
+  skills: { verb: '载入技能' },
+  run_agent: { verb: '调度子 Agent' },
+  ask_user: { verb: '提问' },
+  submit_plan: { verb: '提交计划' },
+  transfer: { verb: '传输文件' },
+  switch_work_environment: { verb: '切换工作环境' }
+};
+
 type DisplayBlock =
   | { key: string; node: RichRenderNode; index: number; group?: undefined }
   | { key: string; group: StepGroup; node?: undefined; index?: undefined };
@@ -221,14 +238,14 @@ function groupStepRuns(inputNodes: RichRenderNode[]): DisplayBlock[] {
 }
 
 function stepGroup(items: StepGroup['items'], atEnd: boolean): StepGroup {
-  const steps: string[] = [];
+  const actions = new Map<string, { verb: string; unit?: string; calls: number; targets: Map<string, string> }>();
   let active = props.streaming === true && atEnd;
   let forceOpen = false;
   let failed = 0;
   for (const { node } of items) {
     if (node.kind !== 'functionCall') continue;
     const call = toolCallForNode(node);
-    steps.push(stepLabel(node.props.part as FunctionCallPart, call));
+    addStepAction(actions, node.props.part as FunctionCallPart);
     if (!call) {
       active ||= props.streaming === true;
       continue;
@@ -241,11 +258,15 @@ function stepGroup(items: StepGroup['items'], atEnd: boolean): StepGroup {
   }
   const last = items[items.length - 1]!.node;
   const thinking = props.streaming === true && atEnd && last.kind === 'thought' && last.props.thoughtOpen === true;
-  let label = steps.slice(0, 3).join(' · ');
-  if (steps.length > 3) label += active ? ` … ${steps[steps.length - 1]}` : ' 等';
+  let label = [...actions.values()].map((action) => {
+    if (!action.unit) return action.calls > 1 && action.verb.startsWith('调用 ') ? `${action.verb} ×${action.calls}` : action.verb;
+    const count = action.targets.size || action.calls;
+    const [only] = action.targets.values();
+    return count === 1 && only ? `${action.verb} ${only}` : `${action.verb} ${count} ${action.unit}`;
+  }).join(' · ');
   if (!label) label = thinking ? globalSettings.appearance.streamingTextThinking : thoughtLabel(items);
-  const meta = [steps.length > 0 ? `${steps.length} 步` : '', failed > 0 ? `${failed} 失败` : '',
-    thinking && steps.length > 0 ? '思考中' : active && !thinking ? '进行中' : ''].filter(Boolean).join(' · ');
+  const meta = [failed > 0 ? `${failed} 失败` : '',
+    thinking && actions.size > 0 ? '思考中' : active && !thinking ? '进行中' : ''].filter(Boolean).join(' · ');
   return { items, label, meta, active, forceOpen };
 }
 
@@ -254,14 +275,24 @@ function thoughtLabel(items: StepGroup['items']): string {
   return durationMs > 0 ? `已思考 ${formatThoughtDuration(durationMs)}` : '思考';
 }
 
-function stepLabel(part: FunctionCallPart, call: ToolCallRecord | undefined): string {
+function addStepAction(
+  actions: Map<string, { verb: string; unit?: string; calls: number; targets: Map<string, string> }>,
+  part: FunctionCallPart
+): void {
+  const name = part.functionCall.name;
+  const known = STEP_ACTIONS[name];
+  const verb = known?.verb ?? `调用 ${name}`;
+  const action = actions.get(verb) ?? { verb, unit: known?.unit, calls: 0, targets: new Map<string, string>() };
+  actions.set(verb, action);
+  action.calls += 1;
+  if (!action.unit) return;
   const args = part.functionCall.args && typeof part.functionCall.args === 'object' && !Array.isArray(part.functionCall.args)
-    ? part.functionCall.args as Record<string, unknown> : undefined;
-  const path = typeof args?.path === 'string' ? args.path.split(/[\\/]/).filter(Boolean).pop() : undefined;
-  const fallback = [call?.summary, args?.command, args?.query, args?.url, args?.explanation]
-    .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
-  const target = path ?? (fallback ? shortStepText(fallback) : undefined);
-  return target ? `${part.functionCall.name} ${target}` : part.functionCall.name;
+    ? part.functionCall.args as Record<string, unknown> : {};
+  const paths = Array.isArray(args.paths) ? args.paths : [args.path];
+  for (const path of paths) {
+    if (typeof path === 'string' && path.trim()) action.targets.set(path, path.split(/[\\/]/).filter(Boolean).pop() ?? path);
+  }
+  if (typeof args.command === 'string' && args.command.trim()) action.targets.set(args.command, shortStepText(args.command));
 }
 
 function shortStepText(value: string): string {
@@ -418,7 +449,7 @@ function isExecutionApprovedProgress(progress: unknown): boolean {
           @update:expanded="toggleStepGroup(block.key, $event)">
           <template #icon><IconTool stroke="2" /></template>
           <template #summary>
-            <span class="rich-step-group-label">{{ block.group.label }}</span>
+            <span class="rich-step-group-label" :class="{ 'lc-shimmer-text': block.group.active }">{{ block.group.label }}</span>
             <span class="rich-step-group-meta">{{ block.group.meta }}</span>
           </template>
           <div class="rich-step-group-body">
@@ -439,7 +470,7 @@ function isExecutionApprovedProgress(progress: unknown): boolean {
     <CollapsibleContentBlock v-else-if="streaming && globalSettings.appearance.conciseMode" class="rich-step-group"
       :collapsible="false" icon-active :aria-label="globalSettings.appearance.streamingTextWaiting">
       <template #icon><IconTool stroke="2" /></template>
-      <template #summary><span class="rich-step-group-label">{{ globalSettings.appearance.streamingTextWaiting }}</span></template>
+      <template #summary><span class="rich-step-group-label lc-shimmer-text">{{ globalSettings.appearance.streamingTextWaiting }}</span></template>
     </CollapsibleContentBlock>
     <!-- 流式中但还没有任何内容块：渲染一个仅含光标的空文本节点。 -->
     <component

@@ -20,7 +20,7 @@ const settings = useGlobalSettingsStore();
     <div class="activity-body">
       <CollapsibleContentBlock :collapsible="false" icon-active :aria-label="props.label || settings.appearance.streamingTextPreparing">
         <template #icon><IconTool stroke="2" /></template>
-        <template #summary><span class="activity-concise-label">{{ props.label || settings.appearance.streamingTextPreparing }}</span></template>
+        <template #summary><span class="activity-concise-label lc-shimmer-text">{{ props.label || settings.appearance.streamingTextPreparing }}</span></template>
       </CollapsibleContentBlock>
     </div>
   </article>
