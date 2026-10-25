@@ -30,11 +30,13 @@ const fixtureHtml = `<!doctype html><html><head><link rel="icon" href="data:,"><
     { id: 'provider-write', functionCall: { name: 'write', args: { path: 'src/helper.txt', content: 'x' } } },
     { id: 'provider-read', functionCall: { name: 'read', args: { path: 'docs/main.md' } } }
   ];
+  if (query.has('cmd')) calls.push({ id: 'provider-cmd', functionCall: { name: 'bash', args: { command: query.get('cmd') } } });
   if (query.has('many')) calls.push(
     { id: 'provider-read-2', functionCall: { name: 'read', args: { path: 'docs/a.md' } } },
     { id: 'provider-read-3', functionCall: { name: 'read', args: { path: 'docs/main.md' } } },
     { id: 'provider-read-4', functionCall: { name: 'read', args: { path: 'docs/b.md' } } },
     { id: 'provider-bash', functionCall: { name: 'bash', args: { command: 'npm test' } } },
+    { id: 'provider-shell', functionCall: { name: 'shell', args: { command: "$f = 'e:\维护\a.md'; Test-Path $f" } } },
     { id: 'provider-mcp', functionCall: { name: 'mcp_lookup', args: {} } },
     { id: 'provider-mcp-2', functionCall: { name: 'mcp_lookup', args: {} } }
   );
@@ -122,7 +124,15 @@ test('concise mode folds a tool-only round into one step summary row', async () 
     await open('?concise&many');
     await summary.waitFor();
     assert.equal(await page.locator('.rich-step-group-label').innerText(),
-      '修改 helper.txt · 读取 3 个文件 · 运行 npm test · 调用 mcp_lookup ×2');
+      '修改 helper.txt · 读取 3 个文件 · 运行 2 条命令 · 调用 mcp_lookup ×2');
+
+    // 单条命令只写程序名；以变量开头的 PowerShell 看不出在做什么，只写条数。
+    await open('?concise&cmd=' + encodeURIComponent('npm run build -- --watch'));
+    await summary.waitFor();
+    assert.equal(await page.locator('.rich-step-group-label').innerText(), '修改 helper.txt · 读取 main.md · 运行 npm');
+    await open('?concise&cmd=' + encodeURIComponent("$f = 'e:/维护/a.md'; Test-Path $f"));
+    await summary.waitFor();
+    assert.equal(await page.locator('.rich-step-group-label').innerText(), '修改 helper.txt · 读取 main.md · 运行 1 条命令');
 
     // 有正文的消息也不显示头部，模型名挪到底栏；步骤照样折叠。
     await open('?concise&text');
