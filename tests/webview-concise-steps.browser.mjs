@@ -13,6 +13,7 @@ const fixtureHtml = `<!doctype html><html><head><link rel="icon" href="data:,"><
   import '/src/theme/tokens.css';
   import '/src/theme/base.css';
   import '/src/theme/motion/collapse.css';
+  import '/src/theme/motion/content.css';
   import { createApp } from 'vue';
   import { createPinia, setActivePinia } from 'pinia';
   import MessageItem from '/src/components/conversation/MessageItem.vue';
@@ -29,6 +30,14 @@ const fixtureHtml = `<!doctype html><html><head><link rel="icon" href="data:,"><
     { id: 'provider-write', functionCall: { name: 'write', args: { path: 'src/helper.txt', content: 'x' } } },
     { id: 'provider-read', functionCall: { name: 'read', args: { path: 'docs/main.md' } } }
   ];
+  if (query.has('many')) calls.push(
+    { id: 'provider-read-2', functionCall: { name: 'read', args: { path: 'docs/a.md' } } },
+    { id: 'provider-read-3', functionCall: { name: 'read', args: { path: 'docs/main.md' } } },
+    { id: 'provider-read-4', functionCall: { name: 'read', args: { path: 'docs/b.md' } } },
+    { id: 'provider-bash', functionCall: { name: 'bash', args: { command: 'npm test' } } },
+    { id: 'provider-mcp', functionCall: { name: 'mcp_lookup', args: {} } },
+    { id: 'provider-mcp-2', functionCall: { name: 'mcp_lookup', args: {} } }
+  );
   const parts = query.has('waiting') ? []
     : query.has('thinking') ? [{ text: '先写再读', thought: true }]
     : [{ text: '先写再读', thought: true, thoughtDurationMs: 1200 }, ...calls];
@@ -97,8 +106,8 @@ test('concise mode folds a tool-only round into one step summary row', async () 
     // 简洁模式：整条消息只剩一行步骤摘要，点开才渲染思考和工具卡。
     await open('?concise');
     await summary.waitFor();
-    assert.match(await summary.innerText(), /write helper\.txt · read main\.md/);
-    assert.match(await summary.innerText(), /2 步/);
+    assert.equal(await page.locator('.rich-step-group-label').innerText(), '修改 helper.txt · 读取 main.md');
+    assert.equal(await page.locator('.rich-step-group-label.lc-shimmer-text').count(), 0);
     assert.equal(await summary.getAttribute('aria-expanded'), 'false');
     assert.equal(await page.locator('.floor-header').count(), 0);
     assert.equal(await page.locator('.message-footer').count(), 0);
@@ -108,6 +117,12 @@ test('concise mode folds a tool-only round into one step summary row', async () 
     assert.equal(await page.locator('.rich-step-group .lc-collapsible-block').filter({ hasText: '已思考' }).count(), 1);
     await summary.click();
     await page.locator('.tool-call-card').first().waitFor({ state: 'detached' });
+
+    // 按动作归类计数：同一文件只算一次，单个目标直接写出，认不出的工具写工具名和次数。
+    await open('?concise&many');
+    await summary.waitFor();
+    assert.equal(await page.locator('.rich-step-group-label').innerText(),
+      '修改 helper.txt · 读取 3 个文件 · 运行 npm test · 调用 mcp_lookup ×2');
 
     // 有正文的消息也不显示头部，模型名挪到底栏；步骤照样折叠。
     await open('?concise&text');
@@ -127,6 +142,8 @@ test('concise mode folds a tool-only round into one step summary row', async () 
     assert.equal(heights[0], heights[1]);
     assert.equal(await page.locator('.timeline-activity-row').innerText(), await page.locator('.rich-step-group').innerText());
     assert.equal(await page.locator('.timeline-activity-row .activity-header').count(), 0);
+    assert.equal(await page.locator('.activity-concise-label.lc-shimmer-text').count(), 1);
+    assert.equal(await page.locator('.rich-step-group-label.lc-shimmer-text').count(), 1);
     await open('?concise&thinking');
     await summary.waitFor();
     assert.match(await summary.innerText(), /少女思考中/);
@@ -138,6 +155,8 @@ test('concise mode folds a tool-only round into one step summary row', async () 
     await summary.waitFor();
     assert.equal(await summary.getAttribute('aria-expanded'), 'true');
     assert.match(await summary.innerText(), /进行中/);
+    // 进行中的摘要文字带扫光动画。
+    assert.equal(await page.locator('.rich-step-group-label.lc-shimmer-text').count(), 1);
     await page.locator('.tool-call-card').nth(1).waitFor();
     assert.deepEqual(errors, []);
     await page.close();
