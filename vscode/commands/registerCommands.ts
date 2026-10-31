@@ -126,9 +126,9 @@ export function registerCommands(context: vscode.ExtensionContext, startup: Appl
       const { cleanupBackups } = await import('./backupCleanup');
       await cleanupBackups(context, startup, request);
     }],
-    [EXTENSION_COMMAND_IDS.lanMobileAccess, '手机访问失败', async () => {
-      const { toggleLanMobileAccess } = await import('../lanMobileAccess');
-      await toggleLanMobileAccess(context, startup);
+    [EXTENSION_COMMAND_IDS.lanMobileAccess, '远程访问失败', async (request?: unknown) => {
+      const { lanMobileAccessCommand } = await import('../lanMobileAccess');
+      await lanMobileAccessCommand(context, startup, request);
     }]
   ] as const;
   const dataRootCommandDisposables = dataRootCommands.map(([commandId, failure, run]) => vscode.commands.registerCommand(commandId, async (request?: unknown) => {

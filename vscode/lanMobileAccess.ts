@@ -6,8 +6,15 @@ import * as vscode from 'vscode';
 import type { ApplicationFacade } from './ApplicationFacade';
 import type { ApplicationStartup } from './ApplicationStartup';
 import { MainPanel } from './panels/MainPanel';
-import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS } from '../shared/extensionIdentity';
-import { BridgeMessageType, type BridgeClientId, type WebviewToExtensionMessage } from '../shared/protocol';
+import type { DataRootPromptHost } from './dataRootPrompts';
+import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS, LAN_MOBILE_ACCESS_STATE_KEY } from '../shared/extensionIdentity';
+import {
+  BridgeMessageType,
+  createMessageId,
+  type BridgeClientId,
+  type LanMobileAccessStatePayload,
+  type WebviewToExtensionMessage
+} from '../shared/protocol';
 import { isReliableKernelControlMessage } from '../shared/reliableKernelClientFeed';
 
 /**
@@ -397,44 +404,98 @@ export function lanAddresses(): string[] {
 
 let activeServer: LanMobileAccessServer | undefined;
 let statusItem: vscode.StatusBarItem | undefined;
+/** Settings pages showing the switch; each gets the new state whenever it changes. */
+const watchingClients = new Set<BridgeClientId>();
+let lastError: string | undefined;
 
-/** 命令入口：关闭时开启并给出地址；开启时可复制地址或关闭。 */
-export async function toggleLanMobileAccess(context: vscode.ExtensionContext, startup: ApplicationStartup): Promise<void> {
-  if (!activeServer) {
-    const server = new LanMobileAccessServer({
-      application: () => startup.wait(),
-      webviewRoot: vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview').fsPath,
-      workspaceName: () => vscode.workspace.name ?? 'VS Code',
-      activeConversationId: () => MainPanel.getOpenConversationPanelStates().find((item) => item.active)?.conversationId
-        ?? MainPanel.getOpenConversationPanelStates().find((item) => item.visible)?.conversationId,
-      openConversations: () => MainPanel.getOpenConversationPanelStates().map((item) => item.conversationId),
-      openConversation: async (conversationId) => {
-        await vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.openPanel, { conversationId, reuse: true });
-      }
-    });
-    await server.start();
-    activeServer = server;
-    statusItem ??= vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 97);
-    statusItem.command = EXTENSION_COMMAND_IDS.lanMobileAccess;
-    statusItem.text = `$(device-mobile) 手机访问 :${server.port}`;
-    statusItem.tooltip = `${EXTENSION_BRAND} 手机访问已开启，点击复制地址或关闭`;
-    statusItem.show();
-    context.subscriptions.push({ dispose: stopLanMobileAccess });
+/**
+ * 命令入口。设置页带着 clientId 调用：带 enabled 时开关，否则只读取状态；之后把状态发回设置页。
+ * 命令面板和状态栏不带参数：未开启时开启，然后给出地址，可复制或关闭。
+ */
+export async function lanMobileAccessCommand(context: vscode.ExtensionContext, startup: ApplicationStartup, request?: unknown): Promise<void> {
+  const { clientId, enabled } = (request ?? {}) as { clientId?: unknown; enabled?: unknown };
+  if (typeof clientId === 'string' && clientId) {
+    watchingClients.add(clientId);
+    if (typeof enabled === 'boolean') await setLanMobileAccess(context, startup, enabled);
+    else postState(startup, [clientId]);
+    return;
   }
-  const urls = lanAddresses().map((address) => `http://${address}:${activeServer!.port}`);
-  const primary = urls[0] ?? `http://127.0.0.1:${activeServer.port}`;
+  if (!activeServer) await setLanMobileAccess(context, startup, true);
+  if (!activeServer) {
+    await vscode.window.showErrorMessage(`${EXTENSION_BRAND} 远程访问开启失败：${lastError ?? '未知原因'}`);
+    return;
+  }
+  const urls = currentUrls();
   const choice = await vscode.window.showInformationMessage(
-    `${EXTENSION_BRAND} 手机访问已开启：${primary}`,
-    { detail: `同一局域网内的设备都能打开并操作对话，不用时请关闭。${urls.length > 1 ? `\n其它地址：${urls.slice(1).join('  ')}` : ''}` },
+    `${EXTENSION_BRAND} 远程访问已开启：${urls[0]}`,
+    { detail: `同一局域网内的设备都能打开并操作对话，不用时请关闭。${urls.length > 1 ? `
+其它地址：${urls.slice(1).join('  ')}` : ''}` },
     '复制地址', '关闭'
   );
-  if (choice === '复制地址') await vscode.env.clipboard.writeText(primary);
-  if (choice === '关闭') stopLanMobileAccess();
+  if (choice === '复制地址') await vscode.env.clipboard.writeText(urls[0]);
+  if (choice === '关闭') await setLanMobileAccess(context, startup, false);
 }
 
-function stopLanMobileAccess(): void {
+/** 这个窗口上次开着就在启动时接着开；只监听端口，手机连上来才启动运行时。 */
+export async function restoreLanMobileAccess(context: vscode.ExtensionContext, startup: ApplicationStartup): Promise<void> {
+  if (!activeServer) await start(context, startup);
+}
+
+async function setLanMobileAccess(context: vscode.ExtensionContext, startup: ApplicationStartup, enabled: boolean): Promise<void> {
+  await context.workspaceState.update(LAN_MOBILE_ACCESS_STATE_KEY, enabled);
+  if (enabled && !activeServer) await start(context, startup);
+  if (!enabled) stop();
+  postState(startup, [...watchingClients]);
+}
+
+async function start(context: vscode.ExtensionContext, startup: ApplicationStartup): Promise<void> {
+  const server = new LanMobileAccessServer({
+    application: () => startup.wait(),
+    webviewRoot: vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview').fsPath,
+    workspaceName: () => vscode.workspace.name ?? 'VS Code',
+    activeConversationId: () => MainPanel.getOpenConversationPanelStates().find((item) => item.active)?.conversationId
+      ?? MainPanel.getOpenConversationPanelStates().find((item) => item.visible)?.conversationId,
+    openConversations: () => MainPanel.getOpenConversationPanelStates().map((item) => item.conversationId),
+    openConversation: async (conversationId) => {
+      await vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.openPanel, { conversationId, reuse: true });
+    }
+  });
+  try {
+    await server.start();
+  } catch (error) {
+    lastError = error instanceof Error ? error.message : String(error);
+    return;
+  }
+  lastError = undefined;
+  activeServer = server;
+  statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 97);
+  statusItem.command = EXTENSION_COMMAND_IDS.lanMobileAccess;
+  statusItem.text = `$(remote) 远程访问 :${server.port}`;
+  statusItem.tooltip = `${EXTENSION_BRAND} 远程访问已开启：${currentUrls().join('  ')}
+点击复制地址或关闭`;
+  statusItem.show();
+  context.subscriptions.push({ dispose: stop });
+}
+
+function stop(): void {
   activeServer?.stop();
   activeServer = undefined;
   statusItem?.dispose();
   statusItem = undefined;
+}
+
+function currentUrls(): string[] {
+  if (!activeServer) return [];
+  const urls = lanAddresses().map((address) => `http://${address}:${activeServer!.port}`);
+  return urls.length > 0 ? urls : [`http://127.0.0.1:${activeServer.port}`];
+}
+
+function postState(startup: ApplicationStartup, clientIds: BridgeClientId[]): void {
+  const host = startup.current() as Partial<DataRootPromptHost> | undefined;
+  if (typeof host?.postToWebview !== 'function') return;
+  const payload: LanMobileAccessStatePayload = { enabled: activeServer !== undefined, urls: currentUrls(), ...(lastError ? { error: lastError } : {}) };
+  for (const clientId of clientIds) {
+    const posted = host.postToWebview(clientId, { id: createMessageId(), type: BridgeMessageType.LanMobileAccessState, channel: 'settings', payload });
+    if (!posted) watchingClients.delete(clientId);
+  }
 }
