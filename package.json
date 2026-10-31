@@ -74,6 +74,11 @@
         "command": "limcode-test.cleanupBackups",
         "title": "Limcode Test: 清理备份",
         "category": "Limcode Test"
+      },
+      {
+        "command": "limcode-test.lanMobileAccess",
+        "title": "Limcode Test: 手机访问（局域网）",
+        "category": "Limcode Test"
       }
     ],
     "menus": {
