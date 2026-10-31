@@ -15,6 +15,7 @@ export const EXTENSION_COMMAND_IDS = {
   returnToPreviousDataRoot: 'limcode-test.returnToPreviousDataRoot',
   deletePreviousDataRoot: 'limcode-test.deletePreviousDataRoot',
   cleanupBackups: 'limcode-test.cleanupBackups',
+  lanMobileAccess: 'limcode-test.lanMobileAccess',
   applyLiveDiffPreview: 'limcode-test.applyLiveDiffPreview'
 } as const;
 
