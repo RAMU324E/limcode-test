@@ -16,14 +16,29 @@ class EventEmitter {
   dispose() { this.listeners.clear(); }
 }
 
-const vscode = { EventEmitter, Uri: { file: (fsPath) => ({ fsPath }) }, ViewColumn: { One: 1 }, workspace: { workspaceFolders: [] }, window: {} };
+const statusItems = [];
+const vscode = {
+  EventEmitter,
+  Uri: { file: (fsPath) => ({ fsPath }), joinPath: (base, ...parts) => ({ fsPath: path.join(base.fsPath, ...parts) }) },
+  ViewColumn: { One: 1 },
+  StatusBarAlignment: { Right: 2 },
+  workspace: { workspaceFolders: [], name: '工作区' },
+  commands: { executeCommand: async () => undefined },
+  window: {
+    createStatusBarItem() {
+      const item = { shown: false, disposed: false, show() { this.shown = true; }, dispose() { this.disposed = true; } };
+      statusItems.push(item);
+      return item;
+    }
+  }
+};
 Module._load = function load(name, parent, isMain) {
   return name === 'vscode' ? vscode : originalLoad.call(this, name, parent, isMain);
 };
 after(() => { Module._load = originalLoad; });
 
 const compiledRoot = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
-const { LanMobileAccessServer } = require(path.join(compiledRoot, 'vscode/lanMobileAccess.js'));
+const { LanMobileAccessServer, lanMobileAccessCommand, restoreLanMobileAccess } = require(path.join(compiledRoot, 'vscode/lanMobileAccess.js'));
 const { RELIABLE_KERNEL_ACK_MESSAGE } = require(path.join(compiledRoot, 'shared/reliableKernelClientFeed.js'));
 
 function fakeApplication() {
@@ -134,4 +149,47 @@ test('手机访问：页面注入桥接脚本，SSE 下发后端消息，POST �
   server.stop();
   assert.deepEqual(application.calls.detached, ['client-1']);
   assert.equal(server.listening, false);
+});
+
+test('远程访问开关：设置页开启后出现状态栏项并记住，关闭后撤下，状态回传给设置页', async (t) => {
+  const stored = new Map();
+  const context = {
+    extensionUri: { fsPath: os.tmpdir() },
+    subscriptions: [],
+    workspaceState: { get: (key) => stored.get(key), update: async (key, value) => { stored.set(key, value); } }
+  };
+  const posted = [];
+  const host = { postToWebview(clientId, message) { posted.push([clientId, message]); return clientId !== 'gone'; } };
+  const startup = { current: () => host, wait: async () => host };
+  const lastState = () => posted.at(-1)[1].payload;
+  t.after(() => lanMobileAccessCommand(context, startup, { clientId: 'cleanup', enabled: false }));
+
+  await lanMobileAccessCommand(context, startup, { clientId: 'settings-1' });
+  assert.deepEqual(posted.map(([clientId, message]) => [clientId, message.type, message.channel]), [['settings-1', 'lanMobileAccess.state', 'settings']]);
+  assert.deepEqual(lastState(), { enabled: false, urls: [] });
+  assert.equal(statusItems.length, 0, '默认关闭：读取状态不会开启');
+
+  await lanMobileAccessCommand(context, startup, { clientId: 'settings-1', enabled: true });
+  assert.equal(lastState().enabled, true);
+  assert.match(lastState().urls[0], /^http:\/\/[\d.]+:\d+$/);
+  const port = Number(new URL(lastState().urls[0]).port);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/missing.js`)).status, 404, '已在监听');
+  assert.equal(stored.get('lanMobileAccess.enabled'), true);
+  assert.equal(statusItems.length, 1);
+  assert.ok(statusItems[0].shown);
+  assert.match(statusItems[0].text, /远程访问/);
+  assert.equal(statusItems[0].command, 'limcode-test.lanMobileAccess');
+
+  // 再开一次不会重复监听；另一个设置页随后也能收到变化。
+  await lanMobileAccessCommand(context, startup, { clientId: 'gone' });
+  await restoreLanMobileAccess(context, startup);
+  assert.equal(statusItems.length, 1);
+
+  posted.length = 0;
+  await lanMobileAccessCommand(context, startup, { clientId: 'settings-1', enabled: false });
+  assert.deepEqual(posted.map(([clientId]) => clientId), ['settings-1'], '已关闭的设置页不再收到状态');
+  assert.deepEqual(lastState(), { enabled: false, urls: [] });
+  assert.equal(stored.get('lanMobileAccess.enabled'), false);
+  assert.ok(statusItems[0].disposed);
+  await assert.rejects(fetch(`http://127.0.0.1:${port}/missing.js`));
 });

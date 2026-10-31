@@ -19,6 +19,9 @@ export const EXTENSION_COMMAND_IDS = {
   applyLiveDiffPreview: 'limcode-test.applyLiveDiffPreview'
 } as const;
 
+/** workspaceState key: LAN remote access stays on across reloads of the window that switched it on. */
+export const LAN_MOBILE_ACCESS_STATE_KEY = 'lanMobileAccess.enabled';
+
 export const MAIN_PANEL_VIEW_TYPE = 'limcode-test.mainPanel';
 export const SIDEBAR_CONTAINER_ID = 'limcode-test-sidebar';
 export const SIDEBAR_ENTRY_VIEW_ID = 'limcode-test-entry-view';
