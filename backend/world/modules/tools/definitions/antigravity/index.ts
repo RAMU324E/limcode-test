@@ -52,7 +52,7 @@ export const antigravityTool: ToolDefinition = {
     description: [
       'Delegate a self-contained task to an Antigravity agent (the agy CLI) that works headlessly in the workspace with full permissions: it reads and writes files and runs commands without asking for approval.',
       'operation=start begins a new agy conversation; operation=send continues an earlier one by agyConversationId (follow-ups, fixes). Both run in the background and return a processRef at once. Progress streams to the background command panel, and the final answer arrives automatically as a background result when agy finishes, so do not poll. operation=read reads the output of a processRef only when you need to check progress; operation=stop terminates it.',
-      'agy cannot ask questions. Give it the full context, constraints, files to touch and acceptance criteria in prompt. Afterwards review its changes yourself (git diff, tests) before relying on them.',
+      'agy cannot ask questions while it runs and is told to stay inside cwd. Give it the full context, constraints, files to touch and acceptance criteria in prompt. If its final answer says information is missing or asks a question, answer with operation=send and the same agyConversationId. Afterwards review its changes yourself (git diff, tests) before relying on them.',
       `model is an agy model slug; omit it to use the configured default. Known slugs:\n- ${MODEL_GUIDE.join('\n- ')}`
     ].join('\n'),
     parameters: {

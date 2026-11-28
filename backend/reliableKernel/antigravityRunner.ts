@@ -29,9 +29,18 @@ const ANSWER_TAIL_NOTICE_BYTES = 5_000;
 const PROGRESS_TEXT_MAX_CHARS = 160;
 const STDERR_TAIL_MAX_CHARS = 1_500;
 
+/**
+ * Measured on agy 1.5.18 headless: ask_question returns an empty answer at once and the model carries
+ * on as if it had one, and an open-ended task sends it searching the user's home directory. The
+ * prefix rules out both; a question it cannot settle becomes the final answer, which the calling
+ * Agent answers with operation=send.
+ */
 const NO_QUESTIONS_PREFIX = [
   '你是被另一个 Agent 调用的子 Agent，没有人会回答你的提问。',
+  '不要调用 ask_question 工具：在这里它只会立刻返回空答案。',
   '遇到不确定的地方，自己做出合理假设并继续完成任务，不要停下来提问或等待确认；',
+  '如果缺少关键信息、无法做出合理假设，就不要动手，在最终答复里写清楚缺什么，然后结束，调用你的 Agent 会补充后让你继续。',
+  '只在当前工作目录里工作：任务没有要求时，不要翻看工作目录之外的文件，尤其是用户主目录、其他应用的配置和对话记录。',
   '在最终答复里列出你做了哪些假设、改了哪些文件、怎样验证的。',
   ''
 ].join('\n');

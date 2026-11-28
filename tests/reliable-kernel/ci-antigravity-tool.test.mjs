@@ -48,7 +48,8 @@ out({ event: 'result', result: {
   conversation_id: conversation, status: 'SUCCESS', duration_seconds: 1.2, num_turns: 1,
   usage: { input_tokens: 10, output_tokens: 5 },
   response: JSON.stringify({ model, conversation, skip: args.includes('--dangerously-skip-permissions'),
-    noQuestions: prompt.includes('不要停下来提问'), promptLength: prompt.length,
+    noQuestions: prompt.includes('不要停下来提问'), noAskTool: prompt.includes('不要调用 ask_question'),
+    stayInCwd: prompt.includes('不要翻看工作目录之外的文件'), promptLength: prompt.length,
     task: taskFile ? fs.readFileSync(taskFile.trim(), 'utf8').length : 0 })
 } });
 `;
@@ -111,7 +112,8 @@ test('AG02 runner drives agy headless with full permissions and reports progress
   assert.match(result.stdout, /第4步 回复：写好了 out\.txt。\n/);
   const answer = finalAnswer(result.stdout);
   assert.deepEqual({ ...answer, promptLength: undefined }, {
-    model: 'gemini-3.8-flash-low', conversation: 'conv-new-1', skip: true, noQuestions: true, promptLength: undefined, task: 0
+    model: 'gemini-3.8-flash-low', conversation: 'conv-new-1', skip: true, noQuestions: true, noAskTool: true, stayInCwd: true,
+    promptLength: undefined, task: 0
   });
   // The footer comes after the answer, so the tail a completion delivers always carries it.
   const footer = result.stdout.slice(result.stdout.lastIndexOf('==== 运行信息 ===='));
@@ -164,6 +166,7 @@ test('AG06 arguments: start/send need a prompt, send needs the conversation, rea
   assert.throws(() => validateAntigravityToolArguments({ operation: 'stop' }), /processId/);
   assert.throws(() => validateAntigravityToolArguments({ prompt: 'x', model: 'gemini 4; rm' }), /model/);
   assert.equal(antigravityTool.declaration.metadata.defaultEnabled, false);
+  assert.match(antigravityTool.declaration.description, /asks a question, answer with operation=send and the same agyConversationId/);
 });
 
 test('AG07 the model reads and stops by processRef/cursor like the command tool', () => {
